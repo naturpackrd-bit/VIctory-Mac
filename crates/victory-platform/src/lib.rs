@@ -20,6 +20,8 @@ pub mod low;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(unix)]
+pub mod sections;
+#[cfg(unix)]
 pub mod system;
 #[cfg(windows)]
 mod windows;

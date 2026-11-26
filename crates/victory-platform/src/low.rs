@@ -26,6 +26,10 @@ pub struct Range {
 /// first. Each is mapped with no access until carved.
 static RESERVED: Mutex<Vec<Range>> = Mutex::new(Vec::new());
 
+/// What [`carve`] handed out and [`give_back`] has not taken back, each as
+/// carved (its length in whole pages).
+static CARVED: Mutex<Vec<Range>> = Mutex::new(Vec::new());
+
 /// The reserved pieces. Nothing in this module panics while holding the
 /// lock, so a poisoned lock still holds a whole list and is used as it is.
 fn reserved() -> MutexGuard<'static, Vec<Range>> {
@@ -35,7 +39,16 @@ fn reserved() -> MutexGuard<'static, Vec<Range>> {
 /// The ranges between LOW_FLOOR and LOW_LIMIT with nothing mapped, lowest
 /// first, page-granular, from the host's map of this process.
 pub fn free_ranges() -> Vec<Range> {
-    gaps(mapped_ranges(), Host::page_size())
+    free_ranges_between(LOW_FLOOR, LOW_LIMIT)
+}
+
+/// The ranges within `[low, high)` with nothing mapped, lowest first,
+/// page-granular, from the host's map of this process.
+pub fn free_ranges_between(low: usize, high: usize) -> Vec<Range> {
+    if high <= low {
+        return Vec::new();
+    }
+    gaps(mapped_ranges(low, high), Host::page_size(), low, high)
 }
 
 /// Reserves every free range below 4 GiB for titles (read-write memory from
@@ -94,12 +107,57 @@ pub fn carve(len: usize, align: usize) -> Option<usize> {
     };
     let rest: Vec<Range> = [before, after].into_iter().filter(|r| r.len > 0).collect();
     pieces.splice(index..=index, rest);
+    // Taken after RESERVED where both are.
+    CARVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Range { start: at, len });
     Some(at)
 }
 
-/// The unmapped, page-granular ranges between LOW_FLOOR and LOW_LIMIT, given
-/// the mapped ranges as `(start, end)` in any order.
-fn gaps(mut mapped: Vec<(usize, usize)>, page: usize) -> Vec<Range> {
+/// Returns a range [`carve`] handed out (`start` as carved, `len` as asked
+/// or as rounded) to the reserved pieces, with no access again and nothing
+/// backing it; false if it is not one `carve` handed out (or was given back
+/// already).
+pub fn give_back(start: usize, len: usize) -> bool {
+    use crate::sections::Sections;
+    let page = Host::page_size();
+    let Some(len) = len.checked_next_multiple_of(page) else {
+        return false;
+    };
+    let mut pieces = reserved();
+    {
+        let mut carved = CARVED.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(i) = carved.iter().position(|r| *r == Range { start, len }) else {
+            return false;
+        };
+        carved.swap_remove(i);
+    }
+    // Fresh memory in place, so that what the title left there is dropped
+    // and nothing of the host's can land in the range meanwhile; if the
+    // host refuses, the pages only lose access and keep what they held.
+    if !Host::unmap_in_place(start, len) {
+        // SAFETY: a range `carve` handed out and its user gave back, which
+        // nothing refers into any more.
+        unsafe { Host::protect(start, len, Protection::NoAccess) };
+    }
+    // Back among the pieces, joined to its neighbours.
+    let at = pieces.partition_point(|r| r.start < start);
+    pieces.insert(at, Range { start, len });
+    if at + 1 < pieces.len() && start + len == pieces[at + 1].start {
+        pieces[at].len += pieces[at + 1].len;
+        pieces.remove(at + 1);
+    }
+    if at > 0 && pieces[at - 1].start + pieces[at - 1].len == start {
+        pieces[at - 1].len += pieces[at].len;
+        pieces.remove(at);
+    }
+    true
+}
+
+/// The unmapped, page-granular ranges within `[low, high)`, given the
+/// mapped ranges as `(start, end)` in any order.
+fn gaps(mut mapped: Vec<(usize, usize)>, page: usize, low: usize, high: usize) -> Vec<Range> {
     mapped.sort_unstable();
     let mut free = Vec::new();
     let mut push = |start: usize, end: usize| {
@@ -114,9 +172,9 @@ fn gaps(mut mapped: Vec<(usize, usize)>, page: usize) -> Vec<Range> {
             });
         }
     };
-    let mut cursor = LOW_FLOOR;
+    let mut cursor = low;
     for (start, end) in mapped {
-        if start >= LOW_LIMIT {
+        if start >= high {
             break;
         }
         if start > cursor {
@@ -124,16 +182,17 @@ fn gaps(mut mapped: Vec<(usize, usize)>, page: usize) -> Vec<Range> {
         }
         cursor = cursor.max(end);
     }
-    if cursor < LOW_LIMIT {
-        push(cursor, LOW_LIMIT);
+    if cursor < high {
+        push(cursor, high);
     }
     free
 }
 
 /// The mapped ranges, `(start, end)`, of `/proc/self/maps` (`start-end` in
-/// hex at the start of each line); none if it cannot be read.
+/// hex at the start of each line): all of them, whatever the bounds, which
+/// [`gaps`] applies; none if it cannot be read.
 #[cfg(target_os = "linux")]
-fn mapped_ranges() -> Vec<(usize, usize)> {
+fn mapped_ranges(_low: usize, _high: usize) -> Vec<(usize, usize)> {
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
         return Vec::new();
     };
@@ -219,18 +278,19 @@ mod mach {
     }
 }
 
-/// The task's regions below LOW_LIMIT, `(start, end)`: the executable's
-/// `__PAGEZERO` first, then what `mach_vm_region` reports, which returns each
-/// region at or after the address it is given.
+/// The task's regions from `low` (or the end of the executable's
+/// `__PAGEZERO`, if higher) to `high`, `(start, end)`: `__PAGEZERO` first,
+/// then what `mach_vm_region` reports, which returns each region at or
+/// after the address it is given.
 #[cfg(target_os = "macos")]
-fn mapped_ranges() -> Vec<(usize, usize)> {
+fn mapped_ranges(low: usize, high: usize) -> Vec<(usize, usize)> {
     let mut mapped = Vec::new();
     let page_zero = page_zero();
     if page_zero > 0 {
         mapped.push((0, page_zero));
     }
-    let mut address = page_zero as libc::mach_vm_address_t;
-    while address < LOW_LIMIT as libc::mach_vm_address_t {
+    let mut address = low.max(page_zero) as libc::mach_vm_address_t;
+    while address < high as libc::mach_vm_address_t {
         let mut size: libc::mach_vm_size_t = 0;
         let mut info = mach::BasicInfo64::default();
         let mut count = mach::BASIC_INFO_64_COUNT;
@@ -250,7 +310,7 @@ fn mapped_ranges() -> Vec<(usize, usize)> {
         };
         // KERN_INVALID_ADDRESS: no region at or after `address`. Any other
         // failure ends the walk the same way.
-        if result != libc::KERN_SUCCESS || address >= LOW_LIMIT as libc::mach_vm_address_t {
+        if result != libc::KERN_SUCCESS || address >= high as libc::mach_vm_address_t {
             break;
         }
         let Some(end) = address.checked_add(size) else {
@@ -293,7 +353,7 @@ mod tests {
             (0x0, 0x2_0000),
             (0x4_0000, 0x4_1000),
         ];
-        let free = gaps(mapped, page);
+        let free = gaps(mapped, page, LOW_FLOOR, LOW_LIMIT);
         assert_eq!(
             free,
             [
@@ -311,6 +371,20 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(gaps(vec![(0, usize::MAX)], page), []);
+        assert_eq!(gaps(vec![(0, usize::MAX)], page, LOW_FLOOR, LOW_LIMIT), []);
+        // Other bounds: only what lies within them.
+        assert_eq!(
+            gaps(vec![(0x4_0000, 0x5_0000)], page, 0x3_0000, 0x6_0000),
+            [
+                Range {
+                    start: 0x3_0000,
+                    len: 0x1_0000
+                },
+                Range {
+                    start: 0x5_0000,
+                    len: 0x1_0000
+                },
+            ]
+        );
     }
 }

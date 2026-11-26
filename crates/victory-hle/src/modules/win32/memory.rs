@@ -119,6 +119,9 @@ struct Region {
     /// and after the reservation that is not part of the region.
     host_start: usize,
     host_len: usize,
+    /// Carved out of the low 4 GiB the runner reserved
+    /// (`victory_platform::low`), and given back there on release.
+    low: bool,
 }
 
 static REGIONS: Mutex<BTreeMap<usize, Region>> = Mutex::new(BTreeMap::new());
@@ -225,6 +228,89 @@ fn reserve(
             pages,
             host_start,
             host_len,
+            low: false,
+        },
+    );
+    Ok(base)
+}
+
+/// Reserves `round_up(size, page)` bytes at an `align`-aligned base with
+/// the whole reservation within `[low, high)`: below 4 GiB from what the
+/// runner reserved there at start (`victory_platform::low::carve`), else
+/// in the first free range of the host's map that fits. The region's base.
+// `xmem` reserves through `virtual_alloc_within`; this is for callers that
+// reserve without committing, none yet.
+#[allow(dead_code)]
+pub(crate) fn reserve_within(
+    low: usize,
+    high: usize,
+    size: usize,
+    align: usize,
+    protect: u32,
+) -> Result<usize, u32> {
+    reserve_within_in(&mut regions(), low, high, size, align, protect)
+}
+
+/// [`reserve_within`] with the reservations held.
+fn reserve_within_in(
+    map: &mut BTreeMap<usize, Region>,
+    low: usize,
+    high: usize,
+    size: usize,
+    align: usize,
+    protect: u32,
+) -> Result<usize, u32> {
+    let page = page();
+    if size == 0 || !align.is_power_of_two() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let align = align.max(page);
+    let len = round_up(size, page).ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
+    let fits = |base: usize| base >= low && base.checked_add(len).is_some_and(|end| end <= high);
+    let (base, from_low) = if high <= 1 << 32 {
+        let base = victory_platform::low::carve(len, align).ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
+        if !fits(base) {
+            victory_platform::low::give_back(base, len);
+            return Err(ERROR_NOT_ENOUGH_MEMORY);
+        }
+        (base, true)
+    } else {
+        // Another allocation may take a range between the look and the
+        // allocation: the next range is tried then.
+        let base = victory_platform::low::free_ranges_between(low, high)
+            .into_iter()
+            .find_map(|range| {
+                let base = round_up(range.start, align)?;
+                let end = base.checked_add(len)?;
+                if end > range.start + range.len || !fits(base) {
+                    return None;
+                }
+                (Host::allocate(len, Some(base)) == Some(base)).then_some(base)
+            })
+            .ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
+        (base, false)
+    };
+    // Every page starts reserved, as in `reserve`. A refusal leaves them
+    // read-write, which no title relies on; the region stays.
+    // SAFETY: the memory just allocated or carved, which nothing refers
+    // into.
+    unsafe { Host::protect(base, len, Protection::NoAccess) };
+    let pages = vec![
+        Page {
+            committed: false,
+            protect: 0,
+        };
+        len / page
+    ];
+    map.insert(
+        base,
+        Region {
+            size: len,
+            allocation_protect: protect,
+            pages,
+            host_start: base,
+            host_len: len,
+            low: from_low,
         },
     );
     Ok(base)
@@ -304,11 +390,95 @@ fn virtual_alloc(address: usize, size: usize, kind: u32, protect: u32) -> Result
     }
 }
 
+/// As [`virtual_alloc`], but a reservation at no address of the title's
+/// lies within `[low, high)` at an `align`-aligned base
+/// ([`reserve_within`]).
+pub(crate) fn virtual_alloc_within(
+    address: usize,
+    size: usize,
+    kind: u32,
+    protect: u32,
+    low: usize,
+    high: usize,
+    align: usize,
+) -> Result<usize, u32> {
+    let kind = kind & !(MEM_TOP_DOWN | MEM_LARGE_PAGES);
+    if size == 0 {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    let host = protection(protect).ok_or(ERROR_INVALID_PARAMETER)?;
+    let mut map = regions();
+    match (kind & MEM_RESERVE != 0, kind & MEM_COMMIT != 0) {
+        (true, commit_too) => {
+            let base = if address == 0 {
+                reserve_within_in(&mut map, low, high, size, align, protect)?
+            } else {
+                reserve(&mut map, address, size, protect)?
+            };
+            if commit_too {
+                let len = map.get(&base).map_or(0, |r| r.size);
+                if let Err(code) = commit(&mut map, base, len, protect, host) {
+                    release(&mut map, base);
+                    return Err(code);
+                }
+            }
+            Ok(base)
+        }
+        (false, true) if address != 0 => commit(&mut map, address, size, protect, host),
+        _ => Err(ERROR_INVALID_PARAMETER),
+    }
+}
+
+/// Records the pages of `[address, address + len)`, which must lie in one
+/// region, as committed with `protect`: they show other memory now (a view
+/// of physical pages), which the caller maps there. Nothing is done to the
+/// host. False if the range is not in one region.
+pub(crate) fn mark_mapped(address: usize, len: usize, protect: u32) -> bool {
+    let to = Page {
+        committed: true,
+        protect,
+    };
+    mark(address, len, to)
+}
+
+/// Records the pages of `[address, address + len)`, which must lie in one
+/// region, as reserved again (the caller took what they showed away).
+/// Nothing is done to the host. False if the range is not in one region.
+pub(crate) fn mark_reserved(address: usize, len: usize) -> bool {
+    let to = Page {
+        committed: false,
+        protect: 0,
+    };
+    mark(address, len, to)
+}
+
+/// Gives the pages of `[address, address + len)` the state `to`, if they
+/// lie in one region.
+fn mark(address: usize, len: usize, to: Page) -> bool {
+    let mut map = regions();
+    let Some((base, region)) = region_at(&mut map, address) else {
+        return false;
+    };
+    let Some((first, last)) = page_range(base, region.pages.len(), address, len.max(1)) else {
+        return false;
+    };
+    region.pages[first..last].fill(to);
+    true
+}
+
+/// What `VirtualQuery` says about the page `address` is in.
+pub(crate) fn query(address: usize) -> MEMORY_BASIC_INFORMATION {
+    virtual_query(address)
+}
+
 /// Gives back the region at `base` and its whole host allocation.
 fn release(map: &mut BTreeMap<usize, Region>, base: usize) -> bool {
     let Some(region) = map.remove(&base) else {
         return false;
     };
+    if region.low {
+        return victory_platform::low::give_back(region.host_start, region.host_len);
+    }
     // SAFETY: the whole host allocation of a region the title released, so
     // nothing uses it any more.
     unsafe { Host::free(region.host_start, region.host_len) }
@@ -967,7 +1137,7 @@ pub struct MEMORYSTATUS {
 const _: () = assert!(std::mem::size_of::<MEMORYSTATUS>() == 56);
 
 /// Bytes committed in our reservations.
-fn committed_bytes() -> u64 {
+pub(crate) fn committed_bytes() -> u64 {
     let page = page() as u64;
     regions()
         .values()

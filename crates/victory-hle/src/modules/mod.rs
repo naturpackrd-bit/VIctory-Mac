@@ -39,6 +39,9 @@ pub mod xgameui;
 pub mod win32;
 #[cfg(windows)]
 pub mod xmem;
+#[cfg(not(windows))]
+#[path = "xmem_sections.rs"]
+pub mod xmem;
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;
@@ -70,7 +73,6 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(net::module());
     all.push(rpcrt4::module());
-    #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
