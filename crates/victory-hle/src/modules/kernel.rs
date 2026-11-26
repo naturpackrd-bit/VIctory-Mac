@@ -158,6 +158,11 @@ pub extern "win64" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *m
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+        // A title image we mapped: no host loader knows its exports.
+        #[cfg(not(windows))]
+        if runtime::image_path(module as usize).is_some() {
+            return title_export(module, name);
+        }
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
@@ -171,10 +176,40 @@ pub extern "win64" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *m
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
     let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-    match m.exports.iter().find(|e| e.name == name) {
+    // A DLL may be served by several modules (kernel32 by this one and by
+    // `win32`): the handle is the first's, the export may be any's.
+    let shared = |other: &&HleModule| other.dlls.iter().any(|d| m.dlls.contains(d));
+    let export = registry()
+        .iter()
+        .filter(shared)
+        .flat_map(|other| other.exports.iter())
+        .find(|e| e.name == name);
+    match export {
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The export `name` of the title image `module` (`runtime::export_of`);
+/// null for one it lacks and for an ordinal (we look exports up by name).
+#[cfg(not(windows))]
+fn title_export(module: *mut c_void, name: *const u8) -> *mut c_void {
+    if (name as usize) < 0x1_0000 {
+        tracing::warn!(
+            module = module as usize,
+            ordinal = name as usize,
+            "GetProcAddress by ordinal"
+        );
+        return std::ptr::null_mut();
+    }
+    let name = narrow(name);
+    match runtime::export_of(module as usize, &name) {
+        Some(address) => address as *mut c_void,
+        None => {
+            tracing::warn!(module = module as usize, %name, "GetProcAddress: no such export");
             std::ptr::null_mut()
         }
     }
@@ -283,6 +318,14 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     }
 }
 
+/// Off Windows, where the host has none: logged like [`exit`], then the
+/// process ends with `code`.
+#[cfg(not(windows))]
+pub extern "win64" fn ExitProcess(code: u32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title exits the process");
+    host::exit(code as i32)
+}
+
 /// See [`exit`]; only the current process is logged.
 pub extern "win64" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
@@ -326,7 +369,8 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
         return Some(base as *mut c_void);
     }
     // DLLs the host has too are real host modules, whatever `--strict` says.
-    let host_dll = HostPolicy::default().allows(&file);
+    // Off Windows there are no host modules: ours stand in for them.
+    let host_dll = cfg!(windows) && HostPolicy::default().allows(&file);
     if !host_dll && let Some(m) = registry().iter().find(|m| m.serves(&file)) {
         if load {
             tracing::info!(dll = file, "loaded as a pseudo module");
@@ -469,6 +513,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            #[cfg(not(windows))]
+            hle_export!(ExitProcess),
         ],
     }
 }
@@ -716,9 +762,6 @@ mod tests {
         }
     }
 
-    // Title paths are Windows paths, which only Windows' `Path` reads as
-    // such (`runtime::set_image_path`); elsewhere: docs/macos.md, M2.
-    #[cfg(windows)]
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
@@ -761,7 +804,6 @@ mod tests {
         unsafe { assert_eq!((*__p___argc(), (**__p___argv()).is_null()), (1, false)) };
     }
 
-    #[cfg(windows)]
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }
@@ -801,9 +843,6 @@ mod tests {
         );
     }
 
-    // Title paths are Windows paths, which only Windows' `Path` reads as
-    // such (`runtime::set_image_path`); elsewhere: docs/macos.md, M2.
-    #[cfg(windows)]
     #[test]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;

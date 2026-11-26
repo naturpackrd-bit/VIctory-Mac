@@ -1,20 +1,16 @@
 use std::path::Path;
 
-#[cfg(windows)]
 use anyhow::Context;
 use anyhow::Result;
 
 use crate::{Console, Unimplemented};
 
-#[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
-#[cfg(any(windows, test))]
 fn skip_cpu_check(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-#[cfg(any(windows, test))]
 fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
     if has_avx2 || skip_cpu_check(skip_env) {
         return Ok(());
@@ -27,7 +23,6 @@ fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()>
 
 /// Pre-flight check before executing title code: Xbox Series binaries are
 /// compiled for Zen 2 and require AVX2.
-#[cfg(windows)]
 fn check_cpu_features() -> Result<()> {
     #[cfg(target_arch = "x86_64")]
     let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
@@ -371,7 +366,6 @@ fn poke(base: usize, size: usize) {
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
-#[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
@@ -379,7 +373,6 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 /// The DLLs among `imported` (the main image's static imports) that must
 /// come from the title's folder (`wanted`) but were not mapped from it:
 /// none of their imports can be bound. Each named once, case ignored.
-#[cfg(any(windows, test))]
 fn absent_title_dlls(
     imported: &[&str],
     mapped: &[&str],
@@ -489,14 +482,12 @@ impl LateDlls {
 
 /// The Windows loader lock's shape: one thread at a time, re-entered by
 /// the thread that holds it.
-#[cfg(windows)]
 #[derive(Default)]
 struct LoaderLock {
     owner: std::sync::Mutex<(Option<std::thread::ThreadId>, usize)>,
     free: std::sync::Condvar,
 }
 
-#[cfg(windows)]
 impl LoaderLock {
     fn hold<T>(&self, f: impl FnOnce() -> T) -> T {
         let me = std::thread::current().id();
@@ -555,7 +546,7 @@ mod absent_tests {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
@@ -617,11 +608,497 @@ mod cpu_check_tests {
     }
 }
 
-/// Stub off Windows (docs/macos.md): the loader that maps and starts a
-/// title is Windows-only so far (macOS: milestone M2).
+/// Off Windows (docs/macos.md, M2b) the title is mapped by our own loader
+/// (`victory_loader::map`): its DLLs, dependencies first, then the
+/// executable, each bound against our runtime and the DLLs before it, and
+/// started on a thread of its own with the stack it asks for.
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
-    anyhow::bail!(
-        "running titles needs Windows for now; the macOS port is under way (docs/macos.md)"
-    )
+pub fn run(
+    exe: &Path,
+    unimplemented: Unimplemented,
+    strict: bool,
+    execute: bool,
+    console: Console,
+) -> Result<()> {
+    use victory_hle::{HleResolver, HostPolicy};
+    use victory_loader::stubs::UnimplementedPolicy;
+
+    if execute {
+        check_cpu_features()?;
+    }
+    let cfg = victory_core::Config::load()?;
+    let bytes = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let info = victory_pe::ImageInfo::parse(&bytes)?;
+    let hash = blake3::hash(&bytes).to_hex();
+    match victory_game::identify(&hash) {
+        Some(build) => println!("build          {} ({hash})", build.label),
+        None => println!("build          unknown ({hash})"),
+    }
+    if info.is_dll() {
+        anyhow::bail!("{} is a DLL, not a title executable", exe.display());
+    }
+    // The title's addresses below 4 GiB are kept for it before anything is
+    // mapped (a tools build of a test binary may have none free).
+    let free: usize = victory_platform::low::free_ranges()
+        .iter()
+        .map(|r| r.len)
+        .sum();
+    victory_platform::low::reserve();
+    println!(
+        "low memory     {:.2} GiB reserved below 4 GiB",
+        free as f64 / (1u64 << 30) as f64
+    );
+    if !victory_loader::faults::install() {
+        anyhow::bail!("installing the fault handlers failed");
+    }
+
+    let hle = HleResolver::new(if strict {
+        HostPolicy::none()
+    } else {
+        HostPolicy::default()
+    });
+    let wanted = |dll: &str| title_dll(&hle.host, dll);
+    let title_dir = exe
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // A missing manifest leaves id 0 and no storage quota.
+    let manifest =
+        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let title = victory_hle::runtime::Title::from_manifest(&manifest);
+    let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
+    println!(
+        "title          {:08X}, storage {} ({} MB)",
+        title.id,
+        storage.display(),
+        title.storage_bytes >> 20
+    );
+    // The console's fixed drives: the package as `G:`, temporary files `T:`.
+    victory_hle::modules::win32::files::mount_at('G', title_dir);
+    let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
+    victory_hle::modules::win32::files::mount_at('T', &temp);
+    victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
+    victory_hle::console::set(match console {
+        Console::SeriesX => victory_hle::console::Console::SeriesX,
+        Console::SeriesS => victory_hle::console::Console::SeriesS,
+    });
+    println!("console        {}", victory_hle::console::current().name());
+
+    let policy = match unimplemented {
+        Unimplemented::Trap => UnimplementedPolicy::Trap,
+        Unimplemented::Zero => UnimplementedPolicy::Zero,
+    };
+    let mut dlls = Vec::new();
+    for module in &info.imports {
+        if wanted(&module.dll) {
+            let mut visiting = Vec::new();
+            map_dll(
+                &module.dll,
+                title_dir,
+                &hle,
+                &wanted,
+                policy,
+                &mut dlls,
+                &mut visiting,
+            )?;
+        }
+    }
+    let imported: Vec<&str> = info.imports.iter().map(|m| m.dll.as_str()).collect();
+    let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
+    let absent = absent_title_dlls(&imported, &mapped, &wanted);
+    if !absent.is_empty() {
+        let message = format!(
+            "{} not in {}, and neither the host nor VIctory provides {}: the package is \
+             incomplete; copy every file of the package next to the executable",
+            absent.join(", "),
+            title_dir.display(),
+            if absent.len() == 1 { "it" } else { "them" },
+        );
+        println!("missing dlls   {message}");
+        if execute && matches!(unimplemented, Unimplemented::Trap) {
+            anyhow::bail!(
+                "the title's own DLLs are missing: {message} (`--unimplemented zero` runs it anyway)"
+            );
+        }
+    }
+
+    let exe_name = exe
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let resolver = TitleResolver::new(&hle, &dlls);
+    let image = MappedImage::map_with(&bytes, &exe_name, &resolver, policy)
+        .with_context(|| format!("mapping {}", exe.display()))?;
+    resolver.show(&exe_name);
+    drop(bytes);
+    // Never unmapped: title code may run until the process ends.
+    let exe_image: &'static MappedImage = Box::leak(Box::new(image));
+    victory_hle::runtime::set_main_image(exe_image.base());
+    victory_hle::runtime::set_image_path(exe_image.base(), &title_path(&exe_name));
+    println!(
+        "mapped at      {:#x} (preferred {:#x})",
+        exe_image.base(),
+        info.image_base
+    );
+    for (name, dll) in &dlls {
+        println!("title dll      {name} at {:#x}", dll.base());
+        victory_hle::runtime::set_image_path(dll.base(), &title_path(name));
+    }
+    if info.stack_reserve > 0 {
+        victory_hle::modules::win32::threads::set_default_stack_size(info.stack_reserve as usize);
+    }
+    if let Some(at) = exe_image.export("__XMemAllocationHooks__") {
+        victory_hle::modules::xmem::set_allocation_hooks(at);
+    }
+    let images = Images {
+        exe: exe_image,
+        dlls: dlls.clone(),
+    };
+    if IMAGES.set(std::sync::Mutex::new(images)).is_err() {
+        anyhow::bail!("a title was mapped already");
+    }
+    victory_hle::modules::win32::threads::set_thread_notifier(notify_images);
+    victory_hle::runtime::set_export_lookup(lookup);
+    let lock = LoaderLock::default();
+    let late_dir = title_dir.to_owned();
+    let late_hle = HleResolver::new(hle.host.clone());
+    victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
+        late_load(file, &lock, &late_dir, &late_hle, policy).map_err(|e| format!("{e:#}"))
+    }));
+
+    if !execute {
+        println!("not executing (pass --execute to start the title)");
+        return Ok(());
+    }
+    // Windows gives the main thread `SizeOfStackReserve`; the host's main
+    // thread is not ours to resize, so the title gets a thread of its own.
+    let stack = info.stack_reserve.max(1 << 20) as usize;
+    let main = std::thread::Builder::new()
+        .name("title main".into())
+        .stack_size(stack)
+        .spawn(move || -> Result<u32> {
+            use victory_loader::DLL_PROCESS_ATTACH;
+            victory_loader::teb::attach_current_thread();
+            for (name, dll) in &dlls {
+                dll.notify(DLL_PROCESS_ATTACH)
+                    .map_err(|e| anyhow::anyhow!("{name}'s DllMain refused: {e}"))?;
+            }
+            // The executable's TLS callbacks; its entry point runs below.
+            exe_image
+                .notify(DLL_PROCESS_ATTACH)
+                .map_err(|e| anyhow::anyhow!("{}'s TLS callbacks failed: {e}", exe_image.name()))?;
+            let entry = exe_image
+                .entry_point()
+                .ok_or_else(|| anyhow::anyhow!("the executable has no entry point"))?;
+            // `mainCRTStartup` takes nothing and returns its exit code.
+            Ok(victory_hle::modules::win32::threads::run_on_this_thread(
+                entry, 0,
+            ))
+        })
+        .context("starting the title's main thread")?;
+    let code = main
+        .join()
+        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    println!("title exited with {code}");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+use victory_loader::MappedImage;
+
+/// The title's images, mapped by `run` and never unmapped: title code may
+/// run until the process ends. Late loads add DLLs.
+#[cfg(not(windows))]
+struct Images {
+    exe: &'static MappedImage,
+    /// In the order they were mapped: each after the DLLs it imports.
+    dlls: Vec<(String, &'static MappedImage)>,
+}
+
+#[cfg(not(windows))]
+impl Images {
+    /// The image whose file is `file` (any case).
+    fn base_of(&self, file: &str) -> Option<usize> {
+        self.all()
+            .find(|(name, _)| name.eq_ignore_ascii_case(file))
+            .map(|(_, image)| image.base())
+    }
+
+    /// Every image, the DLLs in order and then the executable.
+    fn all(&self) -> impl Iterator<Item = (&str, &'static MappedImage)> {
+        let dlls = self
+            .dlls
+            .iter()
+            .map(|(name, image)| (name.as_str(), *image));
+        dlls.chain(std::iter::once((self.exe.name(), self.exe)))
+    }
+}
+
+#[cfg(not(windows))]
+static IMAGES: std::sync::OnceLock<std::sync::Mutex<Images>> = std::sync::OnceLock::new();
+
+#[cfg(not(windows))]
+fn images() -> Option<std::sync::MutexGuard<'static, Images>> {
+    Some(IMAGES.get()?.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The path the title sees for its file `name`: in the package, `G:`. Off
+/// Windows there is no host path a title could use.
+#[cfg(not(windows))]
+fn title_path(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("G:\\{name}"))
+}
+
+/// Tells every image of a thread's start or end (`DLL_THREAD_*`), the DLLs
+/// in order and then the executable. The list is read first, so that the
+/// lock is not held while title code runs.
+#[cfg(not(windows))]
+fn notify_images(reason: u32) {
+    let Some(list) = images().map(|images| {
+        images
+            .all()
+            .map(|(name, image)| (name.to_owned(), image))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    for (name, image) in list {
+        if let Err(error) = image.notify(reason) {
+            tracing::warn!(image = name, reason, %error, "notifying a title image failed");
+        }
+    }
+}
+
+/// `GetProcAddress` of a title image: its export `name`.
+#[cfg(not(windows))]
+fn lookup(base: usize, name: &str) -> Option<usize> {
+    let images = images()?;
+    let (_, image) = images.all().find(|(_, image)| image.base() == base)?;
+    image.export(name)
+}
+
+/// The entry of `dir` whose file name is `name`, case ignored (the title
+/// imports `Foo.DLL`, the folder has `foo.dll`).
+#[cfg(not(windows))]
+fn find_file(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+}
+
+/// Maps the title DLL `name` from `title_dir`, after the title DLLs it
+/// imports (`wanted`), each bound against our runtime and the DLLs in
+/// `mapped`, to which it is added under its file's own spelling. Nothing
+/// is done for one mapped already, one being mapped (a cycle), or one the
+/// folder lacks (the caller reports those).
+#[cfg(not(windows))]
+fn map_dll(
+    name: &str,
+    title_dir: &Path,
+    hle: &victory_hle::HleResolver,
+    wanted: &dyn Fn(&str) -> bool,
+    policy: victory_loader::stubs::UnimplementedPolicy,
+    mapped: &mut Vec<(String, &'static MappedImage)>,
+    visiting: &mut Vec<String>,
+) -> Result<()> {
+    if mapped.iter().any(|(m, _)| m.eq_ignore_ascii_case(name)) {
+        return Ok(());
+    }
+    if visiting.iter().any(|v| v.eq_ignore_ascii_case(name)) {
+        let from = visiting.last().map_or("", String::as_str);
+        tracing::warn!(dll = name, from, "title DLLs import each other: a cycle");
+        return Ok(());
+    }
+    let Some(path) = find_file(title_dir, name) else {
+        return Ok(());
+    };
+    let file_name = path
+        .file_name()
+        .map_or_else(|| name.to_owned(), |n| n.to_string_lossy().into_owned());
+    visiting.push(file_name.clone());
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let info = victory_pe::ImageInfo::parse(&bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    for module in &info.imports {
+        if wanted(&module.dll) {
+            map_dll(
+                &module.dll,
+                title_dir,
+                hle,
+                wanted,
+                policy,
+                mapped,
+                visiting,
+            )?;
+        }
+    }
+    let image = {
+        let resolver = TitleResolver::new(hle, mapped);
+        let image = MappedImage::map_with(&bytes, &file_name, &resolver, policy)
+            .with_context(|| format!("mapping {}", path.display()))?;
+        resolver.show(&file_name);
+        image
+    };
+    // Never unmapped, as the executable.
+    mapped.push((file_name, Box::leak(Box::new(image))));
+    visiting.pop();
+    Ok(())
+}
+
+/// A title image's imports: our runtime first, then the title's DLLs mapped
+/// so far; what each import was bound to is counted for the `bound` line.
+#[cfg(not(windows))]
+struct TitleResolver<'a> {
+    hle: &'a victory_hle::HleResolver,
+    dlls: &'a [(String, &'static MappedImage)],
+    hle_count: std::cell::Cell<u32>,
+    title_count: std::cell::Cell<u32>,
+    missing: std::cell::RefCell<Vec<String>>,
+}
+
+#[cfg(not(windows))]
+impl<'a> TitleResolver<'a> {
+    fn new(hle: &'a victory_hle::HleResolver, dlls: &'a [(String, &'static MappedImage)]) -> Self {
+        TitleResolver {
+            hle,
+            dlls,
+            hle_count: Default::default(),
+            title_count: Default::default(),
+            missing: Default::default(),
+        }
+    }
+
+    /// The `bound` line of the image `name`, and one line per import that
+    /// nobody provides.
+    fn show(&self, name: &str) {
+        let missing = self.missing.borrow();
+        println!(
+            "bound          {name}: {} hle, {} title, {} missing",
+            self.hle_count.get(),
+            self.title_count.get(),
+            missing.len()
+        );
+        for import in missing.iter() {
+            println!("  missing      {import}");
+        }
+    }
+
+    /// `dll!symbol` from a title DLL mapped already.
+    fn title(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_loader::{Provenance, Resolution};
+        let Some((_, image)) = self
+            .dlls
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(dll))
+        else {
+            return Resolution::Missing;
+        };
+        match symbol {
+            victory_pe::ImportSymbol::Name { name, .. } => match image.export(name) {
+                Some(address) => Resolution::Found {
+                    address,
+                    provenance: Provenance::Title,
+                },
+                None => Resolution::Missing,
+            },
+            // `MappedImage::export` finds exports by name only.
+            victory_pe::ImportSymbol::Ordinal(ordinal) => {
+                tracing::warn!(dll, ordinal, "a title DLL's export by ordinal: not bound");
+                Resolution::Missing
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl victory_loader::ImportResolver for TitleResolver<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_loader::{Provenance, Resolution};
+        let resolution = match self.hle.resolve(dll, symbol) {
+            Resolution::Missing => self.title(dll, symbol),
+            found => found,
+        };
+        let count = match resolution {
+            Resolution::Found {
+                provenance: Provenance::Title,
+                ..
+            } => &self.title_count,
+            Resolution::Found { .. } => &self.hle_count,
+            Resolution::Missing => {
+                self.missing.borrow_mut().push(format!("{dll}!{symbol}"));
+                return resolution;
+            }
+        };
+        count.set(count.get() + 1);
+        resolution
+    }
+}
+
+/// What a `LoadLibrary` of a title DLL not mapped yet reaches: maps it and
+/// the title DLLs it needs, binds them against those mapped before, and
+/// runs their `DllMain`s on the calling thread (a title thread, with a
+/// TEB), dependencies first, as the Windows loader would. Its base, or
+/// `None` if `file` is no title DLL or not in the folder.
+#[cfg(not(windows))]
+fn late_load(
+    file: &str,
+    lock: &LoaderLock,
+    title_dir: &Path,
+    hle: &victory_hle::HleResolver,
+    policy: victory_loader::stubs::UnimplementedPolicy,
+) -> Result<Option<usize>> {
+    use victory_hle::runtime::set_image_path;
+    if !title_dll(&hle.host, file) {
+        return Ok(None);
+    }
+    // Waits while another thread initialises a DLL; a `DllMain` that loads
+    // another DLL re-enters.
+    lock.hold(|| {
+        let mut dlls = {
+            let Some(images) = images() else {
+                return Ok(None);
+            };
+            if let Some(base) = images.base_of(file) {
+                return Ok(Some(base));
+            }
+            images.dlls.clone()
+        };
+        let before = dlls.len();
+        let wanted = |dll: &str| title_dll(&hle.host, dll);
+        map_dll(
+            file,
+            title_dir,
+            hle,
+            &wanted,
+            policy,
+            &mut dlls,
+            &mut Vec::new(),
+        )?;
+        let new = dlls.split_off(before);
+        // Visible before their `DllMain`s run, which may load more.
+        if let Some(mut images) = images() {
+            images.dlls.extend(new.iter().cloned());
+        }
+        for (name, dll) in &new {
+            set_image_path(dll.base(), &title_path(name));
+            println!(
+                "title dll      {name} at {:#x} (loaded by the title)",
+                dll.base()
+            );
+        }
+        for (name, dll) in &new {
+            dll.notify(victory_loader::DLL_PROCESS_ATTACH)
+                .map_err(|e| anyhow::anyhow!("{name}'s DllMain refused: {e}"))?;
+        }
+        Ok(new
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(file))
+            .map(|(_, dll)| dll.base()))
+    })
 }

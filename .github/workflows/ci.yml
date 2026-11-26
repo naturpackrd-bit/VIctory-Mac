@@ -98,7 +98,7 @@ jobs:
             cat run.txt
             case $target in
               aarch64-*) grep -F "built for x86-64" run.txt ;;
-              *) grep -F "needs Windows for now" run.txt ;;
+              *) grep -F "nothing.exe" run.txt ;;
             esac
           done
           # Both builds see the same machine: the available memory they

@@ -1,0 +1,19 @@
+# A tiny stand-in for a title's executable that any host can build: no
+# standard library, every import raw-dylib, linked by the rust-lld that
+# comes with Rust (no Windows SDK). victory's tests build it on demand into
+# their own target directory and run it with `victory run` (docs/macos.md).
+# It is NOT a workspace member.
+[package]
+name = "pe-exe"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]
