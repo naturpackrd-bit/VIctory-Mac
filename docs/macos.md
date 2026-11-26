@@ -29,8 +29,8 @@ XAudio2 on FAudio or our own (M3).
 
 | | Pass criterion | State |
 |---|---|---|
-| M1 | The workspace builds, passes clippy (`-D warnings`) and its tests on macOS, both targets; the binaries start and report the macOS default folders; Windows CI stays green | Code done; the macOS CI job (`.github/workflows/ci.yml`, `macos`) has not run yet |
-| M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: the repository's stand-in title (`tests/fixtures/hle-probe`) loads and runs | |
+| M1 | The workspace builds, passes clippy (`-D warnings`) and its tests on macOS, both targets; the binaries start and report the macOS default folders; Windows CI stays green | macOS: passed (CI run 1, Apple silicon runner, x86-64 under Rosetta 2). Windows: clippy passes; one test fails, `victory-gpu` `pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws`, on the runner's software renderer (WARP), in code this port has not changed; it needs a Windows machine with a GPU to tell whether WARP or the test is at fault |
+| M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: a stand-in title loads and runs | In progress. So far: the runtime crates are x86-64 only (the Apple silicon build is the tools); `extern "win64"` on title-facing code; a stand-in title any host builds (`tests/fixtures/pe-probe`, rust-lld, no Windows SDK); our loader (`victory_loader::MappedImage`) maps, relocates, binds and runs it (tests pass on Linux; macOS in CI). Next: TLS, the TEB on `gs`, exceptions, `ROSETTA_ADVERTISE_AVX`, the low 4 GiB |
 | M2b | Our replacements for the host DLLs the title calls: its C runtime starts | |
 | M2c | With your dump: the title reaches its frame loop headless (no GPU, no audio) for N minutes; every unimplemented import met is logged; memory use measured | |
 | M3 | SDL3 window, input, audio (XAudio2): the title's menu music plays and a pad moves through the menu | |
@@ -80,6 +80,10 @@ the milestone that replaces it.
 
 - `apps/victory/src/run.rs`, `run`: refuses to run a title ("needs Windows
   for now"). M2.
+- `victory-loader`, `map` (our own loader): maps, relocates and binds an
+  image; not yet static TLS, the exception table, delay imports, TLS
+  callbacks or the entry point, and an import nobody resolves fails the
+  mapping instead of getting a reporting stub. M2a.
 - `victory-loader`: steps 2 to 5 (mapping, binding, TLS, threads, crash
   reporting, Zen 2 instruction emulation, patches of the title's code) are not
   built. M2a.

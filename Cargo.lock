@@ -719,6 +719,7 @@ dependencies = [
  "tracing",
  "victory-core",
  "victory-pe",
+ "victory-platform",
  "windows-sys",
 ]
 
