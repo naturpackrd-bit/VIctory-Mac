@@ -30,8 +30,8 @@ XAudio2 on FAudio or our own (M3).
 | | Pass criterion | State |
 |---|---|---|
 | M1 | The workspace builds, passes clippy (`-D warnings`) and its tests on macOS, both targets; the binaries start and report the macOS default folders; Windows CI stays green | macOS: passed (CI runs 1 and 3, Apple silicon runner, x86-64 under Rosetta 2). Windows: clippy passes; one test fails, `victory-gpu` `pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws`, on the runner's software renderer (WARP), in code this port has not changed; it needs a Windows machine with a GPU to tell whether WARP or the test is at fault |
-| M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: a stand-in title loads and runs | In progress. Done: the runtime crates are x86-64 only (the Apple silicon build is the tools); `extern "win64"` on title-facing code; a stand-in title any host builds (`tests/fixtures/pe-probe`, rust-lld, no Windows SDK); our loader (`victory_loader::MappedImage`) maps, relocates, binds (delay imports ahead of time too), runs TLS callbacks and `DllMain`, and gives every unresolved import a stub that reports its first call (`UnimplementedPolicy`); a TEB of ours per thread, with static TLS, reached through the title's `gs` accesses patched at mapping (`victory_loader::teb`); faults in title code (SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE) taken on an alternate stack, the Zen 2 instructions the host lacks emulated (`clzero`, `monitorx`, `mwaitx`, `clwb`, SSE4a, `movntss`/`movntsd`), anything else a crash report without allocating (`victory_loader::faults`); x64 unwind data read and frames undone, handlers located (`victory_loader::unwind`); the low 4 GiB reserved at start and `ROSETTA_ADVERTISE_AVX` set by a relaunch (`apps/victory`). Tests pass on Linux and (CI) on Windows and macOS, both targets, except the low-memory test under Rosetta 2, fixed after CI run 9 (`__PAGEZERO` is the floor of the map, not a region). Next: SEH dispatch (`RtlDispatchException`'s work on the handlers the unwinder finds, `RaiseException`, `__C_specific_handler`), threads, then the title's entry |
-| M2b | Our replacements for the host DLLs the title calls: its C runtime starts | In progress: `victory-hle`'s `win32` module (built off Windows only; it serves `kernel32`, `kernelbase`, `ntdll` and the `api-ms-win-core-*` sets) has handles and the last error (8 exports), synchronization (66: events, semaphores, mutexes and the waits, critical sections, SRW locks, condition variables, `WaitOnAddress`, `InitOnce`, `SList`), memory (40: `VirtualAlloc` and family with reserve/commit kept here, heaps, `GlobalMemoryStatusEx`) and clocks, system information, processor features and the Windows version (33), threads with TLS and FLS slots (37: `CreateThread` on a host thread with the title's stack size, a TEB and the images told of the thread, `ExitThread` through a jump buffer); 184 exports, with tests on Linux. Not yet: files, the C runtime (`ucrt`: sizing needs the census of your dump), `RaiseException` and friends |
+| M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: a stand-in title loads and runs | In progress. Done: the runtime crates are x86-64 only (the Apple silicon build is the tools); `extern "win64"` on title-facing code; a stand-in title any host builds (`tests/fixtures/pe-probe`, rust-lld, no Windows SDK); our loader (`victory_loader::MappedImage`) maps, relocates, binds (delay imports ahead of time too), runs TLS callbacks and `DllMain`, and gives every unresolved import a stub that reports its first call (`UnimplementedPolicy`); a TEB of ours per thread, with static TLS, reached through the title's `gs` accesses patched at mapping (`victory_loader::teb`); faults in title code (SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE) taken on an alternate stack, the Zen 2 instructions the host lacks emulated (`clzero`, `monitorx`, `mwaitx`, `clwb`, SSE4a, `movntss`/`movntsd`), anything else a crash report without allocating (`victory_loader::faults`); x64 unwind data read and frames undone, handlers located (`victory_loader::unwind`); structured exception handling as ntdll does it (`victory_loader::seh`): a fault becomes an exception record and context on the faulting thread's own stack, vectored handlers and then the frames' language handlers are called, `__C_specific_handler` runs `__except` filters and `__finally` blocks, `RtlUnwindEx` unwinds to a target frame, `RaiseException` raises from the title, and the unhandled filter and a crash report take what no handler does; a stand-in title with real scope tables exercises each path in a test; the low 4 GiB reserved at start and `ROSETTA_ADVERTISE_AVX` set by a relaunch (`apps/victory`). Tests pass on Linux and (CI) on Windows and macOS, both targets, except the low-memory test under Rosetta 2, fixed after CI run 9 (`__PAGEZERO` is the floor of the map, not a region). Next: the runner that maps the title's executable and its DLLs with our loader and calls its entry (K); C++ exceptions (`__CxxFrameHandler4`) with the C runtime |
+| M2b | Our replacements for the host DLLs the title calls: its C runtime starts | In progress: `victory-hle`'s `win32` module (built off Windows only; it serves `kernel32`, `kernelbase`, `ntdll` and the `api-ms-win-core-*` sets) has handles and the last error (8 exports), synchronization (66: events, semaphores, mutexes and the waits, critical sections, SRW locks, condition variables, `WaitOnAddress`, `InitOnce`, `SList`), memory (40: `VirtualAlloc` and family with reserve/commit kept here, heaps, `GlobalMemoryStatusEx`) and clocks, system information, processor features and the Windows version (33), threads with TLS and FLS slots (37: `CreateThread` on a host thread with the title's stack size, a TEB and the images told of the thread, `ExitThread` through a jump buffer), the file API over host folders (74: each drive letter a host folder, Windows paths resolved regardless of case, `CreateFile` and its family, find handles, overlapped I/O completing at once, the console streams and `NUL`), exceptions (27: `RaiseException`, `RtlUnwindEx`, `__C_specific_handler`, vectored handlers, the error modes, no debugger); 285 exports, with tests on Linux. In progress: the C runtime (`ucrt`: startup, heap, strings, math, time, locale; then stdio) and the title's memory (`xmem`) over shared memory views |
 | M2c | With your dump: the title reaches its frame loop headless (no GPU, no audio) for N minutes; every unimplemented import met is logged; memory use measured | |
 | M3 | SDL3 window, input, audio (XAudio2): the title's menu music plays and a pad moves through the menu | |
 | M4 | Metal back end: the menu, then the city street, render as on Windows; frame times and memory measured | |
@@ -79,7 +79,8 @@ the milestone that replaces it.
 ### Runtime and loader
 
 - `apps/victory/src/run.rs`, `run`: refuses to run a title ("needs Windows
-  for now"). M2.
+  for now"); the macOS runner (map with our loader, mount the drives,
+  threads and stacks, the entry point) is the next slice. M2c.
 - `victory-loader`, `map` (our own loader): an import nobody resolves gets,
   by `UnimplementedPolicy`, a refusal of the mapping (`Refuse`), a stub that
   traps (`Trap`) or one that logs its first call and returns 0 (`Zero`);
@@ -94,15 +95,26 @@ the milestone that replaces it.
   before it is run. A thread's TLS blocks for an image mapped after the
   thread attached appear when it attaches again. M2a/M2b.
 - `victory-loader`, `faults`: a fault in title code that is not a Zen 2
-  instruction to emulate ends the process with a crash report (registers,
-  the top of the stack) and exit code 128 + the signal; the title's own
-  handlers (`__try`, vectored handlers, `SetUnhandledExceptionFilter`) are
-  not yet called, though `unwind` finds them: SEH dispatch is M2a's next
-  step. Faults in our own code go to the handler that was installed before
-  ours (Rust's, which aborts). Up to 8 handlers of ours (`register`); the
-  alternate stack (64 KiB) is leaked when a thread ends. M2a.
-- `victory-loader`, `unwind`: a frame's handler and language-specific data
-  are located but never invoked (see `faults`); `backtrace` reads an image's
+  instruction to emulate is handed to `seh` on the thread's own stack; a
+  thread with no room left there (a stack overflow) gets the old crash
+  report (registers, the top of the stack) and exit code 128 + the signal,
+  a path no test has run. Faults in our own code go to the handler that
+  was installed before ours (Rust's, which aborts). Up to 8 handlers of
+  ours (`register`); the alternate stack (64 KiB) is leaked when a thread
+  ends. M2a.
+- `victory-loader`, `seh`: the context of a fault always carries MXCSR
+  `0x1F80`, so resuming drops a rounding mode the title set; every SIGFPE
+  is `STATUS_INTEGER_DIVIDE_BY_ZERO` and every SIGTRAP `STATUS_BREAKPOINT`
+  (single steps included); dynamic function tables
+  (`RtlAddFunctionTable`, `RtlInstallFunctionTableCallback`) are accepted
+  with a warning and not kept; `RtlVirtualUnwind` ignores its context
+  pointers; `RtlCaptureStackBackTrace` returns no frames (its callers are
+  our own frames, which have no unwind data); the `CONTEXT_*` flags are the
+  bare bits without `CONTEXT_AMD64`; collided unwinds and noncontinuable
+  exceptions have the code paths and no test; a thread with no TEB counts
+  its stack limit as 0. Nothing of this has run on macOS, where
+  `__es.__err` gives the write bit (compile-checked only). M2a/M2c.
+- `victory-loader`, `unwind`: `backtrace` reads an image's
   exception table again for every frame, and reads an epilogue a byte at a
   time (one checked read a byte: fine for a crash report, to be made one
   read when exceptions are dispatched often). The establisher frame of a
@@ -161,19 +173,40 @@ the milestone that replaces it.
   the kernel's page size (16 KiB under Rosetta 2 too): CI run 10 saw the
   native and the Rosetta build agree (6.8 and 6.7 GiB available of 14), as
   they would not with Rosetta's 4 KiB. M2b.
+- `victory-hle/src/modules/win32`, `files`: `SetFileTime` and
+  `FileBasicInfo` return success and set nothing; `GetDiskFreeSpaceExW` and
+  `GetDiskFreeSpaceW` report a total of twice the free space, and off
+  Windows `storage::disk_free` is `u64::MAX`, so neither number is real;
+  `MOVEFILE_COPY_ALLOWED` is ignored, so a move between drives works only
+  where the host renames between the two folders; `CreateSymbolicLinkW`
+  fails; a UNC path fails with `ERROR_PATH_NOT_FOUND`; `X:name` resolves
+  against the drive's root (no current directory per drive); trailing dots
+  and spaces are not trimmed from names; `GetFinalPathNameByHandleW` gives
+  the `\\?\X:\` form for every flag; `ReadFileEx` and `WriteFileEx`
+  call their completion routine at once (no APC queue); a find ignores its
+  information level's extras, `search_op` and flags; read-only files are
+  recognised by the owner's write bit; files are created with host write
+  access whatever the title asked, and the title's own access is checked
+  after. APFS case folding, `created()` and `ctime` are untested on macOS:
+  only the Linux tests have run this. M2b/M2c.
+- `victory-hle/src/modules/win32`, `exceptions`: no debugger is ever
+  present; `DebugBreak` is an `int3`, which the title's handlers see as
+  `STATUS_BREAKPOINT`; the error modes are stored and change nothing. M2b.
 - `victory-hle/src/modules/kernel.rs`, the non-Windows `host` module: every
   host call fails (null handles, zero lengths, no stack walk); `exit`,
   `abort` and `TerminateProcess` end our process. `SetThreadPriority`
   changes nothing and fails. The last error is the `win32` module's now
-  (`GetLastError`, in the TEB). M2b.
+  (`GetLastError`, in the TEB), and `SetUnhandledExceptionFilter` installs
+  the filter `seh` calls. M2b.
 - `victory-hle/src/host.rs`, non-Windows `imp::resolve`: no host DLL serves
   any import; on macOS this stays so, and our own implementations replace
   them. M2b.
 - `victory-hle/src/modules/d3d12x.rs`, `create_device`: the device keeps its
   own allocator, the title's memory (`xmem`) being Windows-only. M2.
 - `victory-hle/src/modules/storage.rs`, `folder`: no persistent-storage
-  drive; its path calls fail (`files`, the virtual drives, is Windows-only).
-  M2.
+  drive; its path calls fail until the runner mounts the drives
+  (`win32::files::mount_at` off Windows, as `files::mount_at` on Windows).
+  M2c.
 - `victory-hle/src/modules/rpcrt4.rs`: identifiers come from a counter mixed
   with the time, not from the system's random generator. M2.
 - `victory-hle/src/modules/xgame.rs`, `XLaunchNewGame`: no relaunch. M2.
