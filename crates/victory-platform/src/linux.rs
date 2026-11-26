@@ -2,9 +2,64 @@
 
 use std::path::PathBuf;
 
-use crate::{Dirs, Host, Memory};
+use crate::{Dirs, Host, Memory, Protection};
+
+fn host_protection(protection: Protection) -> libc::c_int {
+    match protection {
+        Protection::NoAccess => libc::PROT_NONE,
+        Protection::Read => libc::PROT_READ,
+        Protection::ReadWrite => libc::PROT_READ | libc::PROT_WRITE,
+        Protection::ReadExecute => libc::PROT_READ | libc::PROT_EXEC,
+        Protection::ReadWriteExecute => libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+    }
+}
 
 impl Memory for Host {
+    fn page_size() -> usize {
+        // SAFETY: a plain query.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
+    fn allocate(len: usize, at: Option<usize>) -> Option<usize> {
+        let fixed = if at.is_some() {
+            libc::MAP_FIXED_NOREPLACE
+        } else {
+            0
+        };
+        // SAFETY: a fresh anonymous mapping; MAP_FIXED_NOREPLACE fails rather
+        // than replace what is there.
+        let p = unsafe {
+            libc::mmap(
+                at.unwrap_or(0) as *mut libc::c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | fixed,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        // Kernels before 4.17 take the flag for a hint.
+        if at.is_some_and(|at| at != p as usize) {
+            // SAFETY: the mapping just made, used by nobody.
+            unsafe { libc::munmap(p, len) };
+            return None;
+        }
+        Some(p as usize)
+    }
+
+    unsafe fn protect(at: usize, len: usize, protection: Protection) -> bool {
+        // SAFETY: the caller's range of our memory.
+        unsafe { libc::mprotect(at as *mut libc::c_void, len, host_protection(protection)) == 0 }
+    }
+
+    unsafe fn free(at: usize, len: usize) -> bool {
+        // SAFETY: the caller's whole allocation.
+        unsafe { libc::munmap(at as *mut libc::c_void, len) == 0 }
+    }
+
     unsafe fn read(src: usize, dst: *mut u8, len: usize) -> bool {
         if len == 0 {
             return true;

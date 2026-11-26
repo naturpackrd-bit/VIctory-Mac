@@ -16,6 +16,10 @@ pub const FILE_HEADER_CHARACTERISTICS: usize = 18;
 
 /// `IMAGE_OPTIONAL_HEADER64::AddressOfEntryPoint` (u32).
 pub const OPT_ADDRESS_OF_ENTRY_POINT: usize = 16;
+/// `IMAGE_OPTIONAL_HEADER64::ImageBase` (u64).
+pub const OPT_IMAGE_BASE: usize = 24;
+/// `IMAGE_OPTIONAL_HEADER64::SizeOfHeaders` (u32).
+pub const OPT_SIZE_OF_HEADERS: usize = 60;
 /// `IMAGE_OPTIONAL_HEADER64::CheckSum` (u32).
 pub const OPT_CHECKSUM: usize = 64;
 /// `IMAGE_OPTIONAL_HEADER64::DllCharacteristics` (u16).

@@ -118,6 +118,37 @@ impl CodeViewInfo {
     }
 }
 
+/// The RVAs a loader adds its displacement to when the image cannot have
+/// its preferred base: every 64-bit absolute address
+/// (`IMAGE_REL_BASED_DIR64`) the base relocation table lists, in its order.
+/// Padding entries (`IMAGE_REL_BASED_ABSOLUTE`) are left out; any other kind
+/// is refused, x86-64 images having none.
+pub fn base_relocations(data: &[u8]) -> Result<Vec<u32>, PeError> {
+    let file = PeFile64::parse(data)?;
+    let Some(mut blocks) = file
+        .data_directories()
+        .relocation_blocks(data, &file.section_table())?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut rvas = Vec::new();
+    while let Some(block) = blocks.next()? {
+        for relocation in block {
+            match relocation.typ {
+                pe::IMAGE_REL_BASED_ABSOLUTE => {}
+                pe::IMAGE_REL_BASED_DIR64 => rvas.push(relocation.virtual_address),
+                other => {
+                    return Err(PeError::Unsupported(format!(
+                        "base relocation of type {other:?} at rva {:#x}",
+                        relocation.virtual_address
+                    )));
+                }
+            }
+        }
+    }
+    Ok(rvas)
+}
+
 /// Upper bound on TLS callbacks we are willing to walk (defends against garbage).
 const MAX_TLS_CALLBACKS: usize = 1024;
 

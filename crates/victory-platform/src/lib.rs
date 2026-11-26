@@ -24,8 +24,44 @@ compile_error!("victory-platform supports Windows and macOS (and Linux, for test
 /// This process's host: every subsystem trait is implemented for it.
 pub struct Host;
 
+/// What code may do with a range of memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    NoAccess,
+    Read,
+    ReadWrite,
+    ReadExecute,
+    ReadWriteExecute,
+}
+
 /// This process's memory, as the kernel sees it.
 pub trait Memory {
+    /// The page size: the unit of [`Memory::allocate`] and
+    /// [`Memory::protect`] (4 KiB on Windows and for x86-64 processes under
+    /// Rosetta 2).
+    fn page_size() -> usize;
+
+    /// `len` bytes of fresh, zeroed, read-write memory starting at a page:
+    /// at `at` if the whole range is free there (what is already mapped is
+    /// never replaced), else `None`; with `at` `None`, wherever the host puts
+    /// it.
+    fn allocate(len: usize, at: Option<usize>) -> Option<usize>;
+
+    /// Gives the pages of `[at, at + len)` `protection`; false if the host
+    /// refused.
+    ///
+    /// # Safety
+    /// The range lies in memory from [`Memory::allocate`], and nothing that
+    /// holds a reference into it is left with access it no longer has.
+    unsafe fn protect(at: usize, len: usize, protection: Protection) -> bool;
+
+    /// Gives back one whole allocation of [`Memory::allocate`].
+    ///
+    /// # Safety
+    /// `at` and `len` are those of the allocation, and nothing uses it any
+    /// more.
+    unsafe fn free(at: usize, len: usize) -> bool;
+
     /// Copies `len` bytes of this process's memory at `src` to `dst`, the
     /// kernel checking the source: false if a page of it is not readable
     /// (`dst` may then hold some of it). Nothing faults, whatever `src` is.
@@ -101,58 +137,78 @@ mod tests {
     /// A readable page of 7s and a page with no access after it: (the
     /// readable page, the page size). Never freed (two pages, for the
     /// test's life).
-    #[cfg(unix)]
     fn readable_then_no_access() -> (usize, usize) {
-        // SAFETY: a page-size query, a fresh anonymous mapping of two pages
-        // and changes to that mapping only.
+        let size = Host::page_size();
+        let p = Host::allocate(2 * size, None).expect("two pages");
+        // SAFETY: the first of our two fresh pages; then the second's
+        // protection, which nothing refers into.
         unsafe {
-            let size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            let p = libc::mmap(
-                std::ptr::null_mut(),
-                2 * size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            );
-            assert_ne!(p, libc::MAP_FAILED);
-            p.cast::<u8>().write_bytes(7, size);
-            assert_eq!(
-                libc::mprotect(p.cast::<u8>().add(size).cast(), size, libc::PROT_NONE),
-                0
-            );
-            (p as usize, size)
+            (p as *mut u8).write_bytes(7, size);
+            assert!(Host::protect(p + size, size, Protection::NoAccess));
         }
+        (p, size)
     }
 
-    #[cfg(windows)]
-    fn readable_then_no_access() -> (usize, usize) {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
-        };
-        // Windows on x64 has 4 KiB pages.
-        const SIZE: usize = 4096;
-        // SAFETY: a fresh allocation of two pages and changes to it only.
+    #[test]
+    fn allocations_are_zeroed_writable_and_given_back() {
+        let size = Host::page_size();
+        assert!(size >= 4096 && size.is_power_of_two(), "{size}");
+        let p = Host::allocate(3 * size, None).expect("three pages");
+        assert_eq!(p % size, 0, "starts at a page");
+        // SAFETY: our fresh, read-write allocation.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, 3 * size) };
+        assert!(bytes.iter().all(|&b| b == 0));
+        bytes[3 * size - 1] = 0x5a;
+        assert_eq!(bytes[3 * size - 1], 0x5a);
+        // SAFETY: the whole allocation, no longer used.
+        assert!(unsafe { Host::free(p, 3 * size) });
+    }
+
+    /// An allocation at an address fails where something is mapped, and
+    /// what is there is left as it was; where nothing is, it is given there.
+    #[test]
+    fn fixed_allocations_never_replace_a_mapping() {
+        let size = Host::page_size();
+        let taken = Host::allocate(2 * size, None).expect("two pages");
+        // SAFETY: our fresh allocation.
+        unsafe { (taken as *mut u8).write(0x77) };
+        assert_eq!(Host::allocate(size, Some(taken)), None);
+        // SAFETY: as above, still mapped and unchanged.
+        assert_eq!(unsafe { (taken as *const u8).read() }, 0x77);
+        // SAFETY: the whole allocation, no longer used.
+        assert!(unsafe { Host::free(taken, 2 * size) });
+        // Somewhere free: just given back, unless another test's allocation
+        // took it meanwhile (then a fresh one is found and given back).
+        let placed = (0..8).find_map(|_| {
+            let free = Host::allocate(size, None)?;
+            // SAFETY: as above.
+            assert!(unsafe { Host::free(free, size) });
+            Host::allocate(size, Some(free)).map(|p| (p, free))
+        });
+        let (p, free) = placed.expect("an allocation at a free address");
+        assert_eq!(p, free);
+        // SAFETY: as above.
+        assert!(unsafe { Host::free(p, size) });
+    }
+
+    /// Code written into an allocation runs once the allocation is made
+    /// executable: the loader maps title code so (under Rosetta 2 on
+    /// Apple silicon too).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn written_code_runs_once_executable() {
+        // mov eax, 42; ret
+        const CODE: [u8; 6] = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+        let size = Host::page_size();
+        let p = Host::allocate(size, None).expect("a page");
+        // SAFETY: our fresh page; made read-execute once written, then
+        // called as the function the bytes are; freed when done.
         unsafe {
-            let p = VirtualAlloc(
-                std::ptr::null(),
-                2 * SIZE,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            );
-            assert!(!p.is_null());
-            p.cast::<u8>().write_bytes(7, SIZE);
-            let mut old = 0;
-            assert_ne!(
-                VirtualProtect(
-                    p.cast::<u8>().add(SIZE).cast(),
-                    SIZE,
-                    PAGE_NOACCESS,
-                    &mut old
-                ),
-                0
-            );
-            (p as usize, SIZE)
+            std::ptr::copy_nonoverlapping(CODE.as_ptr(), p as *mut u8, CODE.len());
+            assert!(Host::protect(p, size, Protection::ReadExecute));
+            let f: extern "C" fn() -> u32 = std::mem::transmute(p);
+            assert_eq!(f(), 42);
+            assert!(Host::free(p, size));
         }
     }
 

@@ -11,7 +11,7 @@ pub mod layout;
 
 pub use image::{
     CodeViewInfo, ExportInfo, ImageInfo, ImportEntry, ImportModule, ImportSymbol, SectionInfo,
-    TlsInfo,
+    TlsInfo, base_relocations,
 };
 
 /// Errors produced while parsing an image or import library.
