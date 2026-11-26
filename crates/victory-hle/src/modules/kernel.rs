@@ -662,6 +662,7 @@ mod host {
     }
 
     pub(super) fn exit(code: i32) -> ! {
+        crate::modules::ucrt::runtime::run_exit_hooks();
         std::process::exit(code)
     }
 
