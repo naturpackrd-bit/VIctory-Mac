@@ -102,11 +102,13 @@ mod tests {
         );
     }
 
+    /// A function nobody serves (not even Windows: the name is made up, so
+    /// that no later module of ours takes it) is reported missing.
     #[test]
     fn strict_policy_reports_missing() {
         let r = HleResolver::new(HostPolicy::none());
         assert_eq!(
-            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("Sleep")),
+            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("NoSuchFunction")),
             None
         );
     }
