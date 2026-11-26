@@ -31,7 +31,7 @@ XAudio2 on FAudio or our own (M3).
 |---|---|---|
 | M1 | The workspace builds, passes clippy (`-D warnings`) and its tests on macOS, both targets; the binaries start and report the macOS default folders; Windows CI stays green | macOS: passed (CI runs 1 and 3, Apple silicon runner, x86-64 under Rosetta 2). Windows: clippy passes; one test fails, `victory-gpu` `pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws`, on the runner's software renderer (WARP), in code this port has not changed; it needs a Windows machine with a GPU to tell whether WARP or the test is at fault |
 | M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: a stand-in title loads and runs | In progress. Done: the runtime crates are x86-64 only (the Apple silicon build is the tools); `extern "win64"` on title-facing code; a stand-in title any host builds (`tests/fixtures/pe-probe`, rust-lld, no Windows SDK); our loader (`victory_loader::MappedImage`) maps, relocates, binds (delay imports ahead of time too), runs TLS callbacks and `DllMain`, and gives every unresolved import a stub that reports its first call (`UnimplementedPolicy`); a TEB of ours per thread, with static TLS, reached through the title's `gs` accesses patched at mapping (`victory_loader::teb`); faults in title code (SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE) taken on an alternate stack, the Zen 2 instructions the host lacks emulated (`clzero`, `monitorx`, `mwaitx`, `clwb`, SSE4a, `movntss`/`movntsd`), anything else a crash report without allocating (`victory_loader::faults`); x64 unwind data read and frames undone, handlers located (`victory_loader::unwind`); the low 4 GiB reserved at start and `ROSETTA_ADVERTISE_AVX` set by a relaunch (`apps/victory`). Tests pass on Linux and (CI) on Windows and macOS, both targets, except the low-memory test under Rosetta 2, fixed after CI run 9 (`__PAGEZERO` is the floor of the map, not a region). Next: SEH dispatch (`RtlDispatchException`'s work on the handlers the unwinder finds, `RaiseException`, `__C_specific_handler`), threads, then the title's entry |
-| M2b | Our replacements for the host DLLs the title calls: its C runtime starts | In progress: `victory-hle`'s `win32` module (built off Windows only; it serves `kernel32`, `kernelbase`, `ntdll` and the `api-ms-win-core-*` sets) has handles and the last error (8 exports), synchronization (66: events, semaphores, mutexes and the waits, critical sections, SRW locks, condition variables, `WaitOnAddress`, `InitOnce`, `SList`), memory (40: `VirtualAlloc` and family with reserve/commit kept here, heaps, `GlobalMemoryStatusEx`) and clocks, system information, processor features and the Windows version (33); 147 exports, with tests on Linux. Not yet: threads and dynamic TLS, files, the C runtime (`ucrt`: sizing needs the census of your dump), `RaiseException` and friends |
+| M2b | Our replacements for the host DLLs the title calls: its C runtime starts | In progress: `victory-hle`'s `win32` module (built off Windows only; it serves `kernel32`, `kernelbase`, `ntdll` and the `api-ms-win-core-*` sets) has handles and the last error (8 exports), synchronization (66: events, semaphores, mutexes and the waits, critical sections, SRW locks, condition variables, `WaitOnAddress`, `InitOnce`, `SList`), memory (40: `VirtualAlloc` and family with reserve/commit kept here, heaps, `GlobalMemoryStatusEx`) and clocks, system information, processor features and the Windows version (33), threads with TLS and FLS slots (37: `CreateThread` on a host thread with the title's stack size, a TEB and the images told of the thread, `ExitThread` through a jump buffer); 184 exports, with tests on Linux. Not yet: files, the C runtime (`ucrt`: sizing needs the census of your dump), `RaiseException` and friends |
 | M2c | With your dump: the title reaches its frame loop headless (no GPU, no audio) for N minutes; every unimplemented import met is logged; memory use measured | |
 | M3 | SDL3 window, input, audio (XAudio2): the title's menu music plays and a pad moves through the menu | |
 | M4 | Metal back end: the menu, then the city street, render as on Windows; frame times and memory measured | |
@@ -126,6 +126,21 @@ the milestone that replaces it.
   refused; an `SLIST_HEADER`'s sequence bytes are unused. Every signal
   wakes every waiter through one condition variable, to be made finer when
   it costs. M2b/M2c.
+- `victory-hle/src/modules/win32`, `threads`: `SuspendThread` works only on
+  a thread that has not begun running (one created suspended); on a running
+  one it fails (`ERROR_NOT_SUPPORTED`, a warning once). `TerminateThread`,
+  `GetThreadContext`, `SetThreadContext` and `QueueUserAPC` fail the same
+  way. `ExitThread` returns from the start routine's call without unwinding
+  the title's frames (they need none), so one called from inside a callback
+  our Rust code invoked (`InitOnce`, FLS, TLS callbacks) skips that Rust
+  frame, which must hold nothing to drop; `ExitThread` on a thread we did
+  not start ends the host thread (`pthread_exit`), untested on either host.
+  `TlsAlloc` zeroes the new slot in the calling thread only and `TlsFree`
+  leaves other threads' values; a thread using an expansion slot (index 64
+  and up) gets an 8 KiB array kept for the process's life. `FlsFree` runs
+  the slot's callback for the calling thread's value only. Priorities and
+  affinities are kept and reported, not applied (`SetThreadPriority` is
+  `kernel.rs`'s and does not store here). M2b/M2c.
 - `victory-hle/src/modules/win32`, `memory`: `PAGE_GUARD` becomes a page
   with no access (the one-shot guard fault is not kept); `VirtualQuery`
   knows only reservations made through these functions, so what the host,
@@ -286,6 +301,24 @@ four tests), `victory-hle` `kernel` (two, title paths above) and `storage`
   macOS 27, the version this Mac runs, and that later versions keep only what
   older games need. Decision 1 may not outlive macOS 27; to check against
   Apple's current word before M5.
+
+## Other forks looked at
+
+- Belobug/VIctory-Belobug-AMD (2026-11-26): our `main` (c9c932c) plus three
+  commits, all in the Windows D3D12 renderer: RX 9070 XT fixes with an HUD
+  (a filter for garbage light probes, a vectored handler that parks a
+  pipeline worker the AMD driver's compiler crashed under, a texture size
+  cap under VRAM pressure, pooled indirect-batch buffers, descriptor tables
+  released at landing, `lto = "thin"` and one codegen unit in the release
+  profile), title textures uploaded on the submission's prelude after the
+  refresh (one frame less of latency, no flicker in video rings), and a
+  bridge to AMD's PC FidelityFX 4 upscaler (needs its signed DLL). Not
+  merged: nothing of it runs on macOS, where M4 replaces that renderer with
+  Metal; it is AMD- and Windows-specific in two of three parts; and neither
+  the user nor CI has a Windows GPU to run it on (CI's WARP only compiles
+  and unit-tests it). For M4, two ideas worth keeping: deciding a texture's
+  upload at submission time after its staging refresh, and clamping a
+  texture array view's mip range to the host copy's levels (`from_base`).
 
 ## Memory
 
