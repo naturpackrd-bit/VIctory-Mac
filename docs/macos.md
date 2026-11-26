@@ -199,11 +199,22 @@ four tests), `victory-hle` `kernel` (two, title paths above) and `storage`
     one it cannot patch. M2a.
   - `clzero` raises SIGILL; a handler that zeroes the line and moves `rip`
     on works, as the Windows emulation does.
-- Whether a page can be read-write-execute at once under Rosetta 2: the
-  Windows loader's TLS thunks and code patches (`tls.rs`, `write_sites.rs`)
-  use `PAGE_EXECUTE_READWRITE`; CI run 3 showed only read-execute of written
-  code working (`written_code_runs_once_executable`). If not, patches are
-  written with the page writable and then made executable, as that test does.
+- Found (probe 3, an x86-64 C program under Rosetta 2, 2026-11-26):
+  - A page can be readable, writable and executable at once, and code in it
+    patched in place while it runs: the Windows loader's TLS thunks and code
+    patches (`tls.rs`, `write_sites.rs`, `PAGE_EXECUTE_READWRITE`) port as
+    they are.
+  - One block of memory shown at two addresses (`mach_vm_remap` without
+    copying; current protection read-write, maximum read-write-execute): a
+    write through one view is read through the other. That is what the
+    title's memory (`xmem`, `MapViewOfFile3`) needs. M2c.
+  - Each view has its own protection: one view read-only while the other
+    stays writable; a write through the read-only one faults, is caught and
+    opens it; the writable one never faults. The write guards' per-view
+    cover (`watch.rs`) ports as it is, at the 18 us a fault costs.
+  - Showing a 64 KiB block at a new address and dropping it: 1.3 us; two
+    `mprotect`s of 64 KiB: 0.9 us. Cheap, where Windows' `VirtualQuery` cost
+    the title milliseconds (`console_insn.rs`).
 - The alignment Metal asks of memory it uses in place (no-copy buffers)
   under Rosetta.
 - How long Apple keeps Rosetta 2 whole: it said in 2025 that it stays through
