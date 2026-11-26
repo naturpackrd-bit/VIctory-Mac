@@ -51,16 +51,60 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --locked -- --test-threads=1
 
+  # macOS (docs/macos.md): the runtime is built for x86-64 and runs under
+  # Rosetta 2, the tools natively for Apple silicon; both are checked, tested
+  # and run here. `macos-latest` is an Apple silicon runner.
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # The version, components and targets pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # The x86-64 tests and binary run under Rosetta 2.
+      - name: Rosetta 2
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Clippy, Apple silicon
+        run: |
+          cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin -- -D warnings
+          cargo clippy --workspace --all-targets --all-features --locked --target aarch64-apple-darwin -- -D warnings
+      - name: Clippy, x86-64
+        run: |
+          cargo clippy --workspace --all-targets --locked --target x86_64-apple-darwin -- -D warnings
+          cargo clippy --workspace --all-targets --all-features --locked --target x86_64-apple-darwin -- -D warnings
+      - name: Tests, Apple silicon
+        run: cargo test --workspace --locked --target aarch64-apple-darwin
+      - name: Tests, x86-64 under Rosetta 2
+        run: cargo test --workspace --locked --target x86_64-apple-darwin
+      # The binaries start, find the macOS default folders, and refuse to
+      # run a title with the message that says why.
+      - name: Run victory, both
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            bin=target/$target/debug/victory
+            cargo build --locked -p victory --target $target
+            file $bin
+            $bin --version
+            $bin config | tee config.txt
+            grep -F "$HOME/Library/Caches/victory" config.txt
+            grep -F "$HOME/Library/Application Support/victory" config.txt
+            if $bin run nothing.exe 2> run.txt; then exit 1; fi
+            grep -F "needs Windows for now" run.txt
+          done
+
   check:
-    needs: [clippy, test-default, test-diagnostics]
+    needs: [clippy, test-default, test-diagnostics, macos]
     if: always()
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - name: Require all three jobs to pass
+      - name: Require all four jobs to pass
         run: |
           if ('${{ needs.clippy.result }}' -ne 'success' -or
               '${{ needs.test-default.result }}' -ne 'success' -or
-              '${{ needs.test-diagnostics.result }}' -ne 'success') {
+              '${{ needs.test-diagnostics.result }}' -ne 'success' -or
+              '${{ needs.macos.result }}' -ne 'success') {
             exit 1
           }
