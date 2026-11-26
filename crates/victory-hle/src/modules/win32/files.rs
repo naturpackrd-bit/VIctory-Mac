@@ -332,6 +332,23 @@ fn same_name(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
 }
 
+/// The host's spelling of the entry of `dir` that is `name`: the entry
+/// spelt exactly so if there is one (a Linux folder may hold `c.bin` and
+/// `C.BIN` both), else the one that is `name` regardless of case.
+fn spelling_in(dir: &Path, name: &str) -> Option<String> {
+    let names: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|entry| same_name(entry, name))
+        .collect();
+    names
+        .iter()
+        .find(|entry| *entry == name)
+        .or(names.first())
+        .cloned()
+}
+
 /// The name of the entry of `dir` that is `name` regardless of case.
 fn matching_entry(dir: &Path, name: &str) -> Option<std::ffi::OsString> {
     let entries = fs::read_dir(dir).ok()?;
@@ -2074,13 +2091,11 @@ fn list(pattern: Option<String>) -> Result<VecDeque<Entry>, u32> {
         return Err(ERROR_PATH_NOT_FOUND);
     }
     if !last.contains(['*', '?']) {
-        // One name: the entry itself, under the host's spelling.
-        path.parts.push(last);
-        let host = resolve(&path)?;
-        fs::symlink_metadata(&host).map_err(|_| ERROR_FILE_NOT_FOUND)?;
-        let name = host
-            .file_name()
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        // One name: the entry itself, under the host's spelling, read from
+        // the directory (a case-insensitive host, APFS, finds `C.BIN` as
+        // `c.bin` and would otherwise answer with the title's spelling).
+        let name = spelling_in(&dir, &last).ok_or(ERROR_FILE_NOT_FOUND)?;
+        let host = dir.join(&name);
         return Ok(VecDeque::from([entry(name, &host, false)]));
     }
     let mut names: Vec<String> = fs::read_dir(&dir)
