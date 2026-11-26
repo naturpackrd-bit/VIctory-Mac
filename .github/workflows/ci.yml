@@ -92,6 +92,8 @@ jobs:
             $bin config | tee config.txt
             grep -F "$HOME/Library/Caches/victory" config.txt
             grep -F "$HOME/Library/Application Support/victory" config.txt
+            grep -E '^memory +: [0-9.]+ GiB, [0-9.]+ GiB available, [0-9]+ processors' config.txt \
+              | tee memory-$target.txt
             if $bin run nothing.exe 2> run.txt; then exit 1; fi
             cat run.txt
             case $target in
@@ -99,6 +101,16 @@ jobs:
               *) grep -F "needs Windows for now" run.txt ;;
             esac
           done
+          # Both builds see the same machine: the available memory they
+          # report agrees within 2x (the kernel's page size, not Rosetta 2's
+          # 4 KiB, is the unit the kernel counts pages in), and is not tiny.
+          native=$(awk '{ print $5 }' memory-aarch64-apple-darwin.txt)
+          rosetta=$(awk '{ print $5 }' memory-x86_64-apple-darwin.txt)
+          awk -v a="$native" -v b="$rosetta" 'BEGIN {
+            if (a > 2 * b || b > 2 * a || b < 0.5) {
+              print "available memory disagrees: native " a " GiB, Rosetta " b " GiB"; exit 1
+            }
+          }'
       # The x86-64 runtime keeps the low 4 GiB for titles: a one-page
       # __PAGEZERO, AVX2 seen through Rosetta 2's variable, low memory free.
       - name: Low memory and AVX2 in the x86-64 build

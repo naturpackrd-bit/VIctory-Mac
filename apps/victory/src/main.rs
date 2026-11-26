@@ -347,6 +347,20 @@ fn show_config() -> Result<()> {
     }
     #[cfg(not(all(unix, target_arch = "x86_64")))]
     println!("low memory  : n/a");
+    #[cfg(unix)]
+    {
+        use victory_platform::system::System;
+        let (total, available) = victory_platform::Host::physical_memory();
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        println!(
+            "memory      : {:.1} GiB, {:.1} GiB available, {} processors",
+            gib(total),
+            gib(available),
+            victory_platform::Host::logical_processors()
+        );
+    }
+    #[cfg(not(unix))]
+    println!("memory      : n/a");
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

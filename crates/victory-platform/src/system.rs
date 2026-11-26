@@ -53,6 +53,12 @@ mod host {
         /// `<mach/mach_init.h>`: a send right to this machine's host port
         /// (libc's copy is deprecated).
         fn mach_host_self() -> libc::mach_port_t;
+
+        /// `<mach/vm_page_size.h>`: the kernel's page size, the unit
+        /// `host_statistics64` counts pages in: 16 KiB on Apple silicon,
+        /// for an x86-64 process under Rosetta 2 too, whose own pages
+        /// (`vm_page_size`) are 4 KiB.
+        static vm_kernel_page_size: libc::vm_size_t;
     }
 
     /// The host port, taken once: each `mach_host_self` call adds a
@@ -86,7 +92,7 @@ mod host {
             return (total, 0);
         }
         // SAFETY: a value libSystem sets before `main` and never changes.
-        let page = unsafe { libc::vm_page_size } as u64;
+        let page = unsafe { vm_kernel_page_size } as u64;
         let pages = u64::from(stats.free_count) + u64::from(stats.inactive_count);
         (total, pages.saturating_mul(page).min(total))
     }
