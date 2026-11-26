@@ -3,10 +3,12 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(target_arch = "x86_64")]
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
+#[cfg(target_arch = "x86_64")]
 mod run;
 mod shader;
 mod translate;
@@ -193,11 +195,14 @@ fn main() -> Result<()> {
             imports,
             exports,
         } => inspect::run(&file, imports, exports),
+        #[cfg(target_arch = "x86_64")]
         Command::Census {
             paths,
             strict,
             missing,
         } => census::run(paths, strict, missing),
+        #[cfg(not(target_arch = "x86_64"))]
+        Command::Census { .. } => runtime_only(),
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
         Command::ShaderInfo {
             paths,
@@ -222,13 +227,23 @@ fn main() -> Result<()> {
                 |message| eprintln!("{message}"),
             );
             if let Some(file) = warm {
+                #[cfg(target_arch = "x86_64")]
                 return translate::warm(paths, &file, jobs, wave);
+                #[cfg(not(target_arch = "x86_64"))]
+                return {
+                    let _ = file;
+                    runtime_only()
+                };
             }
             translate::run(paths, validate, pipelines, list, jobs, wave)
         }
+        #[cfg(target_arch = "x86_64")]
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        #[cfg(not(target_arch = "x86_64"))]
+        Command::Shaders { .. } => runtime_only(),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(target_arch = "x86_64")]
         Command::Run {
             exe,
             unimplemented,
@@ -240,10 +255,24 @@ fn main() -> Result<()> {
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        Command::Run { .. } => runtime_only(),
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
+}
+
+/// What the commands of the runtime (the loader, the HLE and the GPU side,
+/// which run the title's x86-64 code) say in a build for another processor:
+/// on Apple silicon the tools are native and the runtime is the x86-64 build,
+/// which runs under Rosetta 2 (docs/macos.md).
+#[cfg(not(target_arch = "x86_64"))]
+fn runtime_only() -> Result<()> {
+    anyhow::bail!(
+        "this command is part of the runtime, which is built for x86-64: use the \
+         x86_64-apple-darwin build (it runs under Rosetta 2; docs/macos.md)"
+    )
 }
 
 fn show_config() -> Result<()> {

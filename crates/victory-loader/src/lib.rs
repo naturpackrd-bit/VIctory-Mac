@@ -25,6 +25,11 @@
 //! the portable helpers only they call are unused, and are let be; the
 //! Windows build is the whole one, and still finds code that is dead.
 #![cfg_attr(not(windows), allow(dead_code))]
+//!
+//! The runtime runs the title's x86-64 code in our process, so it is built
+//! for x86-64 only: on Apple silicon under Rosetta 2, with the tools built
+//! natively beside it (docs/macos.md). Elsewhere this crate is empty.
+#![cfg(target_arch = "x86_64")]
 
 #[cfg(windows)]
 mod console_insn;

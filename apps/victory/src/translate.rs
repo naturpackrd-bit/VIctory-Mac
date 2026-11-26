@@ -24,7 +24,9 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, scan::FileScan, sources};
+#[cfg(target_arch = "x86_64")]
+use crate::shader::scan::FileScan;
+use crate::shader::{MAX_FILE, Source, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -165,6 +167,7 @@ struct Checks {
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
+#[cfg(target_arch = "x86_64")]
 pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<u32>) -> Result<()> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
@@ -415,6 +418,7 @@ pub fn run(
 }
 
 /// Every shader found into the cache runs translate from.
+#[cfg(target_arch = "x86_64")]
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf>) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);

@@ -140,6 +140,16 @@ the milestone that replaces it.
 - Not built: `lifecycle` (the title's window), `apu`, `media`, `dstorage`,
   `net`; XAudio2 and Media Foundation are host DLLs on Windows.
 
+### The Apple silicon build (tools)
+
+`victory-loader`, `victory-hle` and `victory-gpu` run the title's x86-64
+code and are built for x86-64 only; for `aarch64-apple-darwin` they are
+empty crates. There, `victory run`, `victory census`, `victory shaders` and
+`victory translate --warm` stop with "this command is part of the runtime,
+which is built for x86-64". `inspect`, `lib-exports`, `shader-info`,
+`translate` and `config` run natively. The shader cache moves out of
+`victory-gpu` at M4, so that the native build can fill it.
+
 ### Not built on macOS
 
 `victory warm` and `victory replay`; the D3D12 back end and everything that

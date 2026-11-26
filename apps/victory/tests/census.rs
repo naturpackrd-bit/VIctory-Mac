@@ -1,3 +1,6 @@
+// `census` belongs to the runtime build (x86-64; docs/macos.md).
+#![cfg(target_arch = "x86_64")]
+
 use std::path::Path;
 use std::process::Command;
 
