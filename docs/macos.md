@@ -29,8 +29,8 @@ XAudio2 on FAudio or our own (M3).
 
 | | Pass criterion | State |
 |---|---|---|
-| M1 | The workspace builds, passes clippy (`-D warnings`) and its tests on macOS, both targets; the binaries start and report the macOS default folders; Windows CI stays green | macOS: passed (CI run 1, Apple silicon runner, x86-64 under Rosetta 2). Windows: clippy passes; one test fails, `victory-gpu` `pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws`, on the runner's software renderer (WARP), in code this port has not changed; it needs a Windows machine with a GPU to tell whether WARP or the test is at fault |
-| M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: a stand-in title loads and runs | In progress. So far: the runtime crates are x86-64 only (the Apple silicon build is the tools); `extern "win64"` on title-facing code; a stand-in title any host builds (`tests/fixtures/pe-probe`, rust-lld, no Windows SDK); our loader (`victory_loader::MappedImage`) maps, relocates, binds and runs it (tests pass on Linux; macOS in CI). Next: TLS, the TEB on `gs`, exceptions, `ROSETTA_ADVERTISE_AVX`, the low 4 GiB |
+| M1 | The workspace builds, passes clippy (`-D warnings`) and its tests on macOS, both targets; the binaries start and report the macOS default folders; Windows CI stays green | macOS: passed (CI runs 1 and 3, Apple silicon runner, x86-64 under Rosetta 2). Windows: clippy passes; one test fails, `victory-gpu` `pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws`, on the runner's software renderer (WARP), in code this port has not changed; it needs a Windows machine with a GPU to tell whether WARP or the test is at fault |
+| M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: a stand-in title loads and runs | In progress. So far: the runtime crates are x86-64 only (the Apple silicon build is the tools); `extern "win64"` on title-facing code; a stand-in title any host builds (`tests/fixtures/pe-probe`, rust-lld, no Windows SDK); our loader (`victory_loader::MappedImage`) maps, relocates, binds and runs it: tests pass on Linux, on macOS under Rosetta 2 and on Windows (CI run 3). Next: TLS, the TEB on `gs`, exceptions, `ROSETTA_ADVERTISE_AVX`, the low 4 GiB |
 | M2b | Our replacements for the host DLLs the title calls: its C runtime starts | |
 | M2c | With your dump: the title reaches its frame loop headless (no GPU, no audio) for N minutes; every unimplemented import met is logged; memory use measured | |
 | M3 | SDL3 window, input, audio (XAudio2): the title's menu music plays and a pad moves through the menu | |
@@ -199,6 +199,11 @@ four tests), `victory-hle` `kernel` (two, title paths above) and `storage`
     one it cannot patch. M2a.
   - `clzero` raises SIGILL; a handler that zeroes the line and moves `rip`
     on works, as the Windows emulation does.
+- Whether a page can be read-write-execute at once under Rosetta 2: the
+  Windows loader's TLS thunks and code patches (`tls.rs`, `write_sites.rs`)
+  use `PAGE_EXECUTE_READWRITE`; CI run 3 showed only read-execute of written
+  code working (`written_code_runs_once_executable`). If not, patches are
+  written with the page writable and then made executable, as that test does.
 - The alignment Metal asks of memory it uses in place (no-copy buffers)
   under Rosetta.
 - How long Apple keeps Rosetta 2 whole: it said in 2025 that it stays through
