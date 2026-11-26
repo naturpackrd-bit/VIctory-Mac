@@ -39,28 +39,63 @@ use crate::{HleExport, hle_export};
 pub(crate) const EPERM: i32 = 1;
 /// `errno`: no such file or directory.
 pub(crate) const ENOENT: i32 = 2;
-/// `errno`: bad file descriptor (for the stdio slice).
-#[allow(dead_code)]
+/// `errno`: an executable's format is wrong.
+pub(crate) const ENOEXEC: i32 = 8;
+/// `errno`: bad file descriptor.
 pub(crate) const EBADF: i32 = 9;
 /// `errno`: resource temporarily unavailable.
-const EAGAIN: i32 = 11;
+pub(crate) const EAGAIN: i32 = 11;
 /// `errno`: not enough memory.
 pub(crate) const ENOMEM: i32 = 12;
-/// `errno`: permission denied (for the stdio slice).
-#[allow(dead_code)]
+/// `errno`: permission denied.
 pub(crate) const EACCES: i32 = 13;
-/// `errno`: the file exists (for the stdio slice).
-#[allow(dead_code)]
+/// `errno`: the file exists.
 pub(crate) const EEXIST: i32 = 17;
+/// `errno`: a link across devices.
+pub(crate) const EXDEV: i32 = 18;
+/// `errno`: not a directory.
+#[allow(dead_code)]
+pub(crate) const ENOTDIR: i32 = 20;
+/// `errno`: is a directory.
+#[allow(dead_code)]
+pub(crate) const EISDIR: i32 = 21;
 /// `errno`: invalid argument.
 pub(crate) const EINVAL: i32 = 22;
-/// `errno`: too many open files (for the stdio slice).
+/// `errno`: too many open files in the system.
 #[allow(dead_code)]
+pub(crate) const ENFILE: i32 = 23;
+/// `errno`: too many open files.
 pub(crate) const EMFILE: i32 = 24;
+/// `errno`: a file too large.
+pub(crate) const EFBIG: i32 = 27;
+/// `errno`: no space left on the device.
+pub(crate) const ENOSPC: i32 = 28;
+/// `errno`: a seek on a pipe or device.
+#[allow(dead_code)]
+pub(crate) const ESPIPE: i32 = 29;
+/// `errno`: a read-only file system.
+#[allow(dead_code)]
+pub(crate) const EROFS: i32 = 30;
+/// `errno`: a broken pipe.
+pub(crate) const EPIPE: i32 = 32;
 /// `errno`: a math argument out of the function's domain.
 pub(crate) const EDOM: i32 = 33;
 /// `errno`: a result out of range.
 pub(crate) const ERANGE: i32 = 34;
+/// `errno`: a deadlock was avoided.
+#[allow(dead_code)]
+pub(crate) const EDEADLK: i32 = 36;
+/// `errno`: a file name too long.
+#[allow(dead_code)]
+pub(crate) const ENAMETOOLONG: i32 = 38;
+/// `errno`: no locks available.
+#[allow(dead_code)]
+pub(crate) const ENOLCK: i32 = 39;
+/// `errno`: a function not implemented.
+#[allow(dead_code)]
+pub(crate) const ENOSYS: i32 = 40;
+/// `errno`: a directory not empty.
+pub(crate) const ENOTEMPTY: i32 = 41;
 /// `errno`: an illegal byte sequence.
 pub(crate) const EILSEQ: i32 = 42;
 /// What the `_s` functions return when they truncated as asked.

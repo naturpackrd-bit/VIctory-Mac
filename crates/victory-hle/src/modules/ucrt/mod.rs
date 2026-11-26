@@ -2,13 +2,18 @@
 //! sets) and the pieces of `vcruntime140.dll` that are not exception
 //! dispatch: on Windows the host provides them, here they are ours
 //! (docs/macos.md, M2b). One file per area; each lists its exports. Stdio
-//! (the `printf` and `scanf` engines, streams and file descriptors) is not
-//! here yet.
+//! is `format.rs` and `scan.rs` (the `printf` and `scanf` engines),
+//! `lowio.rs` (file descriptors and the file system) and `stdio.rs`
+//! (streams).
 
+pub mod format;
 pub mod heap;
 pub mod locale;
+pub mod lowio;
 pub mod math;
 pub mod runtime;
+pub mod scan;
+pub mod stdio;
 pub mod string;
 pub mod time;
 
@@ -22,6 +27,8 @@ pub(crate) fn module() -> HleModule {
     exports.extend(math::exports());
     exports.extend(time::exports());
     exports.extend(locale::exports());
+    exports.extend(lowio::exports());
+    exports.extend(stdio::exports());
     HleModule {
         name: "ucrt",
         dlls: &[

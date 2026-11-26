@@ -205,8 +205,11 @@ pub fn mount(root: &Path) -> Option<char> {
     if let Some((letter, _)) = drives.iter().find(|(_, r)| *r == root) {
         return Some(*letter);
     }
+    // The console's fixed drives (`G:` the package, `T:` temporary files,
+    // which `mount_at` gives) are never handed out here, mounted or not.
     let letter = ('D'..='Z')
         .rev()
+        .filter(|l| !matches!(l, 'G' | 'T'))
         .find(|l| !drives.iter().any(|(m, _)| m == l))?;
     tracing::info!(drive = %letter, root = %root.display(), "virtual drive");
     drives.push((letter, root));
@@ -2805,8 +2808,8 @@ mod tests {
             invalid()
         );
         assert_eq!(GetLastError(), ERROR_PATH_NOT_FOUND);
-        // Tests mount letters from Z down, and T.
-        let path = r"Q:\file.txt";
+        // No test mounts `A:` (`mount` hands out `D` to `Z`).
+        let path = r"A:\file.txt";
         assert_eq!(open(path, GENERIC_READ, OPEN_EXISTING, 0), invalid());
         assert_eq!(GetLastError(), ERROR_PATH_NOT_FOUND);
         let _ = fs::remove_dir_all(dir);
@@ -2832,6 +2835,16 @@ mod tests {
         }
         assert_eq!(FindClose(handle), TRUE);
         Ok(names)
+    }
+
+    /// A free letter is never one of the console's fixed drives, which
+    /// `mount_at` gives: a mount of `T:` would otherwise take the drive of a
+    /// folder mounted before it.
+    #[test]
+    fn free_letters_skip_the_fixed_drives() {
+        let (dir, letter) = folder("letters");
+        assert!(letter != 'G' && letter != 'T', "{letter}");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3031,7 +3044,8 @@ mod tests {
         let bit = 1 << (x as u32 - 'A' as u32);
         assert!(GetLogicalDrives() & bit != 0);
         assert_eq!(GetDriveTypeW(w(&format!(r"{x}:\")).as_ptr()), DRIVE_FIXED);
-        let root = w(r"Q:\");
+        // (`A:` is never mounted: `mount` hands out `D` to `Z`.)
+        let root = w(r"A:\");
         assert_eq!(GetDriveTypeW(root.as_ptr()), DRIVE_NO_ROOT_DIR);
         let _ = fs::remove_dir_all(dir);
     }
