@@ -143,8 +143,9 @@ the milestone that replaces it.
   or groups; Windows is reported as 10, build 19044, the computer as
   `VICTORY`, the directories as `C:\Windows`. On macOS the available
   memory (`GlobalMemoryStatusEx`) comes from the kernel's page counts times
-  the kernel's page size (16 KiB under Rosetta 2 too; CI compares the two
-  builds' figures), unverified on a Mac at the time of writing. M2b.
+  the kernel's page size (16 KiB under Rosetta 2 too): CI run 10 saw the
+  native and the Rosetta build agree (6.8 and 6.7 GiB available of 14), as
+  they would not with Rosetta's 4 KiB. M2b.
 - `victory-hle/src/modules/kernel.rs`, the non-Windows `host` module: every
   host call fails (null handles, zero lengths, no stack walk); `exit`,
   `abort` and `TerminateProcess` end our process. `SetThreadPriority`
