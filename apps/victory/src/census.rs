@@ -221,6 +221,7 @@ mod tests {
             tls: None,
             has_relocations: false,
             has_exception_table: false,
+            exception_table: None,
             has_load_config: false,
             codeview: None,
         }

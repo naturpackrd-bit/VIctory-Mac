@@ -4,6 +4,9 @@
 //! resolver answers them.
 #![no_std]
 
+mod entry;
+mod faults;
+
 use core::arch::asm;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};

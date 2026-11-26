@@ -11,8 +11,12 @@
 
 use std::path::PathBuf;
 
+#[cfg(unix)]
+pub mod faults;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(unix)]
+pub mod low;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]

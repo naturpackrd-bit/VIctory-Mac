@@ -52,6 +52,7 @@ pub enum MapError {
 /// dropped.
 #[derive(Debug)]
 pub struct MappedImage {
+    name: String,
     base: usize,
     size: usize,
     info: ImageInfo,
@@ -65,8 +66,13 @@ pub struct MappedImage {
 
 impl MappedImage {
     /// Maps the image whose file is `file`, binding its imports through
-    /// `resolver`.
-    pub fn map(file: &[u8], resolver: &dyn ImportResolver) -> Result<MappedImage, MapError> {
+    /// `resolver`; `name` is what crash reports and logs call it (its file
+    /// name, usually).
+    pub fn map(
+        file: &[u8],
+        name: &str,
+        resolver: &dyn ImportResolver,
+    ) -> Result<MappedImage, MapError> {
         let info = ImageInfo::parse(file)?;
         let page = Host::page_size();
         let size = (info.size_of_image as usize).next_multiple_of(page);
@@ -81,6 +87,7 @@ impl MappedImage {
         // From here on, dropping the image gives its memory back.
         #[cfg_attr(windows, allow(unused_mut))]
         let mut image = MappedImage {
+            name: name.to_owned(),
             base,
             size,
             info,
@@ -99,12 +106,33 @@ impl MappedImage {
             image.thunks = image.patch_gs()?;
         }
         image.protect(page, headers)?;
+        crate::images::register(crate::images::Image {
+            name: image.name.clone(),
+            base: image.base,
+            size: image.size,
+            exception_table: image
+                .info
+                .exception_table
+                .map(|(rva, len)| (image.base + rva as usize, len as usize)),
+        });
         Ok(image)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// The address the image is mapped at.
     pub fn base(&self) -> usize {
         self.base
+    }
+
+    /// The image's exception directory (`.pdata`) as mapped, if it has one.
+    pub fn exception_table(&self) -> Option<&[u8]> {
+        let (rva, len) = self.info.exception_table?;
+        let at = self.at(rva as usize, len as usize).ok()?;
+        // SAFETY: read-only bytes of our mapping, alive as long as `self`.
+        Some(unsafe { std::slice::from_raw_parts(at, len as usize) })
     }
 
     /// The image's size in memory, rounded up to whole pages.
@@ -359,6 +387,7 @@ fn size_of_headers(file: &[u8]) -> Result<usize, MapError> {
 
 impl Drop for MappedImage {
     fn drop(&mut self) {
+        crate::images::unregister(self.base);
         #[cfg(not(windows))]
         if let Some(index) = self.tls_index {
             crate::teb::unregister_tls(index);

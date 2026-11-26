@@ -37,9 +37,13 @@ mod console_insn;
 mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
+#[cfg(not(windows))]
+pub mod faults;
 pub mod frame_rate;
+pub mod images;
 pub mod map;
 pub mod prepare;
+pub mod stubs;
 #[cfg(not(windows))]
 pub mod teb;
 pub(crate) mod publish;

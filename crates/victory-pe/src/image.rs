@@ -30,6 +30,9 @@ pub struct ImageInfo {
     pub tls: Option<TlsInfo>,
     pub has_relocations: bool,
     pub has_exception_table: bool,
+    /// The exception directory (`.pdata`, the `RUNTIME_FUNCTION` entries):
+    /// its RVA and size, when the image has one.
+    pub exception_table: Option<(u32, u32)>,
     pub has_load_config: bool,
     pub codeview: Option<CodeViewInfo>,
 }
@@ -251,6 +254,10 @@ impl ImageInfo {
                     layout::file_flags::RELOCS_STRIPPED,
                 ),
             has_exception_table: dir_present(dir::EXCEPTION),
+            exception_table: file
+                .data_directory(dir::EXCEPTION)
+                .filter(|d| d.virtual_address.get(LE) != 0 && d.size.get(LE) != 0)
+                .map(|d| (d.virtual_address.get(LE), d.size.get(LE))),
             has_load_config: dir_present(dir::LOAD_CONFIG),
             codeview,
         })
