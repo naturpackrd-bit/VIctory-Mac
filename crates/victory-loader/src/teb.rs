@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use victory_pe::{GsAccess, GsSite, TEB_SIZE};
+use victory_platform::faults::Faults;
 use victory_platform::{Host, Memory, Protection, Thread};
 
 use crate::map::TLS_IMAGES;
@@ -187,6 +188,9 @@ fn new_thread_state() -> ThreadState {
     // for the thread's life.
     let kept = unsafe { Host::set_teb_pointer(teb.self_address as usize) };
     assert!(kept, "the host refused to keep this thread's TEB pointer");
+    if !Host::alternate_stack() {
+        tracing::warn!("no alternate signal stack: a stack overflow on this thread is lost");
+    }
     ThreadState {
         teb,
         array,
