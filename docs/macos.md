@@ -163,6 +163,28 @@ four tests), `victory-hle` `kernel` (two, title paths above) and `storage`
   machdep.cpu.features` lists none of them either way.) So the runtime
   starts with that variable set, re-launching itself when it is missing, or
   the title and our own AVX2 paths (`victory-gpu`) see no AVX2. M2a.
+- Found (probe 2, an x86-64 C program under Rosetta 2, 2026-11-26):
+  - Memory below 4 GiB, which the title asks for (`ADDRESS_32BIT`): refused
+    with the default 4 GiB `__PAGEZERO`; given at `0x10000000` when linked
+    with `-Wl,-pagezero_size,0x1000`. Then only about 600 KB down there is
+    mapped (our image, dyld), around `0xe00000`. The runtime links so and
+    reserves the low range at its start, before anything else lands in it.
+    M2a.
+  - A 16 GiB block allocated anywhere lands near `0x2_0000_0000`, below the
+    2^40 the title's memory must stay under.
+  - A write to a read-only page, taken by a signal handler that opens the
+    page, costs about 18 us a round; the two `mprotect` calls in it about
+    0.75 us. macOS has nothing like `GetWriteWatch`, so tracking the title's
+    writes by faults would cost about 17 us a page: on the Mac, buffers must
+    not be tracked at all, Metal reading them where the title writes them
+    (M4). M2c's null GPU tracks nothing.
+  - `%gs` is macOS's thread data: `gs:0x30`, `0x58` and `0x60` read 0 and
+    `gs:0x10` a small number (the MIG reply port). A Windows TEB read left
+    unpatched gets a wrong value without faulting, so the loader's patch
+    pass must find every one, and refuses to start a title in which it meets
+    one it cannot patch. M2a.
+  - `clzero` raises SIGILL; a handler that zeroes the line and moves `rip`
+    on works, as the Windows emulation does.
 - The alignment Metal asks of memory it uses in place (no-copy buffers)
   under Rosetta.
 - How long Apple keeps Rosetta 2 whole: it said in 2025 that it stays through
