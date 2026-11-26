@@ -43,6 +43,10 @@ enum Command {
         /// List every exported function.
         #[arg(long)]
         exports: bool,
+        /// List the TEB accesses (`gs:[...]`) in the code, by kind and
+        /// offset: what the macOS loader patches, and the forms it cannot.
+        #[arg(long)]
+        teb: bool,
     },
     /// Aggregate the imports of every PE image under the given paths and
     /// show which ones our runtime covers. Defaults to the configured
@@ -194,7 +198,8 @@ fn main() -> Result<()> {
             file,
             imports,
             exports,
-        } => inspect::run(&file, imports, exports),
+            teb,
+        } => inspect::run(&file, imports, exports, teb),
         #[cfg(target_arch = "x86_64")]
         Command::Census {
             paths,

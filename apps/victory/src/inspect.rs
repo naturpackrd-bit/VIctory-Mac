@@ -3,9 +3,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use victory_pe::implib::ImportLibrary;
-use victory_pe::{ImageInfo, layout};
+use victory_pe::{GsAccess, ImageInfo, layout};
 
-pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
+pub fn run(file: &Path, list_imports: bool, list_exports: bool, list_teb: bool) -> Result<()> {
     let data = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let info = ImageInfo::parse(&data).with_context(|| format!("parsing {}", file.display()))?;
 
@@ -96,7 +96,76 @@ pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
             }
         }
     }
+    if list_teb {
+        teb_accesses(&data, &info);
+    }
     Ok(())
+}
+
+/// The `gs:[...]` accesses in the image's code (how Windows code reaches its
+/// thread's TEB), by kind and TEB offset: what the loader patches where the
+/// host has no TEB for title code (macOS), and the forms it cannot.
+fn teb_accesses(data: &[u8], info: &ImageInfo) {
+    const EXECUTE: u32 = 0x2000_0000;
+    let mut counts: BTreeMap<(GsAccess, u32), usize> = BTreeMap::new();
+    let mut others = Vec::new();
+    for s in info
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & EXECUTE != 0)
+    {
+        let from = s.file_offset as usize;
+        let len = (s.file_size.min(s.virtual_size.max(s.file_size)) as usize)
+            .min(data.len().saturating_sub(from));
+        for site in victory_pe::gs_sites(&data[from..from + len]) {
+            *counts.entry((site.access, site.disp)).or_default() += 1;
+            if let GsAccess::Other(_) = site.access {
+                others.push(format!("{:#x}", s.rva as usize + site.offset));
+            }
+        }
+    }
+    println!(
+        "\nteb accesses   {} ({} kinds)",
+        counts.values().sum::<usize>(),
+        counts.len()
+    );
+    for ((access, disp), n) in &counts {
+        let what = match access {
+            GsAccess::Load64 => "mov r64, gs:[..]".to_owned(),
+            GsAccess::Load32 => "mov r32, gs:[..]".to_owned(),
+            GsAccess::Store64 => "mov gs:[..], r64".to_owned(),
+            GsAccess::Store32 => "mov gs:[..], r32".to_owned(),
+            GsAccess::Other(op) => format!("opcode {op:#x} (not patched)"),
+        };
+        println!("  {n:>7}  teb+{disp:#06x}  {what}  {}", teb_field(*disp));
+    }
+    if !others.is_empty() {
+        let shown = others.len().min(20);
+        println!(
+            "  unpatched forms at rva {}{}",
+            others[..shown].join(", "),
+            if others.len() > shown { ", ..." } else { "" }
+        );
+    }
+}
+
+/// The TEB field at `disp`, for the ones title code is known to read.
+fn teb_field(disp: u32) -> &'static str {
+    match disp {
+        0x00 => "ExceptionList",
+        0x08 => "StackBase",
+        0x10 => "StackLimit",
+        0x28 => "ArbitraryUserPointer",
+        0x30 => "Self",
+        0x40 => "ClientId.UniqueProcess",
+        0x48 => "ClientId.UniqueThread",
+        0x58 => "ThreadLocalStoragePointer",
+        0x60 => "ProcessEnvironmentBlock",
+        0x68 => "LastErrorValue",
+        0x1480..=0x167F => "TlsSlots",
+        0x1780 => "TlsExpansionSlots",
+        _ => "",
+    }
 }
 
 pub fn lib_exports(lib: &Path, list: bool) -> Result<()> {

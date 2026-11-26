@@ -40,6 +40,8 @@ pub mod descriptor_sites;
 pub mod frame_rate;
 pub mod map;
 pub mod prepare;
+#[cfg(not(windows))]
+pub mod teb;
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;

@@ -4,9 +4,12 @@
 //! base is taken, imports bound through an [`ImportResolver`], and each page
 //! given the protection of the sections in it. Nothing in the image runs.
 //!
-//! Not yet (docs/macos.md, M2a): static TLS, the exception table, delay
-//! imports, TLS callbacks and the entry point, and reporting stubs for
-//! imports nobody resolves (mapping fails on those instead).
+//! Off Windows, where the host has no TEB for title code, the image's
+//! static TLS is registered and its `gs` accesses are patched (`teb`).
+//!
+//! Not yet (docs/macos.md, M2a): the exception table, delay imports, TLS
+//! callbacks and the entry point, and reporting stubs for imports nobody
+//! resolves (mapping fails on those instead).
 
 use victory_pe::layout::{self, OPT_IMAGE_BASE, OPT_SIZE_OF_HEADERS};
 use victory_pe::{ImageInfo, PeError, base_relocations};
@@ -17,6 +20,10 @@ use crate::{ImportResolver, Resolution};
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
+
+/// How many images may have static TLS at once: the slots of a thread's
+/// TLS array (`teb`).
+pub const TLS_IMAGES: usize = 64;
 
 /// Why an image could not be mapped.
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +40,12 @@ pub enum MapError {
     Unresolved(Vec<String>),
     #[error("the host refused the protection of [{0:#x}, {1:#x})")]
     Protection(usize, usize),
+    #[error("more than {TLS_IMAGES} images with static TLS")]
+    TlsImages,
+    #[error("no free memory within reach of the image for its gs thunks")]
+    Thunks,
+    #[error("gs accesses the loader cannot patch: {}", .0.join(", "))]
+    GsAccesses(Vec<String>),
 }
 
 /// An image in our memory, mapped by [`MappedImage::map`]; unmapped when
@@ -42,6 +55,12 @@ pub struct MappedImage {
     base: usize,
     size: usize,
     info: ImageInfo,
+    /// The image's static TLS index (`teb`), if it has TLS.
+    #[cfg(not(windows))]
+    tls_index: Option<u32>,
+    /// The thunks its patched `gs` accesses call (`teb`), if it had any.
+    #[cfg(not(windows))]
+    thunks: Option<crate::teb::Thunks>,
 }
 
 impl MappedImage {
@@ -60,11 +79,25 @@ impl MappedImage {
             None => Host::allocate(size, None).ok_or(MapError::NoMemory(size))?,
         };
         // From here on, dropping the image gives its memory back.
-        let image = MappedImage { base, size, info };
+        #[cfg_attr(windows, allow(unused_mut))]
+        let mut image = MappedImage {
+            base,
+            size,
+            info,
+            #[cfg(not(windows))]
+            tls_index: None,
+            #[cfg(not(windows))]
+            thunks: None,
+        };
         let headers = size_of_headers(file)?.min(file.len());
         image.copy(file, headers)?;
         image.relocate(file)?;
         image.bind(resolver)?;
+        #[cfg(not(windows))]
+        {
+            image.tls_index = image.static_tls()?;
+            image.thunks = image.patch_gs()?;
+        }
         image.protect(page, headers)?;
         Ok(image)
     }
@@ -175,6 +208,97 @@ impl MappedImage {
         }
     }
 
+    /// Registers the image's static TLS (`teb`), if it has a TLS directory,
+    /// and writes the index it got into the image's `_tls_index`.
+    #[cfg(not(windows))]
+    fn static_tls(&self) -> Result<Option<u32>, MapError> {
+        let Some(tls) = &self.info.tls else {
+            return Ok(None);
+        };
+        // IMAGE_TLS_DIRECTORY64: start and end of the raw data, the index's
+        // address, the callbacks' address (u64 each), the zero fill (u32).
+        let dir = self.at(tls.directory_rva as usize, 40)?;
+        // SAFETY: 40 bytes of our image, checked above; relocated already,
+        // so its addresses are in our mapping.
+        let (start, end, index_va, zero_fill) = unsafe {
+            (
+                dir.cast::<u64>().read_unaligned(),
+                dir.add(8).cast::<u64>().read_unaligned(),
+                dir.add(16).cast::<u64>().read_unaligned(),
+                dir.add(32).cast::<u32>().read_unaligned() as usize,
+            )
+        };
+        let offset = |va: u64, what: &str| {
+            usize::try_from(va)
+                .ok()
+                .and_then(|va| va.checked_sub(self.base))
+                .filter(|o| *o <= self.size)
+                .ok_or_else(|| MapError::Malformed(format!("TLS {what} {va:#x} outside the image")))
+        };
+        let (start, end) = (offset(start, "start")?, offset(end, "end")?);
+        let len = end
+            .checked_sub(start)
+            .ok_or_else(|| MapError::Malformed("TLS data ends before it starts".to_owned()))?;
+        // SAFETY: `len` bytes of our image, checked by `at`.
+        let init = unsafe { std::slice::from_raw_parts(self.at(start, len)?, len) };
+        let index = crate::teb::register_tls(init, zero_fill).ok_or(MapError::TlsImages)?;
+        let index_at = self.at(offset(index_va, "index")?, 4)?.cast::<u32>();
+        // SAFETY: four bytes of our writable image, checked above.
+        unsafe { index_at.write_unaligned(index) };
+        Ok(Some(index))
+    }
+
+    /// Patches every `gs` access in the image's code to call a thunk that
+    /// reaches our TEB (`teb`); the thunks, if any access was found.
+    #[cfg(not(windows))]
+    fn patch_gs(&self) -> Result<Option<crate::teb::Thunks>, MapError> {
+        use crate::teb::{PatchError, Thunks, patch_sites};
+        let mut thunks: Option<Thunks> = None;
+        let mut patched = 0;
+        for section in &self.info.sections {
+            if section.characteristics & SCN_MEM_EXECUTE == 0 {
+                continue;
+            }
+            let span = span(section);
+            // SAFETY: the section's bytes of our writable image, checked by
+            // `at`; nothing runs them yet.
+            let code = unsafe {
+                std::slice::from_raw_parts_mut(self.at(section.rva as usize, span)?, span)
+            };
+            let sites = victory_pe::gs_sites(code);
+            if sites.is_empty() {
+                continue;
+            }
+            let thunks = match &mut thunks {
+                Some(thunks) => thunks,
+                None => thunks.insert(Thunks::near(self.base, self.size).ok_or(MapError::Thunks)?),
+            };
+            let at = self.base + section.rva as usize;
+            patched += patch_sites(code, at, &sites, thunks).map_err(|e| match e {
+                PatchError::Unpatchable(sites) => MapError::GsAccesses(
+                    sites
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{:?} at rva {:#x}",
+                                s.access,
+                                section.rva as usize + s.offset
+                            )
+                        })
+                        .collect(),
+                ),
+                PatchError::Full => MapError::Thunks,
+            })?;
+        }
+        if let Some(thunks) = &thunks {
+            thunks
+                .finish()
+                .map_err(|(at, len)| MapError::Protection(at, at + len))?;
+        }
+        tracing::debug!(patched, "gs accesses patched to reach our TEB");
+        Ok(thunks)
+    }
+
     /// Gives each page the protection its sections ask for (all of those it
     /// holds a part of, should sections share a page); the `headers` bytes
     /// at the start are read-only, and what no section covers has no access.
@@ -235,6 +359,10 @@ fn size_of_headers(file: &[u8]) -> Result<usize, MapError> {
 
 impl Drop for MappedImage {
     fn drop(&mut self) {
+        #[cfg(not(windows))]
+        if let Some(index) = self.tls_index {
+            crate::teb::unregister_tls(index);
+        }
         // SAFETY: the whole allocation `map` made; nothing in it runs any
         // more (the owner keeps the image while its code may).
         unsafe { Host::free(self.base, self.size) };

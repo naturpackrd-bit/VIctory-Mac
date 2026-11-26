@@ -4,8 +4,9 @@
 //! resolver answers them.
 #![no_std]
 
+use core::arch::asm;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[link(name = "victory-probe", kind = "raw-dylib")]
 unsafe extern "win64" {
@@ -53,6 +54,148 @@ pub extern "win64" fn probe_reloc() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "win64" fn probe_callback(f: extern "win64" fn(u64) -> u64, x: u64) -> u64 {
     f(x).wrapping_mul(2)
+}
+
+// Static TLS, as MSVC's CRT lays it out: `_tls_used` is the directory the
+// linker files in the image (lld-link, like link.exe, puts the symbol of
+// that name in the TLS data directory), between `.tls` and `.tls$ZZZ` lie
+// the variables, and `_tls_index` is what the loader writes.
+
+#[repr(C)]
+pub struct TlsDirectory {
+    start: *const u8,
+    end: *const u8,
+    index: *const u32,
+    callbacks: *const usize,
+    zero_fill: u32,
+    characteristics: u32,
+}
+
+// SAFETY: data the linker and the loader read; nothing here follows the
+// pointers.
+unsafe impl Sync for TlsDirectory {}
+
+#[unsafe(link_section = ".tls")]
+static TLS_START: AtomicU64 = AtomicU64::new(0);
+#[unsafe(link_section = ".tls$ZZZ")]
+static TLS_END: AtomicU64 = AtomicU64::new(0);
+/// A thread-local counter, 5 to begin with on every thread.
+#[unsafe(link_section = ".tls$")]
+static TLS_COUNTER: AtomicU32 = AtomicU32::new(5);
+#[unsafe(no_mangle)]
+pub static _tls_index: AtomicU32 = AtomicU32::new(0);
+#[unsafe(no_mangle)]
+pub static _tls_used: TlsDirectory = TlsDirectory {
+    start: (&raw const TLS_START).cast(),
+    end: (&raw const TLS_END).cast(),
+    index: (&raw const _tls_index).cast(),
+    callbacks: core::ptr::null(),
+    zero_fill: 0,
+    characteristics: 0,
+};
+
+/// Adds `n` to this thread's counter and returns it: the thread's TLS array
+/// from the TEB (`mov rax, qword ptr gs:[0x58]`, as MSVC writes it, the
+/// bytes the loader patches), the image's block at `_tls_index`, the
+/// variable at its offset in the block.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_tls_add(n: u32) -> u32 {
+    let array: *const *mut u8;
+    // SAFETY: a load from the TEB.
+    unsafe {
+        asm!(".byte 0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00",
+             out("rax") array, options(preserves_flags))
+    };
+    let offset = (&raw const TLS_COUNTER as usize) - (&raw const TLS_START as usize);
+    // SAFETY: the loader's array has this image's block at its index; the
+    // block is a copy of the image's TLS data.
+    unsafe {
+        let block = *array.add(_tls_index.load(Ordering::Relaxed) as usize);
+        let counter = &*block.add(offset).cast::<AtomicU32>();
+        counter.fetch_add(n, Ordering::Relaxed) + n
+    }
+}
+
+/// `NtCurrentTeb()`: `mov rax, qword ptr gs:[0x30]`.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_teb() -> u64 {
+    let teb: u64;
+    // SAFETY: a load from the TEB.
+    unsafe {
+        asm!(".byte 0x65, 0x48, 0x8b, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00",
+             out("rax") teb, options(preserves_flags))
+    };
+    teb
+}
+
+/// `GetCurrentThreadId()` as the compiler inlines it: `mov eax, dword ptr
+/// gs:[0x48]` (no REX: an 8-byte instruction).
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_thread_id() -> u32 {
+    let id: u64;
+    // SAFETY: a load from the TEB.
+    unsafe {
+        asm!(".byte 0x65, 0x8b, 0x04, 0x25, 0x48, 0x00, 0x00, 0x00",
+             out("rax") id, options(preserves_flags))
+    };
+    id as u32
+}
+
+/// The stack limit as `__chkstk` reads it: `mov r11, qword ptr gs:[0x10]`.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_stack_limit() -> u64 {
+    let limit: u64;
+    // SAFETY: a load from the TEB.
+    unsafe {
+        asm!(".byte 0x65, 0x4c, 0x8b, 0x1c, 0x25, 0x10, 0x00, 0x00, 0x00",
+             out("r11") limit, options(preserves_flags))
+    };
+    limit
+}
+
+/// `SetLastError` inlined: `mov dword ptr gs:[0x68], ecx`.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_set_last_error(error: u32) {
+    // SAFETY: a store to the TEB.
+    unsafe {
+        asm!(".byte 0x65, 0x89, 0x0c, 0x25, 0x68, 0x00, 0x00, 0x00",
+             in("rcx") u64::from(error), options(preserves_flags))
+    };
+}
+
+/// `GetLastError` inlined: `mov eax, dword ptr gs:[0x68]`.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_last_error() -> u32 {
+    let error: u64;
+    // SAFETY: a load from the TEB.
+    unsafe {
+        asm!(".byte 0x65, 0x8b, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00",
+             out("rax") error, options(preserves_flags))
+    };
+    error as u32
+}
+
+/// `mov qword ptr gs:[0x28], rax` (`ArbitraryUserPointer`): a 64-bit store
+/// whose source is rax, the thunk's usual scratch register.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_set_user_pointer(value: u64) {
+    // SAFETY: a store to the TEB.
+    unsafe {
+        asm!(".byte 0x65, 0x48, 0x89, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00",
+             in("rax") value, options(preserves_flags))
+    };
+}
+
+/// `mov r9, qword ptr gs:[0x28]`: a load into a high register.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_user_pointer() -> u64 {
+    let value: u64;
+    // SAFETY: a load from the TEB.
+    unsafe {
+        asm!(".byte 0x65, 0x4c, 0x8b, 0x0c, 0x25, 0x28, 0x00, 0x00, 0x00",
+             out("r9") value, options(preserves_flags))
+    };
+    value
 }
 
 /// The entry point of the DLL; the tests' loader does not call it.
