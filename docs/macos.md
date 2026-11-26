@@ -1,7 +1,8 @@
 # macOS (Apple silicon)
 
 The port of VIctory to macOS on Apple silicon, keeping the Windows build as it
-is. Target machine: a MacBook Pro with an M5 Pro and 24 GB of memory.
+is. Target machine: a MacBook Pro with an M5 Pro and 24 GB of memory, on
+macOS 27.0.
 
 ## Decisions (2026-11-26)
 
@@ -164,7 +165,9 @@ four tests), `victory-hle` `kernel` (two, title paths above) and `storage`
 - The alignment Metal asks of memory it uses in place (no-copy buffers)
   under Rosetta.
 - How long Apple keeps Rosetta 2 whole: it said in 2025 that it stays through
-  macOS 27, then only what older games need.
+  macOS 27, the version this Mac runs, and that later versions keep only what
+  older games need. Decision 1 may not outlive macOS 27; to check against
+  Apple's current word before M5.
 
 ## Memory
 
