@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use victory_loader::stubs::UnimplementedPolicy;
 use victory_loader::{ImportResolver, MappedImage, Provenance, Resolution};
 use victory_pe::ImportSymbol;
 
@@ -36,7 +37,8 @@ pub fn probe() -> &'static [u8] {
             .env("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", "rust-lld")
             .env(
                 "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
-                "-C linker-flavor=lld-link -C link-arg=/NODEFAULTLIB",
+                "-C linker-flavor=lld-link -C link-arg=/NODEFAULTLIB \
+                 -C link-arg=/DELAYLOAD:victory-probe-delayed.dll",
             )
             .status()
             .expect("running cargo");
@@ -46,9 +48,11 @@ pub fn probe() -> &'static [u8] {
     })
 }
 
-/// The fixture, mapped with [`Probe`] resolving its imports.
+/// The fixture, mapped with [`Probe`] resolving its imports; the one it
+/// leaves missing (`ProbeMissing`) is bound to a stub that returns 0.
 pub fn map_probe() -> MappedImage {
-    MappedImage::map(probe(), PROBE, &Probe).expect("mapping the probe")
+    MappedImage::map_with(probe(), PROBE, &Probe, UnimplementedPolicy::Zero)
+        .expect("mapping the probe")
 }
 
 pub const VALUE: u32 = 0x5EED;
@@ -61,6 +65,10 @@ pub extern "win64" fn probe_value() -> u32 {
 /// wrong place (register or stack slot) shows.
 pub extern "win64" fn probe_sum6(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
     a + 10 * b + 100 * c + 1000 * d + 10_000 * e + 100_000 * f
+}
+
+pub extern "win64" fn probe_delayed() -> u32 {
+    4242
 }
 
 pub extern "win64" fn twice_plus_one(x: u64) -> u64 {
@@ -78,6 +86,12 @@ impl ImportResolver for Probe {
             provenance: Provenance::Hle,
         };
         match symbol {
+            ImportSymbol::Name { name, .. }
+                if dll.eq_ignore_ascii_case("victory-probe-delayed.dll")
+                    && name == "ProbeDelayed" =>
+            {
+                found(probe_delayed as *const () as usize)
+            }
             ImportSymbol::Name { name, .. } if dll.eq_ignore_ascii_case("victory-probe.dll") => {
                 match name.as_str() {
                     "ProbeValue" => found(probe_value as *const () as usize),

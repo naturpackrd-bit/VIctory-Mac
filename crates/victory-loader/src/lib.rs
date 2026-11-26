@@ -90,3 +90,7 @@ pub use windows::{
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 /// `DLL_PROCESS_DETACH`.
 pub const DLL_PROCESS_DETACH: u32 = 0;
+/// `DLL_THREAD_ATTACH`: a thread starts.
+pub const DLL_THREAD_ATTACH: u32 = 2;
+/// `DLL_THREAD_DETACH`: a thread ends.
+pub const DLL_THREAD_DETACH: u32 = 3;

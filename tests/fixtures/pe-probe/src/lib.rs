@@ -15,6 +15,13 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 unsafe extern "win64" {
     fn ProbeValue() -> u32;
     fn ProbeSum6(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64;
+    fn ProbeMissing() -> u32;
+}
+
+// Delay-loaded (`/DELAYLOAD`): the loader binds it ahead, with the others.
+#[link(name = "victory-probe-delayed", kind = "raw-dylib")]
+unsafe extern "win64" {
+    fn ProbeDelayed() -> u32;
 }
 
 /// The Win64 convention, arguments in registers.
@@ -51,6 +58,30 @@ pub extern "win64" fn probe_reloc() -> u32 {
     // SAFETY: a static, read where it lies.
     let value = unsafe { core::ptr::read_volatile(&raw const POINTER) };
     value.fetch_add(1, Ordering::Relaxed)
+}
+
+/// An import the tests' resolver leaves missing: bound to a stub, or the
+/// mapping is refused.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_missing() -> u32 {
+    // SAFETY: as above.
+    unsafe { ProbeMissing() }
+}
+
+/// A delay import, bound by the loader ahead.
+#[unsafe(no_mangle)]
+pub extern "win64" fn probe_delayed() -> u32 {
+    // SAFETY: as above.
+    unsafe { ProbeDelayed() }
+}
+
+/// What lld-link requires of an image with delay imports: the helper the
+/// delay IAT slots point at until bound. It never runs, because our loader
+/// binds delay imports ahead, so it faults if it ever does.
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+pub extern "win64" fn __delayLoadHelper2() {
+    core::arch::naked_asm!("ud2")
 }
 
 /// The title calls a function of ours that it is given.
@@ -92,7 +123,7 @@ pub static _tls_used: TlsDirectory = TlsDirectory {
     start: (&raw const TLS_START).cast(),
     end: (&raw const TLS_END).cast(),
     index: (&raw const _tls_index).cast(),
-    callbacks: core::ptr::null(),
+    callbacks: (&raw const entry::TLS_CALLBACKS).cast(),
     zero_fill: 0,
     characteristics: 0,
 };
@@ -199,12 +230,6 @@ pub extern "win64" fn probe_user_pointer() -> u64 {
              out("r9") value, options(preserves_flags))
     };
     value
-}
-
-/// The entry point of the DLL; the tests' loader does not call it.
-#[unsafe(no_mangle)]
-pub extern "win64" fn _DllMainCRTStartup(_: *mut u8, _: u32, _: *mut u8) -> i32 {
-    1
 }
 
 /// A fault the tests see, never a hang.

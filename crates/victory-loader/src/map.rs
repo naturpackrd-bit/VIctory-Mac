@@ -7,15 +7,25 @@
 //! Off Windows, where the host has no TEB for title code, the image's
 //! static TLS is registered and its `gs` accesses are patched (`teb`).
 //!
-//! Not yet (docs/macos.md, M2a): the exception table, delay imports, TLS
-//! callbacks and the entry point, and reporting stubs for imports nobody
-//! resolves (mapping fails on those instead).
+//! Delay imports are bound ahead, with the others, as Windows binds a
+//! DLL's delay imports when it can, so the image's `__delayLoadHelper2` is
+//! never reached. An import nobody resolves either fails the mapping
+//! ([`MappedImage::map`]) or is bound to a stub that reports its calls
+//! (`stubs`, [`MappedImage::map_with`]).
+//!
+//! Nothing in the image runs while it is mapped: its TLS callbacks and
+//! entry point run when the owner calls [`MappedImage::notify`].
+//!
+//! Not yet (docs/macos.md, M2a): the exception table.
+
+use std::ffi::c_void;
 
 use victory_pe::layout::{self, OPT_IMAGE_BASE, OPT_SIZE_OF_HEADERS};
 use victory_pe::{ImageInfo, PeError, base_relocations};
 use victory_platform::{Host, Memory, Protection};
 
-use crate::{ImportResolver, Resolution};
+use crate::stubs::{Stubs, UnimplementedPolicy};
+use crate::{DLL_PROCESS_ATTACH, ImportResolver, Resolution};
 
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
@@ -46,6 +56,10 @@ pub enum MapError {
     Thunks,
     #[error("gs accesses the loader cannot patch: {}", .0.join(", "))]
     GsAccesses(Vec<String>),
+    #[error("no memory for the stubs of unresolved imports")]
+    Stubs,
+    #[error("the image's DllMain refused to attach")]
+    EntryRefused,
 }
 
 /// An image in our memory, mapped by [`MappedImage::map`]; unmapped when
@@ -62,16 +76,36 @@ pub struct MappedImage {
     /// The thunks its patched `gs` accesses call (`teb`), if it had any.
     #[cfg(not(windows))]
     thunks: Option<crate::teb::Thunks>,
+    /// The stubs its unresolved imports are bound to, if it had any.
+    stubs: Option<Stubs>,
 }
+
+/// A TLS callback, and DllMain but for its result: `(base, reason, null)`.
+type TlsCallback = extern "win64" fn(*mut c_void, u32, *mut c_void);
+type DllMain = extern "win64" fn(*mut c_void, u32, *mut c_void) -> i32;
 
 impl MappedImage {
     /// Maps the image whose file is `file`, binding its imports through
     /// `resolver`; `name` is what crash reports and logs call it (its file
-    /// name, usually).
+    /// name, usually). Imports nobody resolves fail the mapping
+    /// ([`MapError::Unresolved`]).
     pub fn map(
         file: &[u8],
         name: &str,
         resolver: &dyn ImportResolver,
+    ) -> Result<MappedImage, MapError> {
+        MappedImage::map_with(file, name, resolver, UnimplementedPolicy::Refuse)
+    }
+
+    /// As [`MappedImage::map`], with `policy` saying what becomes of imports
+    /// nobody resolves: with [`UnimplementedPolicy::Refuse`] the mapping
+    /// fails and names them; otherwise each is bound to a stub that reports
+    /// its calls and follows the policy (`stubs`).
+    pub fn map_with(
+        file: &[u8],
+        name: &str,
+        resolver: &dyn ImportResolver,
+        policy: UnimplementedPolicy,
     ) -> Result<MappedImage, MapError> {
         let info = ImageInfo::parse(file)?;
         let page = Host::page_size();
@@ -95,11 +129,12 @@ impl MappedImage {
             tls_index: None,
             #[cfg(not(windows))]
             thunks: None,
+            stubs: None,
         };
         let headers = size_of_headers(file)?.min(file.len());
         image.copy(file, headers)?;
         image.relocate(file)?;
-        image.bind(resolver)?;
+        image.stubs = image.bind(resolver, policy)?;
         #[cfg(not(windows))]
         {
             image.tls_index = image.static_tls()?;
@@ -158,6 +193,69 @@ impl MappedImage {
         Some(self.base + export.rva? as usize)
     }
 
+    /// The entry point's address (`_DllMainCRTStartup` for a DLL,
+    /// `mainCRTStartup` for an EXE), if the image has one.
+    pub fn entry_point(&self) -> Option<usize> {
+        match self.info.entry_rva {
+            0 => None,
+            rva => Some(self.base + rva as usize),
+        }
+    }
+
+    /// The addresses of the image's TLS callbacks, in call order; empty
+    /// without TLS.
+    pub fn tls_callbacks(&self) -> Vec<usize> {
+        self.info
+            .tls
+            .iter()
+            .flat_map(|tls| &tls.callback_rvas)
+            .map(|&rva| self.base + rva as usize)
+            .collect()
+    }
+
+    /// Tells the image of a process or thread event (`reason`, one of the
+    /// `DLL_*` constants): runs every TLS callback with `(base, reason,
+    /// null)`, then, for a DLL with an entry point, its DllMain with the
+    /// same arguments. A DllMain that returns 0 for `DLL_PROCESS_ATTACH` is
+    /// [`MapError::EntryRefused`]; for other reasons its result is ignored.
+    /// For an EXE only the TLS callbacks run: its entry point is
+    /// `mainCRTStartup`, which the title's runner calls.
+    ///
+    /// The loader calls none of these itself: the owner calls
+    /// `notify(DLL_PROCESS_ATTACH)` once after mapping, `DLL_THREAD_ATTACH`
+    /// and `DLL_THREAD_DETACH` on each title thread as it starts and ends,
+    /// and `DLL_PROCESS_DETACH` before unmapping. Off Windows the calling
+    /// thread must have attached its TEB (`teb::attach_current_thread`)
+    /// first, since the image's code reaches it through `gs`.
+    pub fn notify(&self, reason: u32) -> Result<(), MapError> {
+        let base = self.base as *mut c_void;
+        for at in self.tls_callbacks() {
+            // SAFETY: a TLS callback of the mapped, relocated and bound
+            // image, called as Windows calls it.
+            let callback = unsafe { std::mem::transmute::<usize, TlsCallback>(at) };
+            callback(base, reason, std::ptr::null_mut());
+        }
+        if !self.info.is_dll() {
+            return Ok(());
+        }
+        let Some(entry) = self.entry_point() else {
+            return Ok(());
+        };
+        // SAFETY: the image's DllMain, called as Windows calls it.
+        let dll_main = unsafe { std::mem::transmute::<usize, DllMain>(entry) };
+        let attached = dll_main(base, reason, std::ptr::null_mut());
+        if reason == DLL_PROCESS_ATTACH && attached == 0 {
+            return Err(MapError::EntryRefused);
+        }
+        Ok(())
+    }
+
+    /// Every unresolved import that was called at least once, through its
+    /// stub: (dll, symbol, calls).
+    pub fn unimplemented(&self) -> Vec<(&str, &str, u64)> {
+        self.stubs.as_ref().map(Stubs::called).unwrap_or_default()
+    }
+
     /// `len` bytes of the image at `rva`, checked to lie inside it.
     fn at(&self, rva: usize, len: usize) -> Result<*mut u8, MapError> {
         match rva.checked_add(len) {
@@ -211,29 +309,50 @@ impl MappedImage {
         Ok(())
     }
 
-    /// Writes every import's address into its IAT slot.
-    fn bind(&self, resolver: &dyn ImportResolver) -> Result<(), MapError> {
+    /// Writes every import's address into its IAT slot, the delay imports'
+    /// into their delay IAT slots. What nobody resolves is refused or bound
+    /// to a stub, as `policy` says; the stubs made, if any.
+    fn bind(
+        &self,
+        resolver: &dyn ImportResolver,
+        policy: UnimplementedPolicy,
+    ) -> Result<Option<Stubs>, MapError> {
         let mut unresolved = Vec::new();
-        for module in &self.info.imports {
+        let mut stubs: Option<Stubs> = None;
+        let modules = self.info.imports.iter().chain(&self.info.delay_imports);
+        for module in modules {
             for entry in &module.entries {
-                match resolver.resolve(&module.dll, &entry.symbol) {
-                    Resolution::Found { address, .. } => {
-                        let slot = self.at(entry.iat_slot_rva as usize, 8)?.cast::<u64>();
-                        // SAFETY: an IAT slot of our writable image, checked
-                        // above.
-                        unsafe { slot.write_unaligned(address as u64) };
+                let address = match resolver.resolve(&module.dll, &entry.symbol) {
+                    Resolution::Found { address, .. } => address,
+                    Resolution::Missing if policy == UnimplementedPolicy::Refuse => {
+                        unresolved.push(format!("{}!{}", module.dll, entry.symbol));
+                        continue;
                     }
                     Resolution::Missing => {
-                        unresolved.push(format!("{}!{}", module.dll, entry.symbol))
+                        let stubs = match &mut stubs {
+                            Some(stubs) => stubs,
+                            None => stubs.insert(Stubs::new().ok_or(MapError::Stubs)?),
+                        };
+                        let symbol = entry.symbol.to_string();
+                        stubs
+                            .stub(&module.dll, &symbol, policy)
+                            .ok_or(MapError::Stubs)?
                     }
-                }
+                };
+                let slot = self.at(entry.iat_slot_rva as usize, 8)?.cast::<u64>();
+                // SAFETY: an IAT slot of our writable image, checked above.
+                unsafe { slot.write_unaligned(address as u64) };
             }
         }
-        if unresolved.is_empty() {
-            Ok(())
-        } else {
-            Err(MapError::Unresolved(unresolved))
+        if !unresolved.is_empty() {
+            return Err(MapError::Unresolved(unresolved));
         }
+        if let Some(stubs) = &stubs {
+            stubs
+                .finish()
+                .map_err(|(at, len)| MapError::Protection(at, at + len))?;
+        }
+        Ok(stubs)
     }
 
     /// Registers the image's static TLS (`teb`), if it has a TLS directory,
