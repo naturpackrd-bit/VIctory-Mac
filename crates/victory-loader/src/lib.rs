@@ -20,9 +20,15 @@
 //! 5. initialise the title's DLLs, then run TLS callbacks and the entry
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
+//!
+//! Steps 2 to 5 are Windows-only so far (macOS: docs/macos.md). Elsewhere
+//! the portable helpers only they call are unused, and are let be; the
+//! Windows build is the whole one, and still finds code that is dead.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
 mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;

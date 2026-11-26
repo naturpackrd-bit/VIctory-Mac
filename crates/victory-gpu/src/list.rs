@@ -653,6 +653,8 @@ extern "system" fn close(this: This) -> HRESULT {
     if let Some(host) = host_list(this) {
         host.close();
     }
+    #[cfg(not(windows))]
+    let _ = this;
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
@@ -771,6 +773,8 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    #[cfg(not(windows))]
+    let _ = (this, count, barriers);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -1892,6 +1896,9 @@ extern "system" fn execute_indirect(
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    #[cfg(not(windows))]
+    let _ = (this, counter);
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1998,15 +2005,27 @@ impl ValueWait {
         if self.address == 0 {
             return true;
         }
-        static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
-            && !crate::texture::committed(self.address as *const u8, bytes)
+        #[cfg(windows)]
         {
-            return true;
+            static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
+                && !crate::texture::committed(self.address as *const u8, bytes)
+            {
+                return true;
+            }
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
-        if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
+        #[cfg(windows)]
+        let read = crate::host::read_into(self.address as *const u8, &mut raw[..bytes]);
+        // Elsewhere the kernel reads it too (`VICTORY_WAIT_ASK` is not
+        // asked: the read itself finds memory that is not there).
+        #[cfg(not(windows))]
+        let read = <victory_platform::Host as victory_platform::Memory>::read_into(
+            self.address as usize,
+            &mut raw[..bytes],
+        );
+        if !read {
             return true;
         }
         self.holds_for(u64::from_le_bytes(raw))

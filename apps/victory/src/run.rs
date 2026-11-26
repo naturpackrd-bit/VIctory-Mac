@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 
 use crate::{Console, Unimplemented};
 
@@ -615,7 +617,11 @@ mod cpu_check_tests {
     }
 }
 
+/// Stub off Windows (docs/macos.md): the loader that maps and starts a
+/// title is Windows-only so far (macOS: milestone M2).
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
-    anyhow::bail!("running titles requires Windows")
+    anyhow::bail!(
+        "running titles needs Windows for now; the macOS port is under way (docs/macos.md)"
+    )
 }

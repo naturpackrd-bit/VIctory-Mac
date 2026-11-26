@@ -430,8 +430,7 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
     let priority = if as_set { priority } else { title_priority(priority) };
-    // SAFETY: the title passes a thread handle.
-    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    host::set_thread_priority(thread, priority)
 }
 
 pub(crate) fn module() -> HleModule {
@@ -573,6 +572,11 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: the title passes a thread handle.
+        unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    }
+
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
         // SAFETY: our filter takes the exception pointers as an opaque pointer.
         unsafe {
@@ -668,6 +672,10 @@ mod host {
         std::process::exit(code as i32)
     }
 
+    pub(super) fn set_thread_priority(_: *mut c_void, _: i32) -> i32 {
+        0
+    }
+
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
     pub(super) fn report_unhandled(_: *const c_void) {}
@@ -689,18 +697,24 @@ mod tests {
     fn no_title_thread_waits_for_idle_processors() {
         let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
         assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
-        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
-        std::thread::spawn(|| {
-            // SAFETY: plain calls on this thread.
-            let thread = unsafe { GetCurrentThread() };
-            assert_eq!(SetThreadPriority(thread, -15), 1);
-            // SAFETY: as above.
-            assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
-        })
-        .join()
-        .unwrap();
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+            std::thread::spawn(|| {
+                // SAFETY: plain calls on this thread.
+                let thread = unsafe { GetCurrentThread() };
+                assert_eq!(SetThreadPriority(thread, -15), 1);
+                // SAFETY: as above.
+                assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+            })
+            .join()
+            .unwrap();
+        }
     }
 
+    // Title paths are Windows paths, which only Windows' `Path` reads as
+    // such (`runtime::set_image_path`); elsewhere: docs/macos.md, M2.
+    #[cfg(windows)]
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
@@ -743,6 +757,7 @@ mod tests {
         unsafe { assert_eq!((*__p___argc(), (**__p___argv()).is_null()), (1, false)) };
     }
 
+    #[cfg(windows)]
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }
@@ -782,6 +797,9 @@ mod tests {
         );
     }
 
+    // Title paths are Windows paths, which only Windows' `Path` reads as
+    // such (`runtime::set_image_path`); elsewhere: docs/macos.md, M2.
+    #[cfg(windows)]
     #[test]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;

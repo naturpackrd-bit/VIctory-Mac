@@ -446,6 +446,8 @@ mod tests {
         std::fs::read(std::env::current_exe().unwrap()).unwrap()
     }
 
+    // The test binary is a PE image only on Windows.
+    #[cfg(windows)]
     #[test]
     fn parses_own_test_binary() {
         let info = ImageInfo::parse(&own_image()).unwrap();
@@ -465,6 +467,8 @@ mod tests {
         assert!(info.tls.is_some());
     }
 
+    // The test binary is a PE image only on Windows.
+    #[cfg(windows)]
     #[test]
     fn rva_to_file_offset_maps_entry_point() {
         let data = own_image();
@@ -473,6 +477,8 @@ mod tests {
         assert!(off < data.len());
     }
 
+    // The test binary is a PE image only on Windows.
+    #[cfg(windows)]
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
         let mut info = ImageInfo::parse(&own_image()).unwrap();
@@ -493,6 +499,8 @@ mod tests {
         assert!(ImageInfo::parse(&truncated).is_err());
     }
 
+    // The test binary is a PE image only on Windows.
+    #[cfg(windows)]
     #[test]
     fn rejects_iat_outside_image() {
         let mut data = own_image();

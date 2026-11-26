@@ -2,6 +2,8 @@
 //! what it cannot handle yet is tallied (decision 0003).
 
 pub(crate) mod host_wave;
+#[cfg(not(windows))]
+mod unhosted;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -9,8 +11,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use unhosted::{self as host, Host, Validator};
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,

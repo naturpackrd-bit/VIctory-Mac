@@ -14,6 +14,12 @@
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
+//!
+//! Only Windows has a host back end yet (D3D12; Metal is planned for macOS,
+//! docs/macos.md). Elsewhere the helpers only it calls are unused, and are
+//! let be: they are what the next back end will call. The Windows build is
+//! the whole one, and still finds code that is dead.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 #[cfg(windows)]
 mod ambient;

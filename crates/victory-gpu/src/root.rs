@@ -74,7 +74,10 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
             unsafe { GetProcAddress(module, name.as_ptr().cast()) }.map(|f| f as usize)
         }
         #[cfg(not(windows))]
-        None
+        {
+            let _ = name;
+            None
+        }
     })
 }
 

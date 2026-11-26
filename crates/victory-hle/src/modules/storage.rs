@@ -186,6 +186,7 @@ static VTABLE: Methods<8> = Methods([
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use crate::modules::xgameruntime::method;
 
     #[test]
@@ -234,6 +235,8 @@ mod tests {
         assert_eq!(path, nested);
     }
 
+    // Virtual drives (`files`) are Windows-only so far (docs/macos.md).
+    #[cfg(windows)]
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
         type Size = extern "system" fn(This, *mut usize) -> HRESULT;
