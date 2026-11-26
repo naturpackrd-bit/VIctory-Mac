@@ -1,8 +1,9 @@
 //! macOS.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-use crate::{Dirs, Host, Memory, Protection};
+use crate::{Dirs, Host, Memory, Protection, Thread};
 
 /// `<mach/vm_statistics.h>` (libc's copies are deprecated).
 const VM_FLAGS_FIXED: libc::c_int = 0;
@@ -114,6 +115,55 @@ impl Memory for Host {
             )
         };
         result == libc::KERN_SUCCESS && copied == len as libc::mach_vm_size_t
+    }
+}
+
+impl Thread for Host {
+    fn stack_bounds() -> (usize, usize) {
+        // SAFETY: plain queries about this thread.
+        unsafe {
+            let thread = libc::pthread_self();
+            let top = libc::pthread_get_stackaddr_np(thread) as usize;
+            let size = libc::pthread_get_stacksize_np(thread);
+            (top - size, top)
+        }
+    }
+
+    fn thread_id() -> u32 {
+        let mut id = 0u64;
+        // SAFETY: a plain query about this thread, into our own variable.
+        unsafe { libc::pthread_threadid_np(libc::pthread_self(), &mut id) };
+        id as u32
+    }
+
+    fn process_id() -> u32 {
+        // SAFETY: a plain query.
+        unsafe { libc::getpid() as u32 }
+    }
+
+    /// A thread-specific key of our own. libpthread keeps a thread's
+    /// specific values in an array at `gs:0`, eight bytes each
+    /// (`pthread_getspecific` is `mov rax, gs:[rdi*8]`), so the key's value
+    /// is at `gs:[key * 8]`. The test `the_teb_pointer_is_read_through_gs`
+    /// holds the layout to that.
+    fn teb_pointer_disp() -> u32 {
+        static KEY: OnceLock<u32> = OnceLock::new();
+        *KEY.get_or_init(|| {
+            let mut key: libc::pthread_key_t = 0;
+            // SAFETY: a fresh key with no destructor, kept for the process's
+            // life.
+            let made = unsafe { libc::pthread_key_create(&mut key, None) };
+            assert_eq!(made, 0, "pthread_key_create failed");
+            key as u32 * 8
+        })
+    }
+
+    unsafe fn set_teb_pointer(teb: usize) -> bool {
+        let key = Self::teb_pointer_disp() / 8;
+        // SAFETY: our key; the value is the caller's pointer, stored as is.
+        unsafe {
+            libc::pthread_setspecific(key as libc::pthread_key_t, teb as *const libc::c_void) == 0
+        }
     }
 }
 

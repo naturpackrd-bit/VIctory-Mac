@@ -78,6 +78,30 @@ pub trait Memory {
     }
 }
 
+/// This thread, for the TEB we keep for it where Windows has the real one
+/// (macOS; Linux for tests).
+#[cfg(unix)]
+pub trait Thread {
+    /// This thread's stack: its lowest address and one past its highest.
+    fn stack_bounds() -> (usize, usize);
+    /// This thread's id, as the host numbers threads (the low 32 bits of a
+    /// wider one).
+    fn thread_id() -> u32;
+    fn process_id() -> u32;
+    /// Where x86-64 code finds this thread's TEB once
+    /// [`Thread::set_teb_pointer`] has run: `gs:[disp]`, with the `disp` this
+    /// returns, the same on every thread. The TEB's own `Self` field (offset
+    /// 0x30) must hold its address: on Linux `gs` is made to point at the
+    /// TEB itself, and `disp` is 0x30.
+    fn teb_pointer_disp() -> u32;
+    /// Makes `gs:[teb_pointer_disp()]` read `teb` on this thread.
+    ///
+    /// # Safety
+    /// `teb` is a TEB whose `Self` field holds `teb`, and it stays valid for
+    /// as long as this thread may read it.
+    unsafe fn set_teb_pointer(teb: usize) -> bool;
+}
+
 /// Where VIctory keeps its own files when the user names no place.
 pub trait Dirs {
     /// The default `cache_dir` (derived data, which may be deleted at any
@@ -210,6 +234,74 @@ mod tests {
             assert_eq!(f(), 42);
             assert!(Host::free(p, size));
         }
+    }
+
+    /// A TEB-shaped block whose `Self` field (0x30) holds its own address.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[repr(C, align(16))]
+    struct FakeTeb([u64; 16]);
+
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    fn fake_teb() -> Box<FakeTeb> {
+        let mut teb = Box::new(FakeTeb([0; 16]));
+        teb.0[6] = &raw const *teb as usize as u64;
+        teb
+    }
+
+    /// What `gs:[disp]` holds on this thread.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    fn read_gs(disp: u32) -> usize {
+        let value: usize;
+        // SAFETY: a load through `gs` at a displacement the host gave us.
+        unsafe {
+            std::arch::asm!("mov {0}, gs:[{1}]", out(reg) value, in(reg) disp as usize,
+                options(nostack, readonly, preserves_flags))
+        };
+        value
+    }
+
+    /// Title code finds its TEB where the host says: here and on another
+    /// thread, each its own.
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    #[test]
+    fn the_teb_pointer_is_read_through_gs() {
+        let disp = Host::teb_pointer_disp();
+        assert_eq!(disp % 8, 0, "{disp:#x}");
+        let mine = fake_teb();
+        let at = &raw const *mine as usize;
+        // SAFETY: a TEB-shaped block with its address at 0x30, kept alive
+        // below.
+        assert!(unsafe { Host::set_teb_pointer(at) });
+        assert_eq!(read_gs(disp), at);
+        let other = std::thread::spawn(move || {
+            let theirs = fake_teb();
+            let at = &raw const *theirs as usize;
+            // SAFETY: as above.
+            assert!(unsafe { Host::set_teb_pointer(at) });
+            (read_gs(disp) == at, at)
+        })
+        .join()
+        .unwrap();
+        assert!(other.0, "the other thread reads its own");
+        assert_ne!(other.1, at);
+        assert_eq!(read_gs(disp), at, "ours is untouched by the other thread's");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_thread_is_known() {
+        let (low, high) = Host::stack_bounds();
+        let here = &raw const low as usize;
+        assert!(
+            low < here && here < high,
+            "{low:#x} < {here:#x} < {high:#x}"
+        );
+        assert!(high - low >= 64 * 1024, "{} bytes of stack", high - low);
+        let mine = Host::thread_id();
+        let theirs = std::thread::spawn(Host::thread_id).join().unwrap();
+        assert_ne!(mine, theirs);
+        assert_eq!(Host::thread_id(), mine, "stable");
+        assert_eq!(Host::process_id(), std::process::id());
     }
 
     #[test]

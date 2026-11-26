@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use crate::{Dirs, Host, Memory, Protection};
+use crate::{Dirs, Host, Memory, Protection, Thread};
+
+/// `arch_prctl` code: set this thread's `gs` base (`<asm/prctl.h>`).
+const ARCH_SET_GS: libc::c_long = 0x1001;
 
 fn host_protection(protection: Protection) -> libc::c_int {
     match protection {
@@ -76,6 +79,49 @@ impl Memory for Host {
         // the source (EFAULT where a page of it is not readable).
         let n = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
         n == len as isize
+    }
+}
+
+impl Thread for Host {
+    /// The mapping of `/proc/self/maps` that holds a local of this thread.
+    fn stack_bounds() -> (usize, usize) {
+        let marker = 0u8;
+        let here = &raw const marker as usize;
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("/proc/self/maps");
+        maps.lines()
+            .filter_map(|line| {
+                let (range, _) = line.split_once(' ')?;
+                let (start, end) = range.split_once('-')?;
+                let (start, end) = (
+                    usize::from_str_radix(start, 16).ok()?,
+                    usize::from_str_radix(end, 16).ok()?,
+                );
+                (start..end).contains(&here).then_some((start, end))
+            })
+            .next()
+            .expect("this thread's stack in /proc/self/maps")
+    }
+
+    fn thread_id() -> u32 {
+        // SAFETY: a plain query.
+        unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+    }
+
+    fn process_id() -> u32 {
+        // SAFETY: a plain query.
+        unsafe { libc::getpid() as u32 }
+    }
+
+    /// Linux does not use `gs` for its own thread data (that is `fs`), so
+    /// the TEB itself is put at the `gs` base, and its `Self` field is read.
+    fn teb_pointer_disp() -> u32 {
+        0x30
+    }
+
+    unsafe fn set_teb_pointer(teb: usize) -> bool {
+        // SAFETY: sets this thread's `gs` base, which nothing of the host's
+        // uses on x86-64 Linux.
+        unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_GS, teb) == 0 }
     }
 }
 

@@ -5,10 +5,12 @@
 //! host binaries alike. This crate never modifies anything; patching lives in
 //! `victory-loader`, which uses the raw offsets exported from [`layout`].
 
+pub mod gs;
 mod image;
 pub mod implib;
 pub mod layout;
 
+pub use gs::{GsAccess, GsSite, TEB_SIZE, gs_sites};
 pub use image::{
     CodeViewInfo, ExportInfo, ImageInfo, ImportEntry, ImportModule, ImportSymbol, SectionInfo,
     TlsInfo, base_relocations,
