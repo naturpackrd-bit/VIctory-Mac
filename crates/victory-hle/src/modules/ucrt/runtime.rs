@@ -3,11 +3,10 @@
 //! and environment; the per-thread `errno` and its messages; signals; the
 //! floating-point control word; threads started through the C runtime; and
 //! the pieces of `vcruntime140.dll` that are not exception dispatch (type
-//! information, RTTI casts, `setjmp`/`longjmp`).
+//! information, RTTI casts, `setjmp`/`longjmp`; C++ exceptions are
+//! `cxx.rs`'s).
 //!
 //! Limits:
-//! - C++ exceptions are not dispatched yet: `_CxxThrowException` ends the
-//!   process, and the frame handlers are inert (they let the search go on).
 //! - `_seh_filter_exe` does not run the title's `signal(SIGSEGV)` (or
 //!   `SIGILL`, `SIGFPE`) handlers for a hardware exception: it lets the
 //!   search go on.
@@ -1595,76 +1594,6 @@ pub extern "win64" fn __std_exception_destroy(data: *mut ExceptionData) {
     }
 }
 
-/// `std::terminate`: `kernel.rs`'s `terminate`.
-pub extern "win64" fn __std_terminate() -> ! {
-    crate::modules::kernel::terminate()
-}
-
-/// Throws a C++ exception: not dispatched yet, so the process ends.
-pub extern "win64" fn _CxxThrowException(object: *mut c_void, throw_info: *const c_void) -> ! {
-    tracing::error!(
-        object = ?object,
-        throw_info = ?throw_info,
-        "C++ exception thrown: not dispatched yet, the process ends"
-    );
-    std::process::abort()
-}
-
-/// The C++ frame handler: inert, it lets the search go on
-/// (`ExceptionContinueSearch`).
-pub extern "win64" fn __CxxFrameHandler3(
-    _record: *mut c_void,
-    _frame: u64,
-    _context: *mut c_void,
-    _dispatcher: *mut c_void,
-) -> u32 {
-    static WARNED: Once = Once::new();
-    WARNED.call_once(|| tracing::warn!("C++ frame handlers are inert"));
-    1
-}
-
-/// See [`__CxxFrameHandler3`].
-pub extern "win64" fn __CxxFrameHandler4(
-    record: *mut c_void,
-    frame: u64,
-    context: *mut c_void,
-    dispatcher: *mut c_void,
-) -> u32 {
-    __CxxFrameHandler3(record, frame, context, dispatcher)
-}
-
-thread_local! {
-    static CURRENT_EXCEPTION: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
-    static CURRENT_EXCEPTION_CONTEXT: Cell<*mut c_void> =
-        const { Cell::new(std::ptr::null_mut()) };
-    static PROCESSING_THROW: Cell<i32> = const { Cell::new(0) };
-}
-
-/// The calling thread's slot for the exception being handled.
-pub extern "win64" fn __current_exception() -> *mut *mut c_void {
-    CURRENT_EXCEPTION.with(Cell::as_ptr)
-}
-
-/// The calling thread's slot for the context of the exception being handled.
-pub extern "win64" fn __current_exception_context() -> *mut *mut c_void {
-    CURRENT_EXCEPTION_CONTEXT.with(Cell::as_ptr)
-}
-
-/// The calling thread's count of throws in progress.
-pub extern "win64" fn __processing_throw() -> *mut i32 {
-    PROCESSING_THROW.with(Cell::as_ptr)
-}
-
-/// Whether the current exception is of a type: never (none is dispatched).
-pub extern "win64" fn _is_exception_typeof(_ty: *const c_void, _pointers: *mut c_void) -> i32 {
-    0
-}
-
-/// Whether an exception object is to be destroyed: yes.
-pub extern "win64" fn _IsExceptionObjectToBeDestroyed(_object: *mut c_void) -> i32 {
-    1
-}
-
 // ---------------------------------------------------------------------------
 // vcruntime: RTTI.
 
@@ -2039,15 +1968,6 @@ pub(crate) fn exports() -> Vec<HleExport> {
         hle_export!(__std_type_info_hash),
         hle_export!(__std_exception_copy),
         hle_export!(__std_exception_destroy),
-        hle_export!(__std_terminate),
-        hle_export!(_CxxThrowException),
-        hle_export!(__CxxFrameHandler3),
-        hle_export!(__CxxFrameHandler4),
-        hle_export!(__current_exception),
-        hle_export!(__current_exception_context),
-        hle_export!(__processing_throw),
-        hle_export!(_is_exception_typeof),
-        hle_export!(_IsExceptionObjectToBeDestroyed),
         hle_export!(__RTtypeid),
         hle_export!(__RTCastToVoid),
         hle_export!(__RTDynamicCast),
@@ -2471,6 +2391,6 @@ mod tests {
 
     #[test]
     fn every_export_is_listed() {
-        assert_eq!(exports().len(), 114);
+        assert_eq!(exports().len(), 105);
     }
 }

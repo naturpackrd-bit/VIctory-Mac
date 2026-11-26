@@ -120,15 +120,24 @@ impl ImportResolver for Probe {
                 let raise = stand_in_raise as *const () as usize;
                 found(raise)
             }
+            // C++ exception handling's, which the loader does not have
+            // (victory-hle does): stand-ins, never called by these tests.
+            ImportSymbol::Name { name, .. } if dll.eq_ignore_ascii_case("vcruntime140.dll") => {
+                match name.as_str() {
+                    "__CxxFrameHandler3" => found(stand_in_handler as *const () as usize),
+                    "_CxxThrowException" => found(stand_in_throw as *const () as usize),
+                    _ => Resolution::Missing,
+                }
+            }
             _ => Resolution::Missing,
         }
     }
 }
 
 /// Nobody: every import is missing.
-/// On Windows, where the probe's SEH functions are never called: what its
-/// `__C_specific_handler` import binds to (`ExceptionContinueSearch`).
-#[cfg(windows)]
+/// On Windows, where the probe's SEH functions are never called, what its
+/// `__C_specific_handler` import binds to; everywhere, its
+/// `__CxxFrameHandler3` (`ExceptionContinueSearch`).
 extern "win64" fn stand_in_handler(
     _record: *mut core::ffi::c_void,
     _frame: u64,
@@ -141,6 +150,12 @@ extern "win64" fn stand_in_handler(
 /// On Windows: what the probe's `RaiseException` import binds to.
 #[cfg(windows)]
 extern "win64" fn stand_in_raise(_code: u32, _flags: u32, _count: u32, _args: *const u64) {}
+
+/// What the probe's `_CxxThrowException` import binds to: these tests throw
+/// nothing.
+extern "win64" fn stand_in_throw(_object: *mut core::ffi::c_void, _info: *const core::ffi::c_void) {
+    std::process::abort()
+}
 
 pub struct Nobody;
 

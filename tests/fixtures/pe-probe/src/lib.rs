@@ -4,6 +4,7 @@
 //! resolver answers them.
 #![no_std]
 
+mod cxx;
 mod entry;
 mod faults;
 mod seh;
@@ -32,6 +33,16 @@ unsafe extern "win64" {
 unsafe extern "win64" {
     fn __C_specific_handler(record: *mut c_void, frame: u64, ctx: *mut c_void, dc: *mut c_void)
     -> u32;
+}
+
+// C++ exception handling's: the language handler `cxx`'s functions (and
+// core's unwind tables) name, and the throw they call, both from assembly.
+#[link(name = "vcruntime140", kind = "raw-dylib")]
+unsafe extern "win64" {
+    fn __CxxFrameHandler3(record: *mut c_void, frame: u64, ctx: *mut c_void, dc: *mut c_void)
+    -> u32;
+    #[allow(dead_code)]
+    fn _CxxThrowException(object: *mut c_void, throw_info: *const c_void);
 }
 
 #[link(name = "kernel32", kind = "raw-dylib")]
@@ -308,10 +319,3 @@ pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) ->
 /// What MSVC objects expect when they use floating point.
 #[unsafe(no_mangle)]
 pub static _fltused: i32 = 0;
-
-/// Named by core's unwind tables; never called, panics abort.
-#[unsafe(no_mangle)]
-pub extern "C" fn __CxxFrameHandler3() -> ! {
-    // SAFETY: as in `panic`.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
-}

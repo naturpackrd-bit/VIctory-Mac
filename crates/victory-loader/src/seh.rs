@@ -926,7 +926,8 @@ pub fn dispatch_exception(record: &mut ExceptionRecord, ctx: &mut Context) -> bo
                 handler_data: handler.data as *mut c_void,
                 history_table: ptr::null_mut(),
                 scope_index: 0,
-                fill0: 0,
+                // `ControlPcIsUnwound`: the pc is a return address.
+                fill0: u32::from(before.rsp != ctx.rsp),
             };
             // SAFETY: the frame's handler, given what Windows gives it.
             let disposition = unsafe { language(record, unwound.establisher_frame, ctx, &mut dc) };
@@ -1077,6 +1078,7 @@ pub unsafe fn unwind_ex(
     if target_frame == 0 {
         record.flags |= EXCEPTION_EXIT_UNWIND;
     }
+    let start = ctx.rsp;
     loop {
         let mut walk = ctx.to_unwind();
         let Some(image) = images::find(walk.rip as usize) else {
@@ -1111,7 +1113,7 @@ pub unsafe fn unwind_ex(
                 handler_data: handler.data as *mut c_void,
                 history_table: ptr::null_mut(),
                 scope_index: 0,
-                fill0: 0,
+                fill0: u32::from(before.rsp != start),
             };
             // SAFETY: as in `dispatch_exception`.
             let disposition = unsafe { language(record, unwound.establisher_frame, ctx, &mut dc) };

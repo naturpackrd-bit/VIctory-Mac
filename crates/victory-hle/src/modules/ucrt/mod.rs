@@ -1,11 +1,11 @@
 //! The Universal C Runtime (`ucrtbase.dll` and the `api-ms-win-crt-*` API
-//! sets) and the pieces of `vcruntime140.dll` that are not exception
-//! dispatch: on Windows the host provides them, here they are ours
-//! (docs/macos.md, M2b). One file per area; each lists its exports. Stdio
-//! is `format.rs` and `scan.rs` (the `printf` and `scanf` engines),
-//! `lowio.rs` (file descriptors and the file system) and `stdio.rs`
-//! (streams).
+//! sets) and `vcruntime140.dll`, C++ exception handling included (`cxx`):
+//! on Windows the host provides them, here they are ours (docs/macos.md,
+//! M2b). One file per area; each lists its exports. Stdio is `format.rs`
+//! and `scan.rs` (the `printf` and `scanf` engines), `lowio.rs` (file
+//! descriptors and the file system) and `stdio.rs` (streams).
 
+pub mod cxx;
 pub mod format;
 pub mod heap;
 pub mod locale;
@@ -22,6 +22,7 @@ use crate::HleModule;
 pub(crate) fn module() -> HleModule {
     let mut exports = Vec::new();
     exports.extend(runtime::exports());
+    exports.extend(cxx::exports());
     exports.extend(heap::exports());
     exports.extend(string::exports());
     exports.extend(math::exports());
