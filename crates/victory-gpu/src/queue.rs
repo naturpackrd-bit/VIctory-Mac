@@ -488,7 +488,7 @@ fn queue<'a>(this: This) -> &'a Queue {
     unsafe { &*this.cast::<Queue>() }
 }
 
-pub(crate) extern "system" fn create(
+pub(crate) extern "win64" fn create(
     _: This,
     desc: *const QueueDesc,
     iid: *const Iid,
@@ -526,7 +526,7 @@ pub(crate) struct QueueDescX {
 
 /// Device method `CreateCommandQueueX`. The host picks engines itself, so
 /// the queue is created as on PC.
-pub(crate) extern "system" fn create_x(
+pub(crate) extern "win64" fn create_x(
     this: This,
     desc: *const QueueDescX,
     iid: *const Iid,
@@ -546,7 +546,7 @@ pub(crate) extern "system" fn create_x(
     create(this, &desc, iid, out)
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         QUEUE,
         iid,
@@ -554,7 +554,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         out,
     )
 }
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
     if left == 0 {
@@ -565,7 +565,7 @@ extern "system" fn release(this: This) -> u32 {
 
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
-extern "system" fn execute(this: This, count: u32, lists: *const This) {
+extern "win64" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -709,12 +709,12 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
+extern "win64" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
-extern "system" fn signal2_x(
+extern "win64" fn signal2_x(
     this: This,
     fence: This,
     value: u64,
@@ -724,8 +724,8 @@ extern "system" fn signal2_x(
     signal(this, fence, value)
 }
 /// Markers and events only matter to profilers.
-extern "system" fn marker(_: This) {}
-extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+extern "win64" fn marker(_: This) {}
+extern "win64" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -756,7 +756,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// reached is nothing; otherwise what the queue is given next is held
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
-extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+extern "win64" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -812,7 +812,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
-extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
+extern "win64" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -910,7 +910,7 @@ pub(crate) fn presented() -> u64 {
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
-extern "system" fn present(
+extern "win64" fn present(
     this: This,
     planes: u32,
     plane_parameters: *const Plane,
@@ -1178,7 +1178,7 @@ const PAGE: u64 = 64 << 10;
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once: every earlier
 /// submission has run.
-extern "system" fn copy_page_mappings(
+extern "win64" fn copy_page_mappings(
     _: This,
     count: u32,
     batches: *const PageBatch,
@@ -1238,7 +1238,7 @@ extern "system" fn copy_page_mappings(
     S_OK
 }
 
-extern "system" fn desc(this: This, out: *mut QueueDesc) {
+extern "win64" fn desc(this: This, out: *mut QueueDesc) {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(queue(this).desc) };
@@ -1328,13 +1328,13 @@ mod tests {
             crate::fence::create(null, 0, 0, fence_iid, &mut fence),
             S_OK
         );
-        let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
+        let signal = slot::<extern "win64" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
         assert_eq!(signal(q, fence, 7), S_OK);
         assert_eq!(
-            slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
+            slot::<extern "win64" fn(This) -> u64>(fence, 0x40)(fence),
             7
         );
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.

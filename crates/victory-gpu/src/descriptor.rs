@@ -920,7 +920,7 @@ fn increment(kind: u32) -> Option<u32> {
 }
 
 /// Device method.
-pub(crate) extern "system" fn increment_size(_: This, kind: u32) -> u32 {
+pub(crate) extern "win64" fn increment_size(_: This, kind: u32) -> u32 {
     increment(kind).unwrap_or(0)
 }
 
@@ -991,7 +991,7 @@ impl RtvRecord {
 }
 
 /// Device method: records the view at `handle` (descriptor memory).
-pub(crate) extern "system" fn create_rtv(
+pub(crate) extern "win64" fn create_rtv(
     _: This,
     resource: This,
     desc: *const [u32; 6],
@@ -1013,7 +1013,7 @@ pub(crate) extern "system" fn create_rtv(
 }
 
 /// Device method: a depth view, recorded as render target views are.
-pub(crate) extern "system" fn create_dsv(
+pub(crate) extern "win64" fn create_dsv(
     this: This,
     resource: This,
     desc: *const [u32; 6],
@@ -1538,7 +1538,7 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+pub(crate) extern "win64" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
         record(handle, View::Constant(address, size));
@@ -1546,7 +1546,7 @@ pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle:
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_srv(
+pub(crate) extern "win64" fn create_srv(
     _: This,
     resource: This,
     desc: *const [u32; 10],
@@ -1556,7 +1556,7 @@ pub(crate) extern "system" fn create_srv(
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_uav(
+pub(crate) extern "win64" fn create_uav(
     _: This,
     resource: This,
     counter: This,
@@ -1570,7 +1570,7 @@ pub(crate) extern "system" fn create_uav(
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
-pub(crate) extern "system" fn create_placed_srv(
+pub(crate) extern "win64" fn create_placed_srv(
     _: This,
     resource: *const [u32; 14],
     desc: *const [u32; 16],
@@ -1581,7 +1581,7 @@ pub(crate) extern "system" fn create_placed_srv(
     }
 }
 
-pub(crate) extern "system" fn create_placed_uav(
+pub(crate) extern "win64" fn create_placed_uav(
     _: This,
     resource: *const [u32; 14],
     desc: *const [u32; 16],
@@ -1593,21 +1593,21 @@ pub(crate) extern "system" fn create_placed_uav(
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_sampler(_: This, desc: *const [u32; 13], handle: u64) {
+pub(crate) extern "win64" fn create_sampler(_: This, desc: *const [u32; 13], handle: u64) {
     if let Some(desc) = words(desc) {
         record(handle, View::Sampler(desc));
     }
 }
 
 /// Device method 0x1e8.
-pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], handle: u64) {
+pub(crate) extern "win64" fn create_sampler_x(_: This, desc: *const [u32; 27], handle: u64) {
     if let Some(desc) = words(desc) {
         record(handle, View::ConsoleSampler(desc));
     }
 }
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
-pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
+pub(crate) extern "win64" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
     let Some(step) = increment(kind).map(u64::from) else {
         return;
     };
@@ -1633,7 +1633,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
 /// Device method: ranges of descriptors (start and count each) gathered
 /// from the sources and scattered to the destinations, in order.
 #[allow(clippy::too_many_arguments)] // the method's own arguments
-pub(crate) extern "system" fn copy(
+pub(crate) extern "win64" fn copy(
     _: This,
     dst_ranges: u32,
     dst_starts: *const u64,
@@ -1701,7 +1701,7 @@ fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_heap(
+pub(crate) extern "win64" fn create_heap(
     _: This,
     desc_ptr: *const HeapDesc,
     iid: *const Iid,
@@ -1766,21 +1766,21 @@ pub(crate) extern "system" fn create_heap(
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &HEAP_IIDS).then_some(this);
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn desc(this: This, out: *mut HeapDesc) {
+extern "win64" fn desc(this: This, out: *mut HeapDesc) {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(heap(this).desc) };
     }
 }
 /// The same address for the CPU and the GPU start.
-extern "system" fn start(this: This) -> u64 {
+extern "win64" fn start(this: This) -> u64 {
     heap(this).start
 }
 
@@ -1854,9 +1854,9 @@ mod tests {
         };
         let mut h = null;
         assert_eq!(create(desc, none, &mut h), S_OK);
-        let cpu = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+        let cpu = slot::<extern "win64" fn(This) -> u64>(h, 0x48)(h);
         assert_eq!(cpu % 64, 0);
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), cpu);
+        assert_eq!(slot::<extern "win64" fn(This) -> u64>(h, 0x50)(h), cpu);
         assert_eq!(increment_size(null, 0), 32);
         // SAFETY: the heap holds 1000 descriptors of 32 bytes.
         unsafe { (cpu as *mut u8).add(999 * 32 + 31).write(1) };
@@ -1912,7 +1912,7 @@ mod tests {
             sync_heaps();
             assert!(host.made(5));
         }
-        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        slot::<extern "win64" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
@@ -2069,10 +2069,10 @@ mod tests {
             ),
             S_OK
         );
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        assert_eq!(slot::<extern "win64" fn(This) -> u64>(h, 0x48)(h), address);
+        assert_eq!(slot::<extern "win64" fn(This) -> u64>(h, 0x50)(h), address);
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
-        assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        assert_ne!(slot::<extern "win64" fn(This) -> u64>(h, 0x48)(h), address);
     }
 }

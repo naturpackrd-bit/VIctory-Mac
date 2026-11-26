@@ -139,7 +139,7 @@ fn heap_free(ptr: *mut u8) {
 /// decide whether the call is valid.
 // shortcut: the cached and non-cached sizes are not enforced as limits;
 // enforce them if a title relies on running out.
-pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
+pub extern "win64" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
     const ALREADY_ALLOCATED: HRESULT = 0x8ACA_0001_u32 as i32;
     if cached == 0 {
         return E_INVALIDARG;
@@ -154,7 +154,7 @@ pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
 }
 
 /// The host address of a device address, null outside the heap.
-pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
+pub extern "win64" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
     heap_unmap(apu).map_or(std::ptr::null_mut(), |p| p.cast())
 }
 
@@ -190,7 +190,7 @@ fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
         .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
 }
 
-pub extern "system" fn ApuAlloc(
+pub extern "win64" fn ApuAlloc(
     out: *mut *mut c_void,
     apu: *mut u32,
     size: u32,
@@ -213,15 +213,15 @@ pub extern "system" fn ApuAlloc(
     S_OK
 }
 
-pub extern "system" fn ApuFree(ptr: *mut c_void) {
+pub extern "win64" fn ApuFree(ptr: *mut c_void) {
     heap_free(ptr.cast());
 }
 
-pub extern "system" fn ApuMapVirtualAddress(ptr: *const c_void) -> u32 {
+pub extern "win64" fn ApuMapVirtualAddress(ptr: *const c_void) -> u32 {
     heap_map(ptr as usize)
 }
 
-pub extern "system" fn ApuIsVirtualAddressValid(ptr: *const c_void, align: u32) -> bool {
+pub extern "win64" fn ApuIsVirtualAddressValid(ptr: *const c_void, align: u32) -> bool {
     let apu = heap_map(ptr as usize);
     apu != 0 && (align == 0 || apu.is_multiple_of(align))
 }
@@ -243,7 +243,7 @@ const CONTEXT_BYTES: [usize; 6] = [32, 256, 256, 16, 64, 256];
 
 static CONTEXTS: Mutex<Option<[usize; 6]>> = Mutex::new(None);
 
-pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts) -> HRESULT {
+pub extern "win64" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts) -> HRESULT {
     if contexts.is_null() {
         return E_INVALIDARG;
     }
@@ -277,7 +277,7 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     S_OK
 }
 
-pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
+pub extern "win64" fn AcpHalReleaseShapeContexts() -> HRESULT {
     match lock(&CONTEXTS).take() {
         Some(arrays) => {
             *XMA.write().unwrap_or_else(|e| e.into_inner()) = Xma::EMPTY;
@@ -811,12 +811,12 @@ pub struct Acp {
 
 #[repr(C)]
 struct AcpMethods {
-    connect: extern "system" fn(*mut Acp, u32, u32) -> HRESULT,
-    disconnect: extern "system" fn(*mut Acp) -> HRESULT,
-    submit: extern "system" fn(*mut Acp, u32, u64, u32, *const c_void, u32) -> HRESULT,
-    pop_message: extern "system" fn(*mut Acp, *mut Message) -> bool,
-    message_count: extern "system" fn(*mut Acp) -> u32,
-    release: extern "system" fn(*mut Acp),
+    connect: extern "win64" fn(*mut Acp, u32, u32) -> HRESULT,
+    disconnect: extern "win64" fn(*mut Acp) -> HRESULT,
+    submit: extern "win64" fn(*mut Acp, u32, u64, u32, *const c_void, u32) -> HRESULT,
+    pop_message: extern "win64" fn(*mut Acp, *mut Message) -> bool,
+    message_count: extern "win64" fn(*mut Acp) -> u32,
+    release: extern "win64" fn(*mut Acp),
 }
 
 static ACP_METHODS: AcpMethods = AcpMethods {
@@ -834,7 +834,7 @@ fn state(this: *mut Acp) -> MutexGuard<'static, State> {
     lock(unsafe { &(*this).state })
 }
 
-extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRESULT {
+extern "win64" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRESULT {
     if commands == 0 {
         return E_INVALIDARG;
     }
@@ -844,7 +844,7 @@ extern "system" fn connect(this: *mut Acp, commands: u32, messages: u32) -> HRES
     S_OK
 }
 
-extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
+extern "win64" fn disconnect(this: *mut Acp) -> HRESULT {
     let mut state = state(this);
     if !state.connected {
         return E_FAIL;
@@ -857,7 +857,7 @@ extern "system" fn disconnect(this: *mut Acp) -> HRESULT {
 /// Done at once: message registrations take effect, a flowgraph completes
 /// unprocessed, a command with an id is acknowledged, and its notification
 /// word is set.
-extern "system" fn submit(
+extern "win64" fn submit(
     this: *mut Acp,
     command: u32,
     id: u64,
@@ -904,7 +904,7 @@ extern "system" fn submit(
     S_OK
 }
 
-extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
+extern "win64" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
     let Some(message) = state(this).messages.pop_front() else {
         return false;
     };
@@ -915,16 +915,16 @@ extern "system" fn pop_message(this: *mut Acp, out: *mut Message) -> bool {
     true
 }
 
-extern "system" fn message_count(this: *mut Acp) -> u32 {
+extern "win64" fn message_count(this: *mut Acp) -> u32 {
     state(this).messages.len() as u32
 }
 
-extern "system" fn release(this: *mut Acp) {
+extern "win64" fn release(this: *mut Acp) {
     // SAFETY: made by `AcpHalCreate` with `Box::into_raw`; released once.
     drop(unsafe { Box::from_raw(this) });
 }
 
-pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
+pub extern "win64" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }

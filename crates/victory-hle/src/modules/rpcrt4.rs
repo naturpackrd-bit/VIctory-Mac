@@ -20,13 +20,13 @@ const OUT_OF_MEMORY: i32 = 14;
 
 /// A version 4 GUID: 16 random bytes, the version nibble and the variant
 /// bits set.
-extern "system" fn UuidCreate(uuid: *mut Guid) -> i32 {
+extern "win64" fn UuidCreate(uuid: *mut Guid) -> i32 {
     create(uuid, false)
 }
 
 /// As [`UuidCreate`]: sequential UUIDs carry a MAC address and a clock on
 /// Windows, which a title must not learn about this machine.
-extern "system" fn UuidCreateSequential(uuid: *mut Guid) -> i32 {
+extern "win64" fn UuidCreateSequential(uuid: *mut Guid) -> i32 {
     create(uuid, true)
 }
 
@@ -80,7 +80,7 @@ fn random(bytes: &mut [u8; 16]) -> bool {
     }
 }
 
-extern "system" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 {
+extern "win64" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 {
     if text.is_null() || uuid.is_null() {
         return INVALID_STRING_UUID;
     }
@@ -96,7 +96,7 @@ extern "system" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 
     }
 }
 
-extern "system" fn UuidFromStringW(text: *const u16, uuid: *mut Guid) -> i32 {
+extern "win64" fn UuidFromStringW(text: *const u16, uuid: *mut Guid) -> i32 {
     if text.is_null() || uuid.is_null() {
         return INVALID_STRING_UUID;
     }
@@ -119,7 +119,7 @@ extern "system" fn UuidFromStringW(text: *const u16, uuid: *mut Guid) -> i32 {
     }
 }
 
-extern "system" fn UuidToStringA(uuid: *const Guid, out: *mut *mut c_char) -> i32 {
+extern "win64" fn UuidToStringA(uuid: *const Guid, out: *mut *mut c_char) -> i32 {
     // SAFETY: the caller passes a GUID to read, as the import declares.
     let Some(g) = (unsafe { uuid.as_ref() }) else {
         return INVALID_STRING_UUID;
@@ -136,7 +136,7 @@ extern "system" fn UuidToStringA(uuid: *const Guid, out: *mut *mut c_char) -> i3
     OK
 }
 
-extern "system" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
+extern "win64" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
     // SAFETY: the caller passes a GUID to read, as the import declares.
     let Some(g) = (unsafe { uuid.as_ref() }) else {
         return INVALID_STRING_UUID;
@@ -153,12 +153,12 @@ extern "system" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
     OK
 }
 
-extern "system" fn RpcStringFreeA(string: *mut *mut c_char) -> i32 {
+extern "win64" fn RpcStringFreeA(string: *mut *mut c_char) -> i32 {
     free(string.cast());
     OK
 }
 
-extern "system" fn RpcStringFreeW(string: *mut *mut u16) -> i32 {
+extern "win64" fn RpcStringFreeW(string: *mut *mut u16) -> i32 {
     free(string.cast());
     OK
 }

@@ -590,8 +590,8 @@ fn names(names: *const *const c_char, count: u32) -> Option<Vec<String>> {
 }
 
 type This = *const Object;
-type ContainerCallback = extern "system" fn(*const ContainerInfo, *mut c_void) -> bool;
-type BlobCallback = extern "system" fn(*const BlobInfo, *mut c_void) -> bool;
+type ContainerCallback = extern "win64" fn(*const ContainerInfo, *mut c_void) -> bool;
+type BlobCallback = extern "win64" fn(*const BlobInfo, *mut c_void) -> bool;
 
 #[repr(C)]
 pub struct ContainerInfo {
@@ -655,7 +655,7 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
-extern "system" fn initialize_async(
+extern "win64" fn initialize_async(
     _: This,
     _user: *const c_void,
     config: *const c_char,
@@ -670,18 +670,18 @@ extern "system" fn initialize_async(
     };
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
-extern "system" fn initialize_result(
+extern "win64" fn initialize_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
     xasync::result(block, (&raw const INIT).cast(), out)
 }
-extern "system" fn close_provider(_: This, provider: *mut Provider) {
+extern "win64" fn close_provider(_: This, provider: *mut Provider) {
     take(provider);
 }
 
-extern "system" fn quota_async(
+extern "win64" fn quota_async(
     _: This,
     provider: *const Provider,
     block: *mut AsyncBlock,
@@ -691,11 +691,11 @@ extern "system" fn quota_async(
         .map(|p| xasync::bytes(p.remaining() as i64));
     xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
 }
-extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
+extern "win64" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
-extern "system" fn delete_async(
+extern "win64" fn delete_async(
     _: This,
     provider: *const Provider,
     name: *const c_char,
@@ -708,14 +708,14 @@ extern "system" fn delete_async(
     };
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
-extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast())
 }
 
 /// Reports the container if it exists; a missing one is no error, the
 /// callback just does not run.
-extern "system" fn container_info(
+extern "win64" fn container_info(
     _: This,
     provider: *const Provider,
     name: *const c_char,
@@ -732,7 +732,7 @@ extern "system" fn container_info(
     S_OK
 }
 
-extern "system" fn enumerate_containers(
+extern "win64" fn enumerate_containers(
     _: This,
     provider: *const Provider,
     context: *mut c_void,
@@ -746,7 +746,7 @@ extern "system" fn enumerate_containers(
 }
 
 /// The container exists once an update to it is submitted.
-extern "system" fn create_container(
+extern "win64" fn create_container(
     _: This,
     provider: *const Provider,
     name: *const c_char,
@@ -760,11 +760,11 @@ extern "system" fn create_container(
     }
     put(out, give(p.container(&name)))
 }
-extern "system" fn close_container(_: This, container: *mut Container) {
+extern "win64" fn close_container(_: This, container: *mut Container) {
     take(container);
 }
 
-extern "system" fn enumerate_blobs(
+extern "win64" fn enumerate_blobs(
     _: This,
     container: *const Container,
     prefix: *const c_char,
@@ -793,7 +793,7 @@ extern "system" fn enumerate_blobs(
     S_OK
 }
 
-extern "system" fn read_blobs(
+extern "win64" fn read_blobs(
     _: This,
     container: *const Container,
     blob_names: *const *const c_char,
@@ -821,7 +821,7 @@ extern "system" fn read_blobs(
 
 /// Read at once; the result holds the layout with pointers relative to the
 /// title's buffer, fixed up when the title takes it.
-extern "system" fn read_async(
+extern "win64" fn read_async(
     _: This,
     container: *const Container,
     blob_names: *const *const c_char,
@@ -834,7 +834,7 @@ extern "system" fn read_async(
     };
     xasync::finished_with(block, (&raw const READ).cast(), result)
 }
-extern "system" fn read_result(
+extern "win64" fn read_result(
     _: This,
     block: *mut AsyncBlock,
     size: usize,
@@ -870,7 +870,7 @@ extern "system" fn read_result(
     put(count, blobs as u32)
 }
 
-extern "system" fn create_update(
+extern "win64" fn create_update(
     _: This,
     container: *const Container,
     display: *const c_char,
@@ -889,11 +889,11 @@ extern "system" fn create_update(
         }),
     )
 }
-extern "system" fn close_update(_: This, update: *mut Update) {
+extern "win64" fn close_update(_: This, update: *mut Update) {
     take(update);
 }
 
-extern "system" fn write_blob(
+extern "win64" fn write_blob(
     _: This,
     update: *mut Update,
     name: *const c_char,
@@ -920,7 +920,7 @@ extern "system" fn write_blob(
     S_OK
 }
 
-extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
+extern "win64" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
         (Some(update), Some(name)) if !name.is_empty() => {
@@ -931,11 +931,11 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
-extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
-extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
@@ -1245,12 +1245,8 @@ mod tests {
 
         // Write two blobs through an update.
         let mut container = std::ptr::null_mut();
-        type Create = extern "system" fn(
-            This,
-            *const Provider,
-            *const c_char,
-            *mut *mut Container,
-        ) -> HRESULT;
+        type Create =
+            extern "win64" fn(This, *const Provider, *const c_char, *mut *mut Container) -> HRESULT;
         let create = method::<Create>(&OBJECT, 0x80);
         assert_eq!(
             create(this, provider, c"bad name".as_ptr(), &mut container),
@@ -1262,13 +1258,13 @@ mod tests {
         );
         let mut update = std::ptr::null_mut();
         type Update_ =
-            extern "system" fn(This, *const Container, *const c_char, *mut *mut Update) -> HRESULT;
+            extern "win64" fn(This, *const Container, *const c_char, *mut *mut Update) -> HRESULT;
         assert_eq!(
             method::<Update_>(&OBJECT, 0xb8)(this, container, c"Chapter 1".as_ptr(), &mut update),
             S_OK
         );
         type Write =
-            extern "system" fn(This, *mut Update, *const c_char, *const u8, usize) -> HRESULT;
+            extern "win64" fn(This, *mut Update, *const c_char, *const u8, usize) -> HRESULT;
         let write = method::<Write>(&OBJECT, 0xc8);
         assert_eq!(
             write(this, update, c"world".as_ptr(), b"hello".as_ptr(), 5),
@@ -1282,9 +1278,9 @@ mod tests {
             write(this, update, c"gone".as_ptr(), b"z".as_ptr(), 1),
             S_OK
         );
-        type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
+        type Delete = extern "win64" fn(This, *mut Update, *const c_char) -> HRESULT;
         assert_eq!(method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()), S_OK);
-        type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
+        type Submit = extern "win64" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
         assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
@@ -1294,7 +1290,7 @@ mod tests {
 
         // A new provider sees the container and reads both blobs back.
         let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
-        extern "system" fn seen(info: *const ContainerInfo, context: *mut c_void) -> bool {
+        extern "win64" fn seen(info: *const ContainerInfo, context: *mut c_void) -> bool {
             // SAFETY: valid during the callback; the context is the test's vector.
             let (info, out) = unsafe {
                 (
@@ -1367,7 +1363,7 @@ mod tests {
         let mut one = 1;
         let mut small = [0u8; 8];
         let read_now = method::<
-            extern "system" fn(
+            extern "win64" fn(
                 This,
                 *const Container,
                 *const *const c_char,

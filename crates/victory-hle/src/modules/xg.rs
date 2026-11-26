@@ -69,7 +69,7 @@ fn suggested(desc: &ResourceDesc) -> Swizzle {
 
 /// `(desc, flags, out layout)`; the title passes flags 0 and puts the
 /// result in the description's layout field.
-pub extern "system" fn XGSuggestSwizzleMode(
+pub extern "win64" fn XGSuggestSwizzleMode(
     desc: *const ResourceDesc,
     _flags: u32,
     out: *mut u32,
@@ -101,7 +101,7 @@ fn computer<'a>(this: This) -> &'a Computer {
     unsafe { &*this }
 }
 
-pub extern "system" fn XGCreateTextureComputer(
+pub extern "win64" fn XGCreateTextureComputer(
     desc: *const ResourceDesc,
     out: *mut This,
 ) -> HRESULT {
@@ -275,11 +275,11 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
     out
 }
 
-extern "system" fn add_ref(this: This) -> u32 {
+extern "win64" fn add_ref(this: This) -> u32 {
     computer(this).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     let left = computer(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
         // SAFETY: made by `Box::into_raw` in `XGCreateTextureComputer`; the
@@ -289,7 +289,7 @@ extern "system" fn release(this: This) -> u32 {
     left
 }
 
-extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
+extern "win64" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -372,7 +372,7 @@ fn result(r: Result<(), Error>) -> HRESULT {
 }
 
 /// `(tiled base, plane, subresource, linear, row pitch, depth pitch)`.
-extern "system" fn copy_into(
+extern "win64" fn copy_into(
     this: This,
     tiled: *mut u8,
     plane: u32,
@@ -408,7 +408,7 @@ extern "system" fn copy_into(
 /// `(linear, plane, subresource, sample, tiled base, row pitch, depth
 /// pitch)`.
 #[allow(clippy::too_many_arguments)]
-extern "system" fn copy_from(
+extern "win64" fn copy_from(
     this: This,
     linear: *mut u8,
     plane: u32,
@@ -467,7 +467,7 @@ const TILE: u64 = 64 << 10;
 /// every slice in turn. With a tail the console's library lists two slices
 /// at most and zeroes all but the first; so do we (the title reads slice 0
 /// only).
-extern "system" fn tiling(
+extern "win64" fn tiling(
     this: This,
     tiles: *mut u32,
     packed: *mut PackedMips,
@@ -542,7 +542,7 @@ extern "system" fn tiling(
 /// element's byte offset from the texture's start. The title reads
 /// texels of a 128x4 `4KB_S` texture on the CPU through it (title+0x5151c90);
 /// an error returned as an offset made it read wild memory. 0 if outside.
-extern "system" fn element_offset(
+extern "win64" fn element_offset(
     this: This,
     plane: u32,
     mip: u32,
@@ -571,7 +571,7 @@ extern "system" fn element_offset(
 
 /// Slots the title does not call: size, alignment, offsets, coordinates,
 /// view descriptor, tiled-resource query.
-extern "system" fn unused(this: This) -> HRESULT {
+extern "win64" fn unused(this: This) -> HRESULT {
     tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
     E_NOTIMPL
 }
@@ -643,14 +643,14 @@ mod tests {
     /// Element offsets: linear rows of 1 KiB (128 elements), 0 outside.
     #[test]
     fn element_offsets_follow_the_layout() {
-        type Offset = extern "system" fn(This, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
+        type Offset = extern "win64" fn(This, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
         let c = create(&desc(128, 4, 1, 11, 0x100));
         let offset: Offset = slot(c, 6);
         let mut bit = 7;
         assert_eq!(offset(c, 0, 0, 3, 1, 0, 0, &mut bit), (128 + 3) * 8);
         assert_eq!(bit, 0);
         assert_eq!(offset(c, 0, 0, 128, 0, 0, 0, std::ptr::null_mut()), 0);
-        slot::<extern "system" fn(This) -> u32>(c, 1)(c);
+        slot::<extern "win64" fn(This) -> u32>(c, 1)(c);
     }
 
     #[test]
@@ -678,7 +678,7 @@ mod tests {
         let c = create(&desc(256, 256, 0, 98, 0x10a));
         // SAFETY: plain data, filled by the call.
         let mut l: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
-        let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
+        let get: extern "win64" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
         assert_eq!(get(c, &mut *l), S_OK);
         assert_eq!(
             (l.size, l.alignment, l.mips, l.planes),
@@ -689,9 +689,8 @@ mod tests {
         assert_eq!((p.mips[0].offset, p.mips[0].pitch_bytes), (65536, 1024));
         assert_eq!((p.mips[1].offset, p.mips[1].in_tail), (32768, 1));
 
-        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
-        type From =
-            extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type Into = extern "win64" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type From = extern "win64" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
         let (into, from): (Into, From) = (slot(c, 8), slot(c, 9));
         let mut tiled = vec![0u8; l.size as usize];
         for mip in 0..9u32 {
@@ -710,7 +709,7 @@ mod tests {
             assert_eq!(back, rows, "mip {mip}");
         }
         // 0x50: one tile for the tail, one for mip 0.
-        type Tiling = extern "system" fn(
+        type Tiling = extern "win64" fn(
             This,
             *mut u32,
             *mut PackedMips,

@@ -73,7 +73,7 @@ pub struct Command {
     reserved: u64,
 }
 
-pub extern "system" fn XDspConnectWithMaximumStreamLimit(
+pub extern "win64" fn XDspConnectWithMaximumStreamLimit(
     base: *mut c_void,
     base_length: u32,
     ir_seconds: u32,
@@ -108,7 +108,7 @@ pub extern "system" fn XDspConnectWithMaximumStreamLimit(
     S_OK
 }
 
-pub extern "system" fn XDspDisconnect(dsp: *mut Dsp) -> HRESULT {
+pub extern "win64" fn XDspDisconnect(dsp: *mut Dsp) -> HRESULT {
     if dsp.is_null() {
         return E_INVALIDARG;
     }
@@ -130,7 +130,7 @@ fn valid(desc: &StreamDesc) -> bool {
     shape && (options & STEREO_OPTIONS == 0 || channels == 2)
 }
 
-pub extern "system" fn XDspActivate(
+pub extern "win64" fn XDspActivate(
     dsp: *mut Dsp,
     desc: *const StreamDesc,
     status: *mut *const Status,
@@ -183,7 +183,7 @@ pub extern "system" fn XDspActivate(
     S_OK
 }
 
-pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
+pub extern "win64" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     if stream.is_null() {
         return E_INVALIDARG;
     }
@@ -196,7 +196,7 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
 }
 
 /// Completes the command at once: its output block is silence.
-pub extern "system" fn XDspSubmitCommand(
+pub extern "win64" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
     ticket: *mut u32,

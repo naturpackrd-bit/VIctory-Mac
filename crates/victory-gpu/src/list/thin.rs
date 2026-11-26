@@ -398,7 +398,7 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
-        $(extern "system" fn $name(this: This $(, $a: $t)*) {
+        $(extern "win64" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
         /// Whether `op` was one of them; done on `list`.
@@ -504,11 +504,11 @@ fn record(handle: u64) -> [u64; RECORD] {
 }
 const RECORD: usize = size_of::<RtvRecord>().div_ceil(8);
 
-extern "system" fn list_close(this: This) -> HRESULT {
+extern "win64" fn list_close(this: This) -> HRESULT {
     front(this).close();
     S_OK
 }
-extern "system" fn list_reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+extern "win64" fn list_reset(this: This, allocator: This, pipeline: This) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -517,10 +517,10 @@ extern "system" fn list_reset(this: This, allocator: This, pipeline: This) -> HR
     front(this).begin(kind, pipeline);
     S_OK
 }
-extern "system" fn list_reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
+extern "win64" fn list_reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
     list_reset(this, allocator, pipeline)
 }
-extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
+extern "win64" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
         return std::ptr::null_mut();
@@ -541,28 +541,28 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     front.put(UPLOAD, &[Box::into_raw(Box::new(block)) as u64]);
     place
 }
-extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+extern "win64" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     if !barriers.is_null() {
         front(this).put_with(BARRIER, &[u64::from(count)], &[bytes_of(barriers, count as usize)]);
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "win64" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
-extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
+extern "win64" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
     front(this).put_with(VIEWPORTS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
 }
-extern "system" fn scissors(this: This, count: u32, items: *const RECT) {
+extern "win64" fn scissors(this: This, count: u32, items: *const RECT) {
     let count = if items.is_null() { 0 } else { count };
     front(this).put_with(SCISSORS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
 }
-extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
+extern "win64" fn blend_factor(this: This, factor: *const [f32; 4]) {
     let given = !factor.is_null();
     front(this).put_with(BLEND_FACTOR, &[u64::from(given)], &[bytes_of(factor, usize::from(given))]);
 }
-extern "system" fn heaps(this: This, count: u32, items: *const This) {
+extern "win64" fn heaps(this: This, count: u32, items: *const This) {
     let count = if items.is_null() { 0 } else { count };
     front(this).put_with(HEAPS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
 }
@@ -574,17 +574,17 @@ fn constants(this: This, op: u64, slot: u32, count: u32, values: *const u32, off
         &[bytes_of(values, count as usize)],
     );
 }
-extern "system" fn compute_constants(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
+extern "win64" fn compute_constants(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
     constants(this, COMPUTE_CONSTANTS, slot, count, values, offset);
 }
-extern "system" fn graphics_constants(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
+extern "win64" fn graphics_constants(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
     constants(this, GRAPHICS_CONSTANTS, slot, count, values, offset);
 }
-extern "system" fn index_buffer(this: This, view: *const IndexView) {
+extern "win64" fn index_buffer(this: This, view: *const IndexView) {
     let given = !view.is_null();
     front(this).put_with(INDEX_BUFFER, &[u64::from(given)], &[bytes_of(view, usize::from(given))]);
 }
-extern "system" fn vertex_buffers(this: This, start: u32, count: u32, views: *const VertexView) {
+extern "win64" fn vertex_buffers(this: This, start: u32, count: u32, views: *const VertexView) {
     let given = !views.is_null();
     front(this).put_with(
         VERTEX_BUFFERS,
@@ -592,7 +592,7 @@ extern "system" fn vertex_buffers(this: This, start: u32, count: u32, views: *co
         &[bytes_of(views, count as usize)],
     );
 }
-extern "system" fn targets(this: This, count: u32, handles: *const u64, one_range: i32, depth: *const u64) {
+extern "win64" fn targets(this: This, count: u32, handles: *const u64, one_range: i32, depth: *const u64) {
     let count = if handles.is_null() { 0 } else { (count as usize).min(8) };
     // SAFETY: the title passes a handle or null.
     let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
@@ -613,7 +613,7 @@ extern "system" fn targets(this: This, count: u32, handles: *const u64, one_rang
         &[bytes_of(records.as_ptr(), records.len())],
     );
 }
-extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], count: u32, rects: *const Rect) {
+extern "win64" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], count: u32, rects: *const Rect) {
     if handle == 0 || color.is_null() {
         return;
     }
@@ -625,7 +625,7 @@ extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], co
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(color, 1), bytes_of(rects, count as usize)],
     );
 }
-extern "system" fn clear_dsv(
+extern "win64" fn clear_dsv(
     this: This,
     handle: u64,
     flags: u32,
@@ -645,7 +645,7 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
-extern "system" fn copy_texture_region(
+extern "win64" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
     x: u32,
@@ -665,7 +665,7 @@ extern "system" fn copy_texture_region(
     );
 }
 #[allow(clippy::too_many_arguments)] // the method's own arguments
-extern "system" fn copy_texture_region_x(
+extern "win64" fn copy_texture_region_x(
     this: This,
     dst: *const CopyLocation,
     x: u32,

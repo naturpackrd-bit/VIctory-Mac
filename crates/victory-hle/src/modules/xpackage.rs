@@ -70,11 +70,11 @@ fn package_bytes() -> u64 {
 
 type This = *const Object;
 
-extern "system" fn current_identifier(_: This, size: usize, buffer: *mut u8) -> HRESULT {
+extern "win64" fn current_identifier(_: This, size: usize, buffer: *mut u8) -> HRESULT {
     put_string(&identifier(), size, buffer, std::ptr::null_mut())
 }
 
-extern "system" fn is_packaged(_: This) -> bool {
+extern "win64" fn is_packaged(_: This) -> bool {
     true
 }
 
@@ -85,7 +85,7 @@ fn monitor() -> *const c_void {
     (&raw const MONITOR).cast()
 }
 
-extern "system" fn create_monitor(
+extern "win64" fn create_monitor(
     _: This,
     id: *const c_char,
     _selector_count: u32,
@@ -99,7 +99,7 @@ extern "system" fn create_monitor(
     }
     put(out, monitor())
 }
-extern "system" fn close_monitor(_: This, _: *const c_void) {}
+extern "win64" fn close_monitor(_: This, _: *const c_void) {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,7 @@ pub struct Progress {
     pub completed: bool,
 }
 
-extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
+extern "win64" fn progress(_: This, _: *const c_void, out: *mut Progress) {
     let bytes = package_bytes();
     put(
         out,
@@ -126,7 +126,7 @@ extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
 }
 
 /// The installation is complete, so progress never changes.
-extern "system" fn register_progress(
+extern "win64" fn register_progress(
     _: This,
     _monitor: *const c_void,
     _context: *mut c_void,
@@ -137,7 +137,7 @@ extern "system" fn register_progress(
 }
 
 /// The completed installation has no pending progress callbacks to wait for.
-extern "system" fn unregister_progress(
+extern "win64" fn unregister_progress(
     _: This,
     _monitor: *const c_void,
     _token: u64,
@@ -151,7 +151,7 @@ extern "system" fn unregister_progress(
 // package's layout does not have (the console answers those with an
 // invalid-selector error); the title asks only about its own
 // chunks, which a full install has.
-extern "system" fn find_availability(
+extern "win64" fn find_availability(
     _: This,
     id: *const c_char,
     _selector_count: u32,
@@ -164,7 +164,7 @@ extern "system" fn find_availability(
     put(out, 0)
 }
 
-extern "system" fn change_order(
+extern "win64" fn change_order(
     _: This,
     id: *const c_char,
     _count: u32,
@@ -176,7 +176,7 @@ extern "system" fn change_order(
 static INSTALL: u8 = 0;
 
 /// Everything is installed: done at once, the result is a monitor.
-extern "system" fn install_chunks_async(
+extern "win64" fn install_chunks_async(
     _: This,
     id: *const c_char,
     _count: u32,
@@ -192,7 +192,7 @@ extern "system" fn install_chunks_async(
     };
     xasync::finished_with(block, (&raw const INSTALL).cast(), result)
 }
-extern "system" fn install_chunks_result(
+extern "win64" fn install_chunks_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut *const c_void,
@@ -201,7 +201,7 @@ extern "system" fn install_chunks_result(
 }
 
 /// Nothing to download.
-extern "system" fn estimate_download(
+extern "win64" fn estimate_download(
     _: This,
     id: *const c_char,
     _count: u32,
@@ -222,7 +222,7 @@ extern "system" fn estimate_download(
 // shortcut: accepted but nothing is removed (the package folder is the
 // user's), so the chunks stay ready; the title's one call site
 // (title+0x293b4b0, its chunk manager) would then see them still installed.
-extern "system" fn uninstall_chunks(
+extern "win64" fn uninstall_chunks(
     _: This,
     id: *const c_char,
     _count: u32,
@@ -233,13 +233,13 @@ extern "system" fn uninstall_chunks(
 
 /// Mount handles only come from mounting another package, and there is
 /// none.
-extern "system" fn mount_path(_: This, _: *const c_void, _: usize, _: *mut u8) -> HRESULT {
+extern "win64" fn mount_path(_: This, _: *const c_void, _: usize, _: *mut u8) -> HRESULT {
     xasync::E_INVALIDARG
 }
-extern "system" fn close_mount(_: This, _: *const c_void) {}
+extern "win64" fn close_mount(_: This, _: *const c_void) {}
 
 /// Only other packages are uninstalled this way, and none is installed.
-extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
+extern "win64" fn uninstall_package(_: This, id: *const c_char) -> bool {
     tracing::info!(
         id = text(id).unwrap_or_default(),
         "package uninstall refused"
@@ -249,14 +249,14 @@ extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
 
 static MOUNT: u8 = 0;
 
-extern "system" fn mount_async(_: This, id: *const c_char, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn mount_async(_: This, id: *const c_char, block: *mut AsyncBlock) -> HRESULT {
     tracing::info!(
         id = text(id).unwrap_or_default(),
         "package mount: not installed"
     );
     xasync::finished(block, (&raw const MOUNT).cast(), NO_PACKAGE)
 }
-extern "system" fn mount_result(
+extern "win64" fn mount_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut *const c_void,
@@ -267,7 +267,7 @@ extern "system" fn mount_result(
 /// Titles enumerate content packages (kind 1); there are none.
 // shortcut: the game kind (0) also lists nothing, not this installation;
 // The title enumerates only content (kind 1, title+0x2937bf0).
-extern "system" fn enumerate(
+extern "win64" fn enumerate(
     _: This,
     kind: u32,
     _scope: u32,
@@ -329,9 +329,9 @@ mod tests {
     #[test]
     fn completed_installation_unregisters_progress_immediately() {
         type Register =
-            extern "system" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
-        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
-        extern "system" fn callback(_: *mut c_void, _: *const c_void) {}
+            extern "win64" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+        type Unregister = extern "win64" fn(This, *const c_void, u64, bool) -> bool;
+        extern "win64" fn callback(_: *mut c_void, _: *const c_void) {}
 
         let this: This = &OBJECT;
         let register = method::<Register>(&OBJECT, 0x48);
@@ -357,17 +357,16 @@ mod tests {
     #[test]
     fn the_installation_is_complete_and_alone() {
         let this: This = &OBJECT;
-        type Id = extern "system" fn(This, usize, *mut u8) -> HRESULT;
+        type Id = extern "win64" fn(This, usize, *mut u8) -> HRESULT;
         let mut id = [0u8; 33];
         assert_eq!(method::<Id>(&OBJECT, 0x18)(this, 33, id.as_mut_ptr()), S_OK);
         let len = id.iter().position(|&b| b == 0).unwrap();
         assert_eq!(std::str::from_utf8(&id[..len]).unwrap(), identifier());
-        assert!(method::<extern "system" fn(This) -> bool>(&OBJECT, 0x20)(
+        assert!(method::<extern "win64" fn(This) -> bool>(&OBJECT, 0x20)(
             this
         ));
 
-        type Find =
-            extern "system" fn(This, *const c_char, u32, *const c_void, *mut u32) -> HRESULT;
+        type Find = extern "win64" fn(This, *const c_char, u32, *const c_void, *mut u32) -> HRESULT;
         let mut availability = 9;
         let ours = format!("{}\0", identifier());
         let find = method::<Find>(&OBJECT, 0x60);
@@ -382,7 +381,7 @@ mod tests {
             NO_PACKAGE
         );
 
-        type Progress_ = extern "system" fn(This, *const c_void, *mut Progress);
+        type Progress_ = extern "win64" fn(This, *const c_void, *mut Progress);
         let mut p = Progress {
             total_bytes: 1,
             installed_bytes: 0,
@@ -393,7 +392,7 @@ mod tests {
         method::<Progress_>(&OBJECT, 0x38)(this, monitor(), &mut p);
         assert!(p.completed && p.launchable && p.installed_bytes == p.total_bytes);
 
-        type Mount = extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type Mount = extern "win64" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
         let mut block = AsyncBlock {
             queue: std::ptr::null(),
             context: std::ptr::null_mut(),

@@ -178,7 +178,7 @@ mod imp {
         static STARTED: AtomicBool = AtomicBool::new(false);
 
         /// Runs as title TLS callbacks do: under the loader lock, as a new
-        /// thread starts.
+        /// thread starts. The host's loader calls it: its convention.
         #[used]
         #[unsafe(link_section = ".CRT$XLY")]
         static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = attach;
@@ -194,6 +194,7 @@ mod imp {
             }
         }
 
+        // Started by the host (`CreateThread`): its convention.
         unsafe extern "system" fn idle(_: *mut c_void) -> u32 {
             0
         }

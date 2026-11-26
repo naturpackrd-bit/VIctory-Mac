@@ -13,7 +13,7 @@ use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
 /// title images and our console modules are found by name.
-pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
+pub extern "win64" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
@@ -21,7 +21,7 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
 }
 
 /// See [`GetModuleHandleW`].
-pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
+pub extern "win64" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
@@ -47,7 +47,7 @@ fn wide(text: *const u16) -> String {
 
 /// A title image's path is its original file, not our cache copy;
 /// `NULL` means the title's exe.
-pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
+pub extern "win64" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_w(module, out, size);
     };
@@ -56,7 +56,7 @@ pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, si
 }
 
 /// See [`GetModuleFileNameW`].
-pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
+pub extern "win64" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
@@ -106,7 +106,7 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 /// Console-only DLLs we implement load as a pseudo handle (titles load
 /// `xgameruntime.dll` this way), the title's DLLs as the images we map
 /// (on first use if nothing imports them); anything else loads on the host.
-pub extern "system" fn LoadLibraryExA(
+pub extern "win64" fn LoadLibraryExA(
     name: *const u8,
     file: *mut c_void,
     flags: u32,
@@ -120,7 +120,7 @@ pub extern "system" fn LoadLibraryExA(
 }
 
 /// See [`LoadLibraryExA`].
-pub extern "system" fn LoadLibraryExW(
+pub extern "win64" fn LoadLibraryExW(
     name: *const u16,
     file: *mut c_void,
     flags: u32,
@@ -140,17 +140,17 @@ fn runs_code(flags: u32) -> bool {
     flags & (0x1 | 0x2 | 0x20 | 0x40) == 0
 }
 
-pub extern "system" fn LoadLibraryA(name: *const u8) -> *mut c_void {
+pub extern "win64" fn LoadLibraryA(name: *const u8) -> *mut c_void {
     LoadLibraryExA(name, std::ptr::null_mut(), 0)
 }
 
-pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
+pub extern "win64" fn LoadLibraryW(name: *const u16) -> *mut c_void {
     LoadLibraryExW(name, std::ptr::null_mut(), 0)
 }
 
 /// Looks up our implementations behind a pseudo handle; real modules go to
 /// the host.
-pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
+pub extern "win64" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
     // `NULL` is the process's exe, which for the title is its own image.
     let module = if module.is_null() {
         runtime::main_image().unwrap_or(0) as *mut c_void
@@ -201,7 +201,7 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
 
 /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`
 /// took no reference on them, so the host's count must not drop.
-pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
+pub extern "win64" fn FreeLibrary(module: *mut c_void) -> i32 {
     if registry().iter().any(|m| handle(m) == module)
         || runtime::image_path(module as usize).is_some()
     {
@@ -212,12 +212,12 @@ pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
 
 /// Title images hear of thread starts and ends from us, not from the
 /// Windows loader (`victory_loader::disable_thread_calls`).
-pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
+pub extern "win64" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
     host::disable_thread_library_calls(module)
 }
 
 /// Title debug output goes to our log (no debugger needs to be attached).
-pub extern "system" fn OutputDebugStringA(text: *const u8) {
+pub extern "win64" fn OutputDebugStringA(text: *const u8) {
     if !text.is_null() {
         let text = narrow(text);
         host::note_title_output(text.trim());
@@ -226,7 +226,7 @@ pub extern "system" fn OutputDebugStringA(text: *const u8) {
 }
 
 /// See [`OutputDebugStringA`].
-pub extern "system" fn OutputDebugStringW(text: *const u16) {
+pub extern "win64" fn OutputDebugStringW(text: *const u16) {
     if !text.is_null() {
         let text = wide(text);
         host::note_title_output(text.trim());
@@ -236,26 +236,26 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 
 /// The CRT's `exit`, through which the title's entry point returns: logs
 /// the code and the caller, then exits on the host.
-pub extern "C" fn exit(code: i32) -> ! {
+pub extern "win64" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
     host::exit(code)
 }
 
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
-pub extern "C" fn abort() -> ! {
+pub extern "win64" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
     host::abort()
 }
 
 /// The CRT's `terminate` and the STL's invalid-argument exit: logged, then
 /// the host's `abort`.
-pub extern "C" fn terminate() -> ! {
+pub extern "win64" fn terminate() -> ! {
     tracing::error!(from = %host::callers(), "title calls terminate");
     host::abort()
 }
 
 /// See [`terminate`].
-pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
+pub extern "win64" fn _invalid_parameter_noinfo_noreturn() -> ! {
     tracing::error!(from = %host::callers(), "title passed an invalid parameter");
     host::abort()
 }
@@ -264,17 +264,18 @@ pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
 /// reports the crash first; the title still gets its own back.
 static TITLE_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
+pub extern "win64" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
     host::set_unhandled_exception_filter(report_unhandled);
     TITLE_FILTER.swap(filter, std::sync::atomic::Ordering::AcqRel)
 }
 
+/// The host calls it (Windows' unhandled-exception filter): its convention.
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     host::report_unhandled(info);
     match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         filter => {
-            type Filter = extern "system" fn(*const c_void) -> i32;
+            type Filter = extern "win64" fn(*const c_void) -> i32;
             // SAFETY: the title registered this filter.
             let filter: Filter = unsafe { std::mem::transmute(filter) };
             filter(info)
@@ -283,7 +284,7 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 }
 
 /// See [`exit`]; only the current process is logged.
-pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
+pub extern "win64" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
     }
@@ -397,12 +398,12 @@ fn argv() -> &'static TitleArgv {
 }
 
 /// See [`TitleArgv`].
-pub extern "C" fn __p___argc() -> *mut i32 {
+pub extern "win64" fn __p___argc() -> *mut i32 {
     argv().count.get()
 }
 
 /// See [`TitleArgv`].
-pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
+pub extern "win64" fn __p___argv() -> *mut *mut *mut c_char {
     argv().list.get()
 }
 
@@ -426,7 +427,7 @@ fn title_priority(asked: i32) -> i32 {
 }
 
 /// [`title_priority`].
-pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+pub extern "win64" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
     let priority = if as_set { priority } else { title_priority(priority) };

@@ -63,14 +63,14 @@ type This = *const Object;
 // shortcut: HDR output is not done (see the presentation items in
 // `TODO.md`); report enabled, with the host display's luminance, once the
 // swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
+extern "win64" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
     tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
     2
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app
 /// exists here, and the console's are online services.
-extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char) -> HRESULT {
+extern "win64" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char) -> HRESULT {
     tracing::info!(uri = text(uri).unwrap_or_default(), "URI not launched");
     NOT_SUPPORTED
 }
@@ -78,7 +78,7 @@ extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char)
 /// A deferral keeps the host display on, as on the console, through a
 /// power request; the handle is that request.
 #[cfg(windows)]
-extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
+extern "win64" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     use windows_sys::Win32::System::Power::{
         PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
     };
@@ -110,7 +110,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
 }
 
 #[cfg(windows)]
-extern "system" fn close_deferral(_: This, handle: *mut c_void) {
+extern "win64" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
     if !handle.is_null() {
@@ -133,7 +133,7 @@ fn last_error() -> HRESULT {
 // a hook in the GPU side: the last presented frame read back as BGRA8 (size,
 // row pitch, bytes) on request, e.g. `victory_gpu::last_frame() ->
 // Option<Frame>`, copied from the back buffer after `PresentX`.
-extern "system" fn take_screenshot(_: This, _user: *const c_void, _result: *mut c_void) -> HRESULT {
+extern "win64" fn take_screenshot(_: This, _user: *const c_void, _result: *mut c_void) -> HRESULT {
     tracing::info!("screenshot not taken");
     NOT_SUPPORTED
 }
@@ -179,13 +179,13 @@ mod tests {
 
     #[test]
     fn sdr_and_display_deferrals() {
-        type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+        type Hdr = extern "win64" fn(This, u32, *mut c_void) -> u32;
         assert_eq!(
             method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),
             2
         );
-        type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
-        type Close = extern "system" fn(This, *mut c_void);
+        type Acquire = extern "win64" fn(This, *mut *mut c_void) -> HRESULT;
+        type Close = extern "win64" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
         match method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle) {
             S_OK => {

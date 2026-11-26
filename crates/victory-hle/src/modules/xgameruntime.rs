@@ -113,13 +113,13 @@ const AREAS: &[&[Interface]] = &[
 ];
 
 /// `AddRef` and `Release`.
-pub extern "system" fn add_ref(_: *const Object) -> u32 {
+pub extern "win64" fn add_ref(_: *const Object) -> u32 {
     1
 }
 
 /// A slot nobody has needed yet; logged with its area. Wrong for a slot
 /// that returns `bool` or a value.
-pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
+pub extern "win64" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
     // SAFETY: title code calls methods on objects we handed out.
     let area = unsafe { (*this).area };
     tracing::warn!(
@@ -180,22 +180,22 @@ pub(crate) fn method<F: Copy>(object: &Object, slot: usize) -> F {
     unsafe { std::mem::transmute_copy(&*object.vtable.add(slot / 8)) }
 }
 
-pub extern "system" fn XGameRuntimeInitialize() -> HRESULT {
+pub extern "win64" fn XGameRuntimeInitialize() -> HRESULT {
     tracing::info!("XGameRuntimeInitialize");
     S_OK
 }
 
-pub extern "system" fn XGameRuntimeUninitialize() {
+pub extern "win64" fn XGameRuntimeUninitialize() {
     tracing::info!("XGameRuntimeUninitialize");
 }
 
 /// The arguments identify the title's build of the stub; not checked.
-pub extern "system" fn InitializeApiImpl(version: u64, build: u64) -> HRESULT {
+pub extern "win64" fn InitializeApiImpl(version: u64, build: u64) -> HRESULT {
     tracing::info!(version, build, "InitializeApiImpl");
     S_OK
 }
 
-pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64) -> HRESULT {
+pub extern "win64" fn InitializeApiImplEx(version: u64, build: u64, flags: u64) -> HRESULT {
     tracing::info!(version, build, flags, "InitializeApiImplEx");
     S_OK
 }
@@ -203,7 +203,7 @@ pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64)
 /// The stub prefers this one when present. It passes the same three values
 /// and a pointer to the title's initialisation options, null unless the
 /// title initialises with options (the title does not).
-pub extern "system" fn InitializeApiImplEx2(
+pub extern "win64" fn InitializeApiImplEx2(
     version: u64,
     build: u64,
     flags: u64,
@@ -213,13 +213,13 @@ pub extern "system" fn InitializeApiImplEx2(
     S_OK
 }
 
-pub extern "system" fn UninitializeApiImpl() {
+pub extern "win64" fn UninitializeApiImpl() {
     tracing::info!("UninitializeApiImpl");
 }
 
 /// The object for an implemented (provider, interface id); others fail,
 /// each pair logged once.
-pub extern "system" fn QueryApiImpl(
+pub extern "win64" fn QueryApiImpl(
     provider: *const Guid,
     iid: *const Guid,
     out: *mut *mut c_void,
@@ -260,7 +260,7 @@ pub extern "system" fn QueryApiImpl(
     NOT_SUPPORTED
 }
 
-pub extern "system" fn XErrorReport(hr: HRESULT, message: *const c_char) {
+pub extern "win64" fn XErrorReport(hr: HRESULT, message: *const c_char) {
     let message = if message.is_null() {
         "".into()
     } else {
@@ -312,8 +312,8 @@ mod tests {
         let ordinal = std::ptr::without_provenance::<u8>(1);
         assert!(GetProcAddress(runtime, ordinal).is_null());
 
-        type Init = extern "system" fn(u64, u64, u64) -> HRESULT;
-        type Query = extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> HRESULT;
+        type Init = extern "win64" fn(u64, u64, u64) -> HRESULT;
+        type Query = extern "win64" fn(*const Guid, *const Guid, *mut *mut c_void) -> HRESULT;
         // SAFETY: the addresses are our functions with these signatures.
         let (init, query) = unsafe {
             (

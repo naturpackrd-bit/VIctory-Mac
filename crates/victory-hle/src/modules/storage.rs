@@ -59,7 +59,7 @@ fn folder() -> Option<String> {
     None
 }
 
-extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
+extern "win64" fn path_size(_: This, out: *mut usize) -> HRESULT {
     match folder() {
         Some(path) => put(out, path.len() + 1),
         None => NOT_SUPPORTED,
@@ -68,7 +68,7 @@ extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
 
 /// A buffer too small for the path fails with `E_FAIL`, the documented
 /// Xbox result (a PC gets `ERROR_INSUFFICIENT_BUFFER`).
-extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+extern "win64" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     match folder() {
         Some(path) if size <= path.len() => E_FAIL,
         Some(path) => put_string(&path, size, buffer, used),
@@ -144,7 +144,7 @@ fn space() -> Result<SpaceInfo, HRESULT> {
     })
 }
 
-extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
+extern "win64" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
     if out.is_null() {
         return xasync::E_INVALIDARG;
     }
@@ -158,7 +158,7 @@ extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
 static PROMPT: u8 = 0;
 
 /// There is nobody to ask: granted when the quota has room, else declined.
-extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
     let hr = match space() {
         Ok(info) if bytes <= info.total_free => S_OK,
         Ok(_) => E_ABORT,
@@ -167,7 +167,7 @@ extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock)
     xasync::finished(block, (&raw const PROMPT).cast(), hr)
 }
 
-extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast())
 }
@@ -239,11 +239,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
-        type Size = extern "system" fn(This, *mut usize) -> HRESULT;
-        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
-        type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
-        type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
-        type Result = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type Size = extern "win64" fn(This, *mut usize) -> HRESULT;
+        type Get = extern "win64" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        type Space = extern "win64" fn(This, *mut SpaceInfo) -> HRESULT;
+        type Prompt = extern "win64" fn(This, u64, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "win64" fn(This, *mut AsyncBlock) -> HRESULT;
         let this: This = &OBJECT;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();

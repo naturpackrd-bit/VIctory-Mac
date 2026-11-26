@@ -44,7 +44,7 @@ fn fence<'a>(this: This) -> &'a Fence {
     unsafe { &*this.cast::<Fence>() }
 }
 
-pub(crate) extern "system" fn create(
+pub(crate) extern "win64" fn create(
     _: This,
     initial: u64,
     flags: u32,
@@ -71,7 +71,7 @@ fn set_event(event: usize) {
     let _ = event;
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         FENCE,
         iid,
@@ -79,20 +79,20 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         out,
     )
 }
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
-pub(crate) extern "system" fn completed(this: This) -> u64 {
+pub(crate) extern "win64" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 /// The title's `GetCompletedValue`.
-extern "system" fn completed_called(this: This) -> u64 {
+extern "win64" fn completed_called(this: This) -> u64 {
     let value = completed(this);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::polled(this as usize, value);
     value
 }
-extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+extern "win64" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
@@ -141,7 +141,7 @@ pub(crate) fn set(this: This, value: u64) {
         !reached
     });
 }
-pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+pub(crate) extern "win64" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");
     set(this, value);
     // A queue may have waited for it: what it held runs now.
@@ -150,11 +150,11 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     S_OK
 }
 
-extern "system" fn creation_flags(this: This) -> u32 {
+extern "win64" fn creation_flags(this: This) -> u32 {
     fence(this).flags
 }
 /// Where the value lives (GPU addresses are CPU addresses).
-extern "system" fn gpu_address(this: This) -> u64 {
+extern "win64" fn gpu_address(this: This) -> u64 {
     (&raw const fence(this).value) as u64
 }
 
@@ -186,12 +186,12 @@ mod tests {
 
         let mut f = std::ptr::null();
         assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
-        assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 1);
+        assert_eq!(slot::<extern "win64" fn(This) -> u64>(f, 0x40)(f), 1);
         // SAFETY: plain auto-reset event.
         let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         assert!(!event.is_null());
-        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
-        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        let wait = slot::<extern "win64" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "win64" fn(This, u64) -> HRESULT>(f, 0x50);
         assert_eq!(wait(f, 5, event), S_OK);
         // SAFETY: a valid event.
         assert_ne!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
@@ -203,12 +203,12 @@ mod tests {
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
         assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
         // The title reads the value at the fence's address.
-        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
+        let at = slot::<extern "win64" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 
     #[test]
@@ -219,9 +219,9 @@ mod tests {
             0x4ca0,
             [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a],
         );
-        type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
-        type Flags = extern "system" fn(This) -> u32;
-        type Release = extern "system" fn(This) -> u32;
+        type Query = extern "win64" fn(This, *const Iid, *mut This) -> HRESULT;
+        type Flags = extern "win64" fn(This) -> u32;
+        type Release = extern "win64" fn(This) -> u32;
 
         // Direct creation as ID3D12Fence1, and GetCreationFlags at slot 0x58.
         let mut f1 = std::ptr::null();

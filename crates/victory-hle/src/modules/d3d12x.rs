@@ -11,7 +11,7 @@ use crate::{HleExport, HleModule};
 
 /// Device creation; first hands the device the title's general allocator
 /// (`XMemAlloc`, which honours the title's hooks) for resource memory.
-extern "system" fn create_device(
+extern "win64" fn create_device(
     adapter: *const c_void,
     parameters: *const u32,
     iid: *const Iid,

@@ -299,7 +299,7 @@ fn hooks() -> [usize; 2] {
 
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
-pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
+pub extern "win64" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
@@ -311,7 +311,7 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
 }
 
 /// See [`XMemAlloc`].
-pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+pub extern "win64" fn XMemFree(address: *mut c_void, attributes: u64) {
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {

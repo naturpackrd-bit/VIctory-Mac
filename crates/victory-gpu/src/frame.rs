@@ -70,7 +70,7 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
-pub(crate) extern "system" fn set_interval(
+pub(crate) extern "win64" fn set_interval(
     _: This,
     _output: This,
     length: u32,
@@ -98,7 +98,7 @@ pub(crate) extern "system" fn set_interval(
 }
 
 /// Device method: events are scheduled at every tick.
-pub(crate) extern "system" fn schedule(
+pub(crate) extern "win64" fn schedule(
     _: This,
     _kind: u32,
     _offset: u32,
@@ -157,7 +157,7 @@ fn next_tick(kind: u32) -> (u64, Duration) {
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so
 /// lateness never accumulates.
-pub(crate) extern "system" fn wait(
+pub(crate) extern "win64" fn wait(
     _: This,
     kind: u32,
     timeout_ms: u32,
@@ -299,7 +299,7 @@ mod pace {
 }
 
 /// Device method: no statistics are kept, so none are returned.
-pub(crate) extern "system" fn statistics(
+pub(crate) extern "win64" fn statistics(
     _: This,
     _token: u64,
     _kinds: u32,

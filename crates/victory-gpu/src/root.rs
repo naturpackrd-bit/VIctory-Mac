@@ -50,7 +50,8 @@ type Serialize =
 type SerializeVersioned =
     unsafe extern "system" fn(*const VersionedDesc, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
 
-/// An export of the host's `d3d12.dll` in System32, looked up once.
+/// An export of the host's `d3d12.dll` in System32, looked up once (the
+/// types above are its functions: the host's convention).
 fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
     *cache.get_or_init(|| {
         #[cfg(windows)]
@@ -95,7 +96,7 @@ fn without_console_flags(desc: Desc) -> Desc {
 }
 
 /// `d3d12_xs!D3D12SerializeRootSignature`.
-pub extern "system" fn serialize(
+pub extern "win64" fn serialize(
     desc: *const Desc,
     version: u32,
     blob: *mut *mut c_void,
@@ -122,7 +123,7 @@ pub extern "system" fn serialize(
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
-pub extern "system" fn serialize_versioned(
+pub extern "win64" fn serialize_versioned(
     desc: *const VersionedDesc,
     blob: *mut *mut c_void,
     error: *mut *mut c_void,
@@ -151,7 +152,7 @@ type Deserialize =
 /// host's serialization, so the host's deserializer reads them, and its
 /// object (IUnknown, then the description getter) is laid out as the
 /// console's. The title's upscaler asks with the PC interface id.
-pub extern "system" fn create_deserializer(
+pub extern "win64" fn create_deserializer(
     blob: *const u8,
     size: usize,
     iid: *const Iid,
@@ -180,7 +181,7 @@ struct RootSignature {
 }
 
 /// Device method.
-pub(crate) extern "system" fn create(
+pub(crate) extern "win64" fn create(
     _: This,
     _nodes: u32,
     blob: *const u8,
@@ -201,11 +202,11 @@ pub(crate) extern "system" fn create(
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
     object::answer(ROOT_SIGNATURE, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     object::release_boxed::<RootSignature>(this)
 }
 
@@ -389,7 +390,7 @@ mod tests {
     #[test]
     fn every_known_interface_creates_a_working_object() {
         let root = created(&ROOT_SIGNATURE_IIDS[0]);
-        let query = slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(root, 0);
+        let query = slot::<extern "win64" fn(This, *const Iid, *mut This) -> HRESULT>(root, 0);
         for iid in &ROOT_SIGNATURE_IIDS {
             let mut out = std::ptr::null();
             assert_eq!(query(root, iid, &mut out), S_OK);
@@ -412,11 +413,11 @@ mod tests {
         let root = created(&ROOT_SIGNATURE_IIDS[1]);
         // SetPrivateDataInterface is the one object method left out.
         assert_eq!(
-            slot::<extern "system" fn() -> HRESULT>(root, 0x28)(),
+            slot::<extern "win64" fn() -> HRESULT>(root, 0x28)(),
             E_NOTIMPL
         );
         assert_eq!(
-            slot::<extern "system" fn(This, *const u16) -> HRESULT>(root, 0x30)(
+            slot::<extern "win64" fn(This, *const u16) -> HRESULT>(root, 0x30)(
                 root,
                 std::ptr::null()
             ),
@@ -425,7 +426,7 @@ mod tests {
         // GetDevice: an unknown interface is answered, not dereferenced.
         let mut device = std::ptr::null();
         let get_device =
-            slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(root, 0x38);
+            slot::<extern "win64" fn(This, *const Iid, *mut This) -> HRESULT>(root, 0x38);
         assert_eq!(
             get_device(root, std::ptr::null(), &mut device),
             E_NOINTERFACE
@@ -472,7 +473,7 @@ mod tests {
             create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root),
             S_OK
         );
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(root, 0x10)(root), 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }
 

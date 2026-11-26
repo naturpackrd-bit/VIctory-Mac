@@ -99,26 +99,26 @@ fn enumeration_not_found(out: *mut This) -> HRESULT {
 }
 
 /// The DXGI device also answers for the D3D12 device.
-extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     if crate::device::is_device(iid) {
         return object::answer(DXGI_DEVICE, iid, Some(crate::device::device()), out);
     }
     query(DXGI_DEVICE, iid, &DEVICE_IIDS, this, out)
 }
-extern "system" fn device_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn device_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
     query(DXGI_DEVICE, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out)
 }
-extern "system" fn device_adapter(_: This, out: *mut This) -> HRESULT {
+extern "win64" fn device_adapter(_: This, out: *mut This) -> HRESULT {
     object::answer(DXGI_DEVICE, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
 
-extern "system" fn adapter_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn adapter_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     query(ADAPTER, iid, &ADAPTER_IIDS, this, out)
 }
-extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
     query(ADAPTER, iid, &FACTORY_IIDS, &FACTORY_OBJECT, out)
 }
-extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
+extern "win64" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
         return enumeration_not_found(out);
     }
@@ -141,7 +141,7 @@ const _: () = assert!(size_of::<AdapterDescription>() == 0x130);
 
 const AMD: u32 = 0x1002;
 
-extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
+extern "win64" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -168,20 +168,20 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     S_OK
 }
 
-extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn factory_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     query(FACTORY, iid, &FACTORY_IIDS, this, out)
 }
-extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
+extern "win64" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
         return enumeration_not_found(out);
     }
     object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
 
-extern "system" fn output_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn output_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     query(OUTPUT, iid, &OUTPUT_IIDS, this, out)
 }
-extern "system" fn output_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn output_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
     query(OUTPUT, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out)
 }
 
@@ -252,7 +252,7 @@ fn display_size() -> (u32, u32) {
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
-extern "system" fn modes(
+extern "win64" fn modes(
     _: This,
     _format: u32,
     _flags: u32,
@@ -300,10 +300,10 @@ mod tests {
     use super::*;
     use crate::object::{E_NOINTERFACE, slot};
 
-    type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
-    type Get = extern "system" fn(This, *mut This) -> HRESULT;
-    type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
-    type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+    type Query = extern "win64" fn(This, *const Iid, *mut This) -> HRESULT;
+    type Get = extern "win64" fn(This, *mut This) -> HRESULT;
+    type Indexed = extern "win64" fn(This, u32, *mut This) -> HRESULT;
+    type Describe = extern "win64" fn(This, *mut AdapterDescription) -> HRESULT;
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.
