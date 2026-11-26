@@ -8851,17 +8851,15 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use victory_platform::{Host, Memory};
     if crate::safecopy::on() {
         // SAFETY: the destination is mapped writable memory of `len` bytes;
         // a source page that is not there fails the copy.
         return unsafe { crate::safecopy::copy(dst, src, len) };
     }
-    let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    // kernel checks the source (`ReadProcessMemory`).
+    unsafe { Host::read(src as usize, dst, len) }
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]

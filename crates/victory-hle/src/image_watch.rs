@@ -29,21 +29,11 @@ fn words(text: &str) -> Vec<Word> {
 
 /// `word` of the image at `base`; `None` if it cannot be read.
 fn read(base: usize, word: &Word) -> Option<u64> {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use victory_platform::{Host, Memory};
     let mut value = [0u8; 8];
-    // SAFETY: the kernel copies at most eight bytes into `value`, and fails
-    // where there is nothing to read.
-    let ok = unsafe {
-        ReadProcessMemory(
-            GetCurrentProcess(),
-            (base + word.offset) as *const _,
-            value.as_mut_ptr().cast(),
-            word.bytes,
-            std::ptr::null_mut(),
-        )
-    };
-    (ok != 0).then(|| u64::from_le_bytes(value))
+    // The kernel copies at most eight bytes into `value`, and fails where
+    // there is nothing to read.
+    Host::read_into(base + word.offset, &mut value[..word.bytes]).then(|| u64::from_le_bytes(value))
 }
 
 /// Starts watching the image at `base`, if asked for.

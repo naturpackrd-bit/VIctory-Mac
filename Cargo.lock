@@ -657,6 +657,7 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing-subscriber",
+ "victory-platform",
 ]
 
 [[package]]
@@ -682,6 +683,7 @@ dependencies = [
  "victory-core",
  "victory-formats",
  "victory-pipeline",
+ "victory-platform",
  "victory-shader",
  "windows",
  "windows-sys",
@@ -699,6 +701,7 @@ dependencies = [
  "victory-gpu",
  "victory-loader",
  "victory-pe",
+ "victory-platform",
  "windows",
  "windows-core",
  "windows-sys",
@@ -736,6 +739,14 @@ dependencies = [
  "tempfile",
  "tracing",
  "victory-core",
+]
+
+[[package]]
+name = "victory-platform"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use victory_platform::{Dirs, Host};
 
 use crate::policy::ensure_outside_repo;
 
@@ -87,10 +88,10 @@ impl Config {
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
             .or(file.cache_dir)
-            .map_or_else(|| default_dir("cache"), Ok)?;
+            .map_or_else(|| default_dir(Host::default_cache_dir()), Ok)?;
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
-            .map_or_else(|| default_dir("data"), Ok)?;
+            .map_or_else(|| default_dir(Host::default_data_dir()), Ok)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
@@ -134,14 +135,12 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
-fn default_dir(name: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
-    Ok(base.join("victory").join(name))
+/// The host's default for a directory the user named no place for
+/// (`victory_platform::Dirs`: `%LOCALAPPDATA%\victory\<name>` on Windows,
+/// `~/Library/Caches/victory` and `~/Library/Application Support/victory`
+/// on macOS).
+fn default_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
+    dir.context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")
 }
 
 #[cfg(test)]
