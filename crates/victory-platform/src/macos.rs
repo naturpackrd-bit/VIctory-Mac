@@ -165,6 +165,56 @@ impl Thread for Host {
             libc::pthread_setspecific(key as libc::pthread_key_t, teb as *const libc::c_void) == 0
         }
     }
+
+    // `arg` is not read here, only handed to `start` on the new thread.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn spawn_thread(
+        stack: usize,
+        start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
+        arg: *mut libc::c_void,
+    ) -> bool {
+        let Some(stack) = stack
+            .max(libc::PTHREAD_STACK_MIN)
+            .checked_next_multiple_of(Host::page_size())
+        else {
+            return false;
+        };
+        // SAFETY: an attribute object of our own, initialized before use and
+        // destroyed after; the new thread gets `start` and `arg` as the
+        // caller gave them, and is detached, so nothing joins it.
+        unsafe {
+            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+            if libc::pthread_attr_init(&mut attr) != 0 {
+                return false;
+            }
+            let mut thread: libc::pthread_t = std::mem::zeroed();
+            let made = libc::pthread_attr_setstacksize(&mut attr, stack) == 0
+                && libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED) == 0
+                && libc::pthread_create(&mut thread, &attr, start, arg) == 0;
+            libc::pthread_attr_destroy(&mut attr);
+            made
+        }
+    }
+
+    fn exit_thread() -> ! {
+        // SAFETY: ends this thread; its thread-local destructors run.
+        unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+    }
+
+    fn name_current_thread(name: &str) {
+        // The name stops at a NUL, and is cut at a character within
+        // libpthread's 64 bytes (63 and the NUL).
+        let name = name.split('\0').next().unwrap_or_default();
+        let mut end = name.len().min(63);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = name.as_bytes()[..end].to_vec();
+        bytes.push(0);
+        // SAFETY: names the calling thread, from a NUL-terminated name we
+        // hold.
+        unsafe { libc::pthread_setname_np(bytes.as_ptr().cast()) };
+    }
 }
 
 /// The user's home folder, if `HOME` names one.

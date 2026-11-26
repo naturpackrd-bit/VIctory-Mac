@@ -160,8 +160,8 @@ pub extern "win64" fn CloseHandle(handle: *mut c_void) -> i32 {
 
 /// A new handle to the object `source` names, within this process (the only
 /// process there is: both process handles must be `GetCurrentProcess()`).
-/// The thread pseudo-handle cannot be duplicated yet: there are no thread
-/// objects (`threads.rs`).
+/// The thread pseudo-handle gives a real handle to the calling thread's
+/// object (`threads.rs`).
 pub extern "win64" fn DuplicateHandle(
     source_process: *mut c_void,
     source: *mut c_void,
@@ -181,7 +181,12 @@ pub extern "win64" fn DuplicateHandle(
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    let Some(object) = get(source as usize) else {
+    let object = if source as usize == CURRENT_THREAD {
+        Some(super::threads::current() as Arc<dyn Object>)
+    } else {
+        get(source as usize)
+    };
+    let Some(object) = object else {
         set_last_error(ERROR_INVALID_HANDLE);
         return 0;
     };

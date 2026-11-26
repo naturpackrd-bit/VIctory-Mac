@@ -106,6 +106,20 @@ pub trait Thread {
     /// `teb` is a TEB whose `Self` field holds `teb`, and it stays valid for
     /// as long as this thread may read it.
     unsafe fn set_teb_pointer(teb: usize) -> bool;
+    /// Starts a detached thread with a stack of at least `stack` bytes
+    /// (rounded up to pages, at least the host's minimum) running
+    /// `start(arg)`; false if the host refused.
+    fn spawn_thread(
+        stack: usize,
+        start: extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void,
+        arg: *mut std::ffi::c_void,
+    ) -> bool;
+    /// Ends the calling thread, as `pthread_exit`: the thread's thread-local
+    /// destructors run. Never returns.
+    fn exit_thread() -> !;
+    /// Names the calling thread for debuggers and profilers, cut to the
+    /// host's limit (15 bytes on Linux, 63 on macOS).
+    fn name_current_thread(name: &str);
 }
 
 /// Where VIctory keeps its own files when the user names no place.

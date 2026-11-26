@@ -79,7 +79,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Called by every function that signals an object, with the lock held
 /// while the object changes: then `notify_all`.
-fn signal<R>(change: impl FnOnce() -> R) -> R {
+pub(crate) fn signal<R>(change: impl FnOnce() -> R) -> R {
     let guard = lock(&DISPATCHER.0);
     let result = change();
     drop(guard);
