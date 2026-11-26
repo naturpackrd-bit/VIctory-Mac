@@ -152,10 +152,15 @@ four tests), `victory-hle` `kernel` (two, title paths above) and `storage`
 
 ## To find out on the Mac
 
-- The page size Rosetta 2 gives x86-64 processes (thought to be 4 KiB; native
-  ones have 16 KiB): `arch -x86_64 getconf PAGESIZE`.
-- That Rosetta 2 offers AVX2, which the title needs:
-  `arch -x86_64 sysctl machdep.cpu.features machdep.cpu.leaf7_features`.
+- Found (M5 Pro, 2026-11-26): Rosetta 2 gives x86-64 processes 4 KiB pages
+  (`arch -x86_64 getconf PAGESIZE`), as Windows does, so the runtime's 4 KiB
+  assumptions hold under it. Native processes have 16 KiB pages.
+- Not yet known: whether Rosetta 2 runs AVX2, which the title needs. Its
+  feature list (`arch -x86_64 sysctl machdep.cpu.features`) stops at SSE4.2
+  and AES, with no AVX or FMA, and it has no `machdep.cpu.leaf7_features`
+  at all: AVX2 is at least not advertised. Next: a probe that reads CPUID
+  and runs one AVX2 instruction, with and without `ROSETTA_ADVERTISE_AVX=1`.
+  If Rosetta 2 cannot run AVX2, decision 1 is reopened.
 - The alignment Metal asks of memory it uses in place (no-copy buffers)
   under Rosetta.
 - How long Apple keeps Rosetta 2 whole: it said in 2025 that it stays through
