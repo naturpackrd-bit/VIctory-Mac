@@ -160,6 +160,13 @@ fn now() -> u64 {
     EPOCH_DIFFERENCE + (since_1970.as_nanos() / 100) as u64
 }
 
+/// A host time as a file time (100 ns since 1601); a time before 1970 reads
+/// as 1970.
+pub(crate) fn file_time_of(time: SystemTime) -> FILETIME {
+    let since_1970 = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    FILETIME::new(EPOCH_DIFFERENCE + (since_1970.as_nanos() / 100) as u64)
+}
+
 /// Howard Hinnant's `civil_from_days`: the (year, month, day) of a day
 /// counted from 1970-01-01.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {

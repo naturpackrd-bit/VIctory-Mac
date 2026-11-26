@@ -99,12 +99,49 @@ impl ImportResolver for Probe {
                     _ => Resolution::Missing,
                 }
             }
+            // Structured exception handling's, ours where the host has
+            // none; on Windows (which has the real ones, and where the SEH
+            // probes are not called) stand-ins, so that the probe binds.
+            ImportSymbol::Name { name, .. }
+                if dll.eq_ignore_ascii_case("ntdll.dll") && name == "__C_specific_handler" =>
+            {
+                #[cfg(not(windows))]
+                let handler = victory_loader::seh::__C_specific_handler as *const () as usize;
+                #[cfg(windows)]
+                let handler = stand_in_handler as *const () as usize;
+                found(handler)
+            }
+            ImportSymbol::Name { name, .. }
+                if dll.eq_ignore_ascii_case("kernel32.dll") && name == "RaiseException" =>
+            {
+                #[cfg(not(windows))]
+                let raise = victory_loader::seh::RaiseException as *const () as usize;
+                #[cfg(windows)]
+                let raise = stand_in_raise as *const () as usize;
+                found(raise)
+            }
             _ => Resolution::Missing,
         }
     }
 }
 
 /// Nobody: every import is missing.
+/// On Windows, where the probe's SEH functions are never called: what its
+/// `__C_specific_handler` import binds to (`ExceptionContinueSearch`).
+#[cfg(windows)]
+extern "win64" fn stand_in_handler(
+    _record: *mut core::ffi::c_void,
+    _frame: u64,
+    _context: *mut core::ffi::c_void,
+    _dispatcher: *mut core::ffi::c_void,
+) -> u32 {
+    1
+}
+
+/// On Windows: what the probe's `RaiseException` import binds to.
+#[cfg(windows)]
+extern "win64" fn stand_in_raise(_code: u32, _flags: u32, _count: u32, _args: *const u64) {}
+
 pub struct Nobody;
 
 impl ImportResolver for Nobody {

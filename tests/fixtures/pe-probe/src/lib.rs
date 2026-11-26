@@ -6,6 +6,7 @@
 
 mod entry;
 mod faults;
+mod seh;
 mod unwind;
 
 use core::arch::asm;
@@ -23,6 +24,20 @@ unsafe extern "win64" {
 #[link(name = "victory-probe-delayed", kind = "raw-dylib")]
 unsafe extern "win64" {
     fn ProbeDelayed() -> u32;
+}
+
+// Structured exception handling's: the handler `seh`'s functions name in
+// their unwind info, and the raise they call, both from assembly.
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "win64" {
+    fn __C_specific_handler(record: *mut c_void, frame: u64, ctx: *mut c_void, dc: *mut c_void)
+    -> u32;
+}
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "win64" {
+    #[allow(dead_code)]
+    fn RaiseException(code: u32, flags: u32, count: u32, args: *const u64);
 }
 
 /// The Win64 convention, arguments in registers.

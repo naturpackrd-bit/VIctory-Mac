@@ -677,7 +677,9 @@ mod host {
         0
     }
 
-    pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
+    pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
+        victory_loader::seh::set_unhandled_filter(Some(filter));
+    }
 
     pub(super) fn report_unhandled(_: *const c_void) {}
 

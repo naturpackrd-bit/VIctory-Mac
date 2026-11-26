@@ -12,7 +12,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use victory_platform::Host;
-use victory_platform::faults::{Fault, FaultKind, Faults, Handled, Handler};
+use victory_platform::faults::{Fault, FaultKind, Faults, Handled, Handler, Registers};
+
+use crate::seh;
 
 /// How many handlers [`register`] takes.
 const HANDLERS_MAX: usize = 8;
@@ -64,12 +66,16 @@ fn dispatch(fault: &mut Fault) -> Handled {
     if crate::images::with_image(rip, |i| i.is_some()) != Some(true) {
         return Handled::Pass; // our code or the host's, or the registry was locked
     }
+    if to_exception(fault) {
+        return Handled::Resume;
+    }
     let mut buffer = [0u8; 2048];
     let mut out = Buf {
         bytes: &mut buffer,
         len: 0,
     };
     report(fault, &mut out);
+    let _ = writeln!(out, "  no stack left to dispatch it on: a stack overflow");
     let len = out.len;
     // SAFETY: our buffer's written bytes to stderr, then the end of the
     // process: both async-signal-safe.
@@ -79,6 +85,80 @@ fn dispatch(fault: &mut Fault) -> Handled {
     }
 }
 
+/// Bytes below the faulting rsp for the exception: its record, then its
+/// context at [`CONTEXT_AT`].
+const EXCEPTION_ROOM: u64 = 0x600;
+/// Where the context lies in [`EXCEPTION_ROOM`]: past the record, 16-aligned.
+const CONTEXT_AT: u64 = 0xA0;
+/// The stack the dispatch needs: the exception and our frames.
+const STACK_ROOM: u64 = EXCEPTION_ROOM + (64 << 10);
+const _: () = assert!(
+    size_of::<seh::ExceptionRecord>() as u64 <= CONTEXT_AT
+        && CONTEXT_AT + size_of::<seh::Context>() as u64 <= EXCEPTION_ROOM
+);
+
+/// Turns a fault in title code into a Windows exception: its record and
+/// context written on the faulting thread's own stack, below its rsp, and
+/// the thread sent to `seh::dispatch_entry` there, which it runs once the
+/// signal handler returns (with the signal mask restored). False, changing
+/// nothing, when the stack has no room left for that (a stack overflow).
+fn to_exception(fault: &mut Fault) -> bool {
+    let limit = crate::teb::current_teb().map_or(0, |teb| {
+        // SAFETY: this thread's TEB, ours, alive for the thread's life; a
+        // read of it, which nothing in a signal handler can disturb.
+        unsafe { (*(teb as *const crate::teb::Teb)).stack_limit }
+    });
+    let regs = &mut *fault.registers;
+    if regs.rsp < limit.saturating_add(STACK_ROOM) {
+        return false;
+    }
+    let (code, parameters) = match fault.kind {
+        FaultKind::Access => (
+            seh::STATUS_ACCESS_VIOLATION,
+            Some([u64::from(fault.write), fault.address as u64]),
+        ),
+        FaultKind::IllegalInstruction => (seh::STATUS_ILLEGAL_INSTRUCTION, None),
+        FaultKind::Breakpoint => {
+            // Windows reports the `int3` itself, not the byte after it.
+            let mut byte = [0u8];
+            let before = regs.rip.wrapping_sub(1) as usize;
+            if <Host as victory_platform::Memory>::read_into(before, &mut byte) && byte[0] == 0xCC {
+                regs.rip -= 1;
+            }
+            (seh::STATUS_BREAKPOINT, None)
+        }
+        FaultKind::Arithmetic => (seh::STATUS_INTEGER_DIVIDE_BY_ZERO, None),
+    };
+    let mut record = seh::ExceptionRecord::new(code, 0, regs.rip);
+    if let Some(parameters) = parameters {
+        record.number_parameters = 2;
+        record.information[..2].copy_from_slice(&parameters);
+    }
+    let base = (regs.rsp - EXCEPTION_ROOM) & !15;
+    // SAFETY: the faulting thread's own stack below its rsp, which Win64
+    // code keeps nothing in, and which has room (checked above).
+    unsafe {
+        std::ptr::write(base as *mut seh::ExceptionRecord, record);
+        std::ptr::write(
+            (base + CONTEXT_AT) as *mut seh::Context,
+            seh::Context::from_registers(regs),
+        );
+    }
+    regs.rip = seh::dispatch_entry as *const () as u64;
+    regs.rdi = base;
+    regs.rsi = base + CONTEXT_AT;
+    // As after a call: rsp + 8 is 16-aligned at a SysV function's entry.
+    regs.rsp = base - 8;
+    // Our code runs with the direction flag clear, as the SysV ABI has it,
+    // and without single steps; the context keeps the title's flags.
+    regs.rflags &= !(RFLAGS_DF | RFLAGS_TF);
+    true
+}
+
+/// The flags' trap (single step) and direction bits.
+const RFLAGS_TF: u64 = 1 << 8;
+const RFLAGS_DF: u64 = 1 << 10;
+
 // libc's, which this crate does not depend on (`<unistd.h>`).
 unsafe extern "C" {
     fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
@@ -86,7 +166,7 @@ unsafe extern "C" {
 }
 
 /// The signal a kind of fault is reported as, for the exit status.
-fn signal_number(kind: FaultKind) -> c_int {
+pub(crate) fn signal_number(kind: FaultKind) -> c_int {
     match kind {
         FaultKind::Access => 11,
         FaultKind::IllegalInstruction => 4,
@@ -134,12 +214,34 @@ pub(crate) fn report(fault: &Fault, out: &mut impl Write) {
         FaultKind::Breakpoint => "breakpoint",
         FaultKind::Arithmetic => "arithmetic",
     };
-    let r = &*fault.registers;
     let _ = writeln!(
         out,
         "victory: {kind} fault at {:#x} in title code",
         fault.address
     );
+    report_state(fault.registers, out);
+}
+
+/// The crash report of an exception in title code that no handler took:
+/// its code, then what [`report`] writes after its first line.
+pub(crate) fn report_exception(
+    code: u32,
+    record: &seh::ExceptionRecord,
+    fault: &Fault,
+    out: &mut impl Write,
+) {
+    let _ = writeln!(
+        out,
+        "victory: exception {code:#010x} ({}) at {:#x} in title code",
+        seh::status_name(code),
+        record.address as usize
+    );
+    report_state(fault.registers, out);
+}
+
+/// The registers, and the eight qwords at `rsp`, each in an image named:
+/// the crash report after its first line.
+fn report_state(r: &Registers, out: &mut impl Write) {
     let _ = write!(out, "  rip ");
     locate(r.rip, out);
     let _ = writeln!(out, "  rsp {:#x}  rflags {:#x}", r.rsp, r.rflags);
@@ -599,6 +701,7 @@ mod tests {
         let fault = Fault {
             kind: FaultKind::Access,
             address: 0x10,
+            write: false,
             registers: &mut registers,
         };
         let mut text = String::new();

@@ -4,6 +4,7 @@
 //! file per area; each lists its exports, and this module serves them
 //! under the DLL names titles import them from (docs/macos.md, M2b).
 
+pub mod files;
 pub mod handles;
 pub mod memory;
 pub mod sync;
@@ -19,6 +20,7 @@ pub(crate) fn module() -> HleModule {
     exports.extend(threads::exports());
     exports.extend(memory::exports());
     exports.extend(time::exports());
+    exports.extend(files::exports());
     HleModule {
         name: "win32",
         dlls: &[

@@ -50,6 +50,8 @@ pub mod unwind;
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;
+#[cfg(not(windows))]
+pub mod seh;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]

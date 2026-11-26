@@ -62,6 +62,8 @@ pub struct Fault<'a> {
     pub kind: FaultKind,
     /// For `Access`: the address the instruction reached for (`si_addr`); 0 otherwise.
     pub address: usize,
+    /// For `Access`: whether the instruction wrote; false when unknown.
+    pub write: bool,
     pub registers: &'a mut Registers,
 }
 
@@ -198,6 +200,9 @@ extern "C" fn on_signal(
     } else {
         0
     };
+    // Bit 1 of the page fault's error code: the access was a write.
+    // SAFETY: the kernel's context for this signal, or null.
+    let write = kind == FaultKind::Access && unsafe { error_code(context) } & 2 != 0;
     let handler = HANDLER.load(SeqCst);
     let mut registers = Registers::default();
     // SAFETY: (both) the kernel's context for this signal, of the type its
@@ -208,6 +213,7 @@ extern "C" fn on_signal(
         handler(&mut Fault {
             kind,
             address,
+            write,
             registers: &mut registers,
         })
     } else {
@@ -276,6 +282,44 @@ unsafe fn fault_address(info: *mut libc::siginfo_t) -> usize {
 unsafe fn fault_address(info: *mut libc::siginfo_t) -> usize {
     // SAFETY: the caller's siginfo.
     unsafe { (*info).si_addr as usize }
+}
+
+/// The fault's error code (`REG_ERR`): for a page fault, bit 1 is set for
+/// a write; 0 without a context.
+///
+/// # Safety
+/// `context` is null or the kernel's `ucontext_t` for a signal being
+/// handled.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe fn error_code(context: *mut libc::c_void) -> u64 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's context.
+    let mcontext = unsafe { &(*context.cast::<libc::ucontext_t>()).uc_mcontext };
+    mcontext.gregs[libc::REG_ERR as usize] as u64
+}
+
+/// The fault's error code (`__es.__err`): for a page fault, bit 1 is set
+/// for a write; 0 without a context.
+///
+/// # Safety
+/// `context` is null or the kernel's `ucontext_t` for a signal being
+/// handled.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+unsafe fn error_code(context: *mut libc::c_void) -> u64 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's context, whose `uc_mcontext` points at the
+    // machine state the kernel saved for the signal, or is null.
+    unsafe {
+        let mcontext = (*context.cast::<libc::ucontext_t>()).uc_mcontext;
+        if mcontext.is_null() {
+            return 0;
+        }
+        u64::from((*mcontext).__es.__err)
+    }
 }
 
 /// The general registers of [`Registers`] in its field order, for the
