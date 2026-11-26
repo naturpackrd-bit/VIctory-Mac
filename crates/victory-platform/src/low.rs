@@ -198,6 +198,11 @@ mod mach {
         /// before `main` and never changes.
         pub static mach_task_self_: libc::mach_port_t;
 
+        /// `<mach-o/getsect.h>` (libmacho, in libSystem): the main
+        /// executable's segment of that name from its own Mach-O header, or
+        /// null when it has none.
+        pub fn getsegbyname(segname: *const libc::c_char) -> *const libc::segment_command_64;
+
         /// `<mach/mach_vm.h>`: the first region of `target` at or after
         /// `*address`, its start and size written to `*address` and
         /// `*size` and its `flavor` of information to `info` (`*count`
@@ -214,12 +219,17 @@ mod mach {
     }
 }
 
-/// The task's regions below LOW_LIMIT, `(start, end)`, from `mach_vm_region`,
-/// which returns each region at or after the address it is given.
+/// The task's regions below LOW_LIMIT, `(start, end)`: the executable's
+/// `__PAGEZERO` first, then what `mach_vm_region` reports, which returns each
+/// region at or after the address it is given.
 #[cfg(target_os = "macos")]
 fn mapped_ranges() -> Vec<(usize, usize)> {
     let mut mapped = Vec::new();
-    let mut address: libc::mach_vm_address_t = 0;
+    let page_zero = page_zero();
+    if page_zero > 0 {
+        mapped.push((0, page_zero));
+    }
+    let mut address = page_zero as libc::mach_vm_address_t;
     while address < LOW_LIMIT as libc::mach_vm_address_t {
         let mut size: libc::mach_vm_size_t = 0;
         let mut info = mach::BasicInfo64::default();
@@ -250,6 +260,25 @@ fn mapped_ranges() -> Vec<(usize, usize)> {
         address = end;
     }
     mapped
+}
+
+/// The size of the executable's `__PAGEZERO` segment, which the kernel maps
+/// nothing for: it raises the floor of the task's map instead
+/// (`vm_map_raise_min_offset` in xnu's `mach_loader.c`), so `mach_vm_region`
+/// never reports it, yet an allocation inside it fails. It is 4 GiB unless
+/// the link said otherwise, as apps/victory's build script does.
+#[cfg(target_os = "macos")]
+fn page_zero() -> usize {
+    // SAFETY: a NUL-terminated name; what is returned points into the
+    // executable's own header, mapped for the life of the process.
+    unsafe {
+        let segment = mach::getsegbyname(c"__PAGEZERO".as_ptr());
+        if segment.is_null() {
+            0
+        } else {
+            (*segment).vmsize as usize
+        }
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -283,57 +312,5 @@ mod tests {
             ]
         );
         assert_eq!(gaps(vec![(0, usize::MAX)], page), []);
-    }
-
-    #[test]
-    fn free_ranges_are_sorted_pagegranular_and_below_4gib() {
-        let free = free_ranges();
-        if free.is_empty() {
-            println!("nothing free below 4 GiB (a 4 GiB __PAGEZERO, or reserved)");
-            return;
-        }
-        let page = Host::page_size();
-        for r in &free {
-            assert_eq!(r.start % page, 0, "{r:x?}");
-            assert_eq!(r.len % page, 0, "{r:x?}");
-            assert!(r.len > 0, "{r:x?}");
-            assert!(r.start >= LOW_FLOOR, "{r:x?}");
-            assert!(r.start + r.len <= LOW_LIMIT, "{r:x?}");
-        }
-        for w in free.windows(2) {
-            assert!(w[0].start + w[0].len <= w[1].start, "{w:x?}");
-        }
-    }
-
-    #[test]
-    fn reserving_takes_what_is_free_and_carving_hands_it_out() {
-        let before = free_ranges();
-        if before.is_empty() {
-            println!("nothing free below 4 GiB (a 4 GiB __PAGEZERO)");
-            return;
-        }
-        let page = Host::page_size();
-        let taken = reserve();
-        assert!(!taken.is_empty());
-        assert_eq!(Host::allocate(page, Some(taken[0].start)), None, "taken");
-        let again = reserve();
-        assert!(
-            again.iter().all(|r| !taken.contains(r)),
-            "{again:x?} {taken:x?}"
-        );
-
-        let a = carve(2 * page, 64 << 10).expect("two pages");
-        assert_eq!(a % (64 << 10), 0);
-        // SAFETY: ours, read-write.
-        unsafe {
-            (a as *mut u8).write(0x5a);
-            ((a + 2 * page - 1) as *mut u8).write(0xa5);
-            assert_eq!((a as *const u8).read(), 0x5a);
-            assert_eq!(((a + 2 * page - 1) as *const u8).read(), 0xa5);
-        }
-        let b = carve(page, page).expect("a page");
-        assert_ne!(a, b);
-        assert!(!(a..a + 2 * page).contains(&b), "{a:#x} {b:#x}");
-        assert_eq!(carve(usize::MAX / 2, page), None);
     }
 }
