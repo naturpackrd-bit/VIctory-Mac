@@ -408,6 +408,16 @@ fn locate(name: Option<String>) -> Result<(WinPath, PathBuf), u32> {
     Ok((path, host))
 }
 
+/// The title path `path` on our drives, opened for reading by the host's
+/// own means, and its host path (to open it again): what DirectStorage
+/// reads its files through. The error is the Win32 code `locate` or the
+/// open gives.
+pub(crate) fn open_for_reading(path: &str) -> Result<(File, PathBuf), u32> {
+    let (_, host) = locate(Some(path.to_owned()))?;
+    let file = File::open(&host).map_err(|error| io_error(&error))?;
+    Ok((file, host))
+}
+
 // Title strings.
 
 /// A NUL-terminated UTF-16 string from the title (lossy); none for null.

@@ -659,8 +659,6 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 }
 
 /// Whether the title owns every page under bytes `[offset, offset + len)`.
-// For the DirectStorage port, which does not exist off Windows yet.
-#[allow(dead_code)]
 pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     let Some(end) = offset.checked_add(len) else {
         return false;
@@ -674,8 +672,6 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations),
 /// through the sections' windows. False if a page is unknown.
-// For the DirectStorage port, which does not exist off Windows yet.
-#[allow(dead_code)]
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
@@ -700,6 +696,95 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         (within, done) = (0, done + k);
     }
     true
+}
+
+/// Whether DirectStorage tells the GPU side where its writes show: never
+/// here, where there is no GPU side to tell (the Windows module reads
+/// `VICTORY_STREAM_NOTICE`).
+pub(crate) fn stream_notice() -> bool {
+    false
+}
+
+/// Where the title sees the pages under bytes `[offset, offset + len)`
+/// now, as (address, bytes) of each view's page, sorted (for DirectStorage's
+/// trace: whether that changed while a request wrote them).
+pub(crate) fn pages_shown(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let end = offset.saturating_add(len);
+    let numbers = pages
+        .get(offset / PAGE..end.div_ceil(PAGE))
+        .unwrap_or_default();
+    // The page table first, let go of before the views are taken.
+    let slices: Vec<Slice> = {
+        let table = page_table();
+        numbers
+            .iter()
+            .filter_map(|n| table.pages.get(n))
+            .cloned()
+            .collect()
+    };
+    let physical = physical();
+    let mut at: Vec<(usize, usize)> = Vec::new();
+    for slice in &slices {
+        for (&base, (len, view)) in &physical.views {
+            let shows = Arc::ptr_eq(&view.section, &slice.section)
+                && (view.index..view.index + len / PAGE).contains(&slice.index);
+            if shows {
+                at.push((base + (slice.index - view.index) * PAGE, PAGE));
+            }
+        }
+    }
+    at.sort_unstable();
+    at
+}
+
+/// DirectStorage has written bytes `[offset, offset + len)` of `pages`:
+/// nothing to do here (on Windows the GPU side is told where the title
+/// sees them; there is none here).
+pub(crate) fn pages_written(_pages: &[usize], _offset: usize, _len: usize) {}
+
+/// What the title's mapping calls cost since the last asking: never
+/// anything here, where no mapping costs are counted.
+pub(crate) fn map_costs() -> Option<String> {
+    None
+}
+
+/// Bytes `[at, at + len)` of a section's own window, writable in place for
+/// as long as this is held: DirectStorage decodes into it instead of a
+/// buffer it would then copy.
+pub(crate) struct PageWindow {
+    at: usize,
+    len: usize,
+    #[expect(dead_code, reason = "held for the window")]
+    section: Arc<PhysicalSection>,
+}
+
+impl PageWindow {
+    pub(crate) fn bytes(&mut self) -> &mut [u8] {
+        // SAFETY: bytes of the section's own window, read-write for as long
+        // as the `Arc` is held; the title's views alias them, as the
+        // console's do.
+        unsafe { std::slice::from_raw_parts_mut(self.at as *mut u8, self.len) }
+    }
+}
+
+/// A window on bytes `[offset, offset + len)` of `pages` when they are
+/// consecutive pages of one allocation (how titles usually hand them out);
+/// `None` otherwise (pages of several allocations, out of order, or
+/// unknown), which `write_physical` then handles or reports.
+pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
+    let runs = runs(pages, offset, len)?;
+    let [(first, _)] = runs.as_slice() else {
+        return None;
+    };
+    let window = first.section.window();
+    if window == 0 {
+        return None;
+    }
+    Some(PageWindow {
+        at: window + first.index * PAGE + offset % PAGE,
+        len,
+        section: first.section.clone(),
+    })
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
@@ -1102,6 +1187,64 @@ mod tests {
         release(r as *mut c_void);
         XMemFreePhysicalPages(3, pages.as_ptr());
         assert!(!pages_known(&pages, 0, PAGE));
+    }
+
+    #[test]
+    fn page_windows_are_the_pages_themselves() {
+        let pages = allocate(2);
+        let mut window = page_window(&pages, PAGE - 2, 4).expect("one run");
+        assert_eq!(window.bytes().len(), 4);
+        window.bytes().copy_from_slice(&[1, 2, 3, 4]);
+        let r = placeholder(2);
+        assert_eq!(
+            XMemMapPhysicalPages(r as *mut c_void, 2, pages.as_ptr()) as usize,
+            r
+        );
+        let mut read = [0u8; 4];
+        assert!(Host::read_into(r + PAGE - 2, &mut read));
+        assert_eq!(read, [1, 2, 3, 4], "written before the view was mapped");
+        // The other way: `write_physical` shows in a window.
+        assert!(write_physical(&pages, PAGE + 7, &[0x77]));
+        let mut second = page_window(&pages[1..], 7, 1).expect("one page");
+        assert_eq!(second.bytes(), [0x77]);
+
+        let other = allocate(1);
+        assert!(page_window(&[pages[0], other[0]], 0, 2 * PAGE).is_none());
+        assert!(page_window(&[pages[1], pages[0]], 0, 2 * PAGE).is_none());
+        assert!(
+            page_window(&[0x7777_0000], 0, 1).is_none(),
+            "an unknown page"
+        );
+        release(r as *mut c_void);
+        XMemFreePhysicalPages(2, pages.as_ptr());
+        XMemFreePhysicalPages(1, other.as_ptr());
+    }
+
+    #[test]
+    fn pages_shown_lists_every_address_of_a_page() {
+        let pages = allocate(2);
+        let r = placeholder(4);
+        let at = |page: usize| r + page * PAGE;
+        assert_eq!(
+            XMemMapPhysicalPages(at(3) as *mut c_void, 1, pages.as_ptr()) as usize,
+            at(3)
+        );
+        assert_eq!(
+            XMemMapPhysicalPages(at(0) as *mut c_void, 2, pages.as_ptr()) as usize,
+            at(0)
+        );
+        assert_eq!(
+            pages_shown(&pages[..1], 0, PAGE),
+            [(at(0), PAGE), (at(3), PAGE)]
+        );
+        assert_eq!(pages_shown(&pages[1..], 10, 20), [(at(1), PAGE)]);
+        assert_eq!(
+            XMemMapPhysicalPages(at(0) as *mut c_void, 2, std::ptr::null()) as usize,
+            at(0)
+        );
+        assert!(pages_shown(&pages[1..], 0, PAGE).is_empty(), "unmapped");
+        release(r as *mut c_void);
+        XMemFreePhysicalPages(2, pages.as_ptr());
     }
 
     /// Two pages allocated and one of them shown twice (other tests' memory

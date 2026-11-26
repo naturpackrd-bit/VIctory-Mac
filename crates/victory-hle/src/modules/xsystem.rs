@@ -132,8 +132,8 @@ static ANALYTICS_VTABLE: Methods<4> = Methods([
 
 /// The device type is not a runtime call: code linked into the title reads
 /// `ConsoleMode` from this key (`RegOpenKeyW`, `RegQueryValueExW`) and
-/// takes a missing value for a PC.
-#[cfg(windows)]
+/// takes a missing value for a PC. Off Windows there is no host registry:
+/// a key that is not ours is not found.
 mod device_type {
     #![allow(non_snake_case)]
 
@@ -141,6 +141,7 @@ mod device_type {
 
     use victory_gpu::console::{self, Console};
 
+    #[cfg(windows)]
     use crate::modules::files::host;
     use crate::{HleModule, hle_export};
 
@@ -152,6 +153,8 @@ mod device_type {
     const FILE_NOT_FOUND: u32 = 2;
     const INVALID_PARAMETER: u32 = 87;
     const MORE_DATA: u32 = 234;
+    #[cfg(not(windows))]
+    const INVALID_HANDLE: u32 = 6;
     const DWORD: u32 = 4;
 
     /// Stands for the key; never a host handle value.
@@ -196,11 +199,16 @@ mod device_type {
 
     // Our titles import only these registry functions (and `RegOpenKeyExW`
     // below), so no other call can reach the host with our key.
+    // Off Windows the closure is a constant, kept for the Windows form.
+    #[cfg_attr(not(windows), allow(clippy::unnecessary_lazy_evaluations))]
     pub extern "win64" fn RegOpenKeyW(root: Key, sub: *const u16, out: *mut Key) -> u32 {
         open(root, sub, out).unwrap_or_else(|| {
-            host!("advapi32.dll", "RegOpenKeyW": extern "win64" fn(Key, *const u16, *mut Key) -> u32)(
+            #[cfg(windows)]
+            return host!("advapi32.dll", "RegOpenKeyW": extern "win64" fn(Key, *const u16, *mut Key) -> u32)(
                 root, sub, out,
-            )
+            );
+            #[cfg(not(windows))]
+            FILE_NOT_FOUND
         })
     }
 
@@ -212,9 +220,15 @@ mod device_type {
         out: *mut Key,
     ) -> u32 {
         open(root, sub, out).unwrap_or_else(|| {
-            host!("advapi32.dll", "RegOpenKeyExW": extern "win64" fn(
+            #[cfg(windows)]
+            return host!("advapi32.dll", "RegOpenKeyExW": extern "win64" fn(
                 Key, *const u16, u32, u32, *mut Key,
-            ) -> u32)(root, sub, options, access, out)
+            ) -> u32)(root, sub, options, access, out);
+            #[cfg(not(windows))]
+            {
+                let _ = (options, access);
+                FILE_NOT_FOUND
+            }
         })
     }
 
@@ -226,10 +240,16 @@ mod device_type {
         data: *mut u8,
         size: *mut u32,
     ) -> u32 {
+        #[cfg(windows)]
         if key != oem() {
             return host!("advapi32.dll", "RegQueryValueExW": extern "win64" fn(
                 Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
             ) -> u32)(key, name, reserved, kind, data, size);
+        }
+        #[cfg(not(windows))]
+        if key != oem() {
+            let _ = reserved;
+            return FILE_NOT_FOUND;
         }
         if !is(name, VALUE) {
             return FILE_NOT_FOUND;
@@ -264,7 +284,10 @@ mod device_type {
         if key == oem() {
             return SUCCESS;
         }
-        host!("advapi32.dll", "RegCloseKey": extern "win64" fn(Key) -> u32)(key)
+        #[cfg(windows)]
+        return host!("advapi32.dll", "RegCloseKey": extern "win64" fn(Key) -> u32)(key);
+        #[cfg(not(windows))]
+        INVALID_HANDLE
     }
 
     pub(crate) fn module() -> HleModule {
@@ -339,6 +362,7 @@ mod device_type {
             assert_eq!(again, oem());
         }
 
+        #[cfg(windows)]
         #[test]
         fn other_keys_reach_the_host() {
             let mut key = std::ptr::null_mut();
@@ -362,7 +386,6 @@ mod device_type {
         }
     }
 }
-#[cfg(windows)]
 pub(crate) use device_type::module;
 
 #[cfg(test)]

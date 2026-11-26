@@ -7,6 +7,9 @@
 //! at once; the order of results is the order of commands.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+// Off Windows the events are ours (`win32::sync`), whose functions are safe
+// to call: the code stays as it is on Windows.
+#![cfg_attr(not(windows), allow(unused_unsafe))]
 
 use std::alloc::Layout;
 use std::collections::VecDeque;
@@ -14,8 +17,19 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use opus_pure::OpusDecoder;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+
+#[cfg(not(windows))]
+use super::win32::handles::CloseHandle;
+#[cfg(not(windows))]
+use super::win32::sync::{CreateEventW, SetEvent};
+// Windows' name for it.
+#[cfg(not(windows))]
+#[allow(clippy::upper_case_acronyms)]
+type HANDLE = *mut c_void;
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -143,7 +157,7 @@ fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
     c.state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub extern "system" fn XApuConnect(
+pub extern "win64" fn XApuConnect(
     input: *const ConnectInput,
     output: *mut ConnectOutput,
     handle: *mut *mut Connection,
@@ -223,7 +237,7 @@ pub extern "system" fn XApuConnect(
     S_OK
 }
 
-pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
+pub extern "win64" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     if handle.is_null() {
         return E_INVALIDARG;
     }
@@ -238,7 +252,7 @@ pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     S_OK
 }
 
-pub extern "system" fn XApuEnqueueCommand(
+pub extern "win64" fn XApuEnqueueCommand(
     handle: *mut Connection,
     command: *const CommandId,
     total: *mut u32,
@@ -371,7 +385,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     result.output_length = bytes as u32;
 }
 
-pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuResult) -> HRESULT {
+pub extern "win64" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuResult) -> HRESULT {
     if handle.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
@@ -388,7 +402,7 @@ pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuR
     S_OK
 }
 
-pub extern "system" fn XApuGetResultCount(handle: *mut Connection, total: *mut u32) -> u32 {
+pub extern "win64" fn XApuGetResultCount(handle: *mut Connection, total: *mut u32) -> u32 {
     if handle.is_null() {
         return 0;
     }

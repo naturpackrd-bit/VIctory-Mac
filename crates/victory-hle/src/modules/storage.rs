@@ -56,7 +56,7 @@ fn folder() -> Option<String> {
     #[cfg(windows)]
     return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
     #[cfg(not(windows))]
-    None
+    super::win32::files::mount(&storage).map(|letter| format!("{letter}:\\"))
 }
 
 extern "win64" fn path_size(_: This, out: *mut usize) -> HRESULT {
@@ -124,6 +124,21 @@ pub(crate) fn disk_free(dir: &Path) -> u64 {
             return free;
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+            // SAFETY: plain data; zero is a valid value.
+            let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a valid output.
+            if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } == 0 {
+                // The fields' types differ by host (32-bit counts on macOS).
+                #[allow(clippy::unnecessary_cast)]
+                let free = stats.f_bavail as u64 * stats.f_frsize as u64;
+                return free;
+            }
+        }
+    }
     let _ = dir;
     u64::MAX
 }
@@ -189,6 +204,31 @@ mod tests {
     #[cfg(windows)]
     use crate::modules::xgameruntime::method;
 
+    /// Tests that set the title, one at a time.
+    static TITLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn storage_is_a_drive_with_the_titles_quota() {
+        let _alone = TITLE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
+        let previous_title = runtime::title();
+        runtime::set_title(runtime::Title {
+            id: 1,
+            storage: dir.path().to_owned(),
+            storage_bytes: 1000,
+            ..Default::default()
+        });
+        let drive = folder().expect("a drive");
+        let letter = drive.chars().next().unwrap();
+        assert!(letter.is_ascii_uppercase(), "{drive}");
+        assert_eq!(drive, format!("{letter}:\\"));
+        let info = space().unwrap();
+        assert_eq!((info.used, info.total_free, info.total), (100, 900, 1000));
+        assert!(info.available_free <= 900);
+        runtime::set_title(previous_title);
+    }
+
     #[test]
     fn empty_storage_uses_zero_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -244,6 +284,7 @@ mod tests {
         type Space = extern "win64" fn(This, *mut SpaceInfo) -> HRESULT;
         type Prompt = extern "win64" fn(This, u64, *mut AsyncBlock) -> HRESULT;
         type Result = extern "win64" fn(This, *mut AsyncBlock) -> HRESULT;
+        let _alone = TITLE.lock().unwrap_or_else(|e| e.into_inner());
         let this: This = &OBJECT;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();

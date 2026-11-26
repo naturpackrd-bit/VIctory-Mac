@@ -109,6 +109,13 @@ pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
     imp::resolve(dll, &name)
 }
 
+/// Off Windows no host DLL serves anything, so a host function is never
+/// there.
+#[cfg(not(windows))]
+pub(crate) fn function(_dll: &str, _name: &str) -> Option<usize> {
+    None
+}
+
 #[cfg(windows)]
 mod imp {
     use std::collections::HashMap;

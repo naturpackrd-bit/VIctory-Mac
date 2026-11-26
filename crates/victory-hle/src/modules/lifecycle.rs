@@ -7,22 +7,29 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
+// Off Windows nothing ends or relaunches the title yet (`xgame`'s
+// `XLaunchNewGame` does on Windows only, and there is no window to close).
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
+#[cfg(windows)]
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
 use crate::{HleModule, hle_export};
 
 /// A suspend routine (`quiesced`) or a constrained-change routine
 /// (`constrained`): both take a flag and the title's context.
-type Routine = extern "system" fn(flag: u8, context: *mut c_void);
+type Routine = extern "win64" fn(flag: u8, context: *mut c_void);
 
 /// Registration id, routine and context.
 type Registration = (usize, Routine, usize);
@@ -67,7 +74,7 @@ fn register(
     0
 }
 
-pub extern "system" fn RegisterAppStateChangeNotification(
+pub extern "win64" fn RegisterAppStateChangeNotification(
     routine: Option<Routine>,
     context: *mut c_void,
     registration: *mut usize,
@@ -75,13 +82,13 @@ pub extern "system" fn RegisterAppStateChangeNotification(
     register(routines(), routine, context, registration)
 }
 
-pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize) {
+pub extern "win64" fn UnregisterAppStateChangeNotification(registration: usize) {
     routines().retain(|&(id, ..)| id != registration);
 }
 
 /// The host's own version never calls the routine (a desktop app is never
 /// constrained), so a title waiting for it would never suspend.
-pub extern "system" fn RegisterAppConstrainedChangeNotification(
+pub extern "win64" fn RegisterAppConstrainedChangeNotification(
     routine: Option<Routine>,
     context: *mut c_void,
     registration: *mut usize,
@@ -89,14 +96,16 @@ pub extern "system" fn RegisterAppConstrainedChangeNotification(
     register(constrained(), routine, context, registration)
 }
 
-pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: usize) {
+pub extern "win64" fn UnregisterAppConstrainedChangeNotification(registration: usize) {
     constrained().retain(|&(id, ..)| id != registration);
 }
 
 /// The window procedure a title window had before ours.
+#[cfg(windows)]
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
-pub extern "system" fn CreateWindowExW(
+#[cfg(windows)]
+pub extern "win64" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
     name: PCWSTR,
@@ -122,7 +131,8 @@ pub extern "system" fn CreateWindowExW(
 }
 
 /// See [`CreateWindowExW`].
-pub extern "system" fn CreateWindowExA(
+#[cfg(windows)]
+pub extern "win64" fn CreateWindowExA(
     ex_style: u32,
     class: PCSTR,
     name: PCSTR,
@@ -147,12 +157,66 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
+/// Stands for the title's window off Windows: never null, never a host
+/// handle.
+#[cfg(not(windows))]
+static WINDOW: u8 = 0;
+
+/// Off Windows, a stand-in window handle ([`WINDOW`]'s address); nothing
+/// is created or recorded. The window arrives with M3's SDL3 work.
+#[cfg(not(windows))]
+pub extern "win64" fn CreateWindowExW(
+    _ex_style: u32,
+    _class: *const u16,
+    _name: *const u16,
+    _style: u32,
+    _x: i32,
+    _y: i32,
+    _width: i32,
+    _height: i32,
+    _parent: *mut c_void,
+    _menu: *mut c_void,
+    _instance: *mut c_void,
+    _param: *const c_void,
+) -> *mut c_void {
+    stand_in_window()
+}
+
+/// See [`CreateWindowExW`].
+#[cfg(not(windows))]
+pub extern "win64" fn CreateWindowExA(
+    _ex_style: u32,
+    _class: *const u8,
+    _name: *const u8,
+    _style: u32,
+    _x: i32,
+    _y: i32,
+    _width: i32,
+    _height: i32,
+    _parent: *mut c_void,
+    _menu: *mut c_void,
+    _instance: *mut c_void,
+    _param: *const c_void,
+) -> *mut c_void {
+    stand_in_window()
+}
+
+#[cfg(not(windows))]
+fn stand_in_window() -> *mut c_void {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("no window off Windows yet (M3): a stand-in handle");
+    }
+    (&raw const WINDOW).cast_mut().cast()
+}
+
 /// A console title sizes its window to its render target (
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
+#[cfg(windows)]
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
@@ -170,12 +234,14 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     (left, top, w, h)
 }
 
+#[cfg(windows)]
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
     let (width, height) = value.trim().split_once(['x', 'X'])?;
     let (width, height) = (width.trim().parse().ok()?, height.trim().parse().ok()?);
     (width > 0 && height > 0).then_some((width, height))
 }
 
+#[cfg(windows)]
 fn window_limit() -> Option<(i32, i32)> {
     static LIMIT: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -191,6 +257,7 @@ fn window_limit() -> Option<(i32, i32)> {
     })
 }
 
+#[cfg(windows)]
 fn fit_with_limit(
     area: &RECT,
     width: i32,
@@ -211,6 +278,7 @@ fn fit_with_limit(
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
 /// (or is `CW_USEDEFAULT`).
+#[cfg(windows)]
 fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     let (aw, ah) = (area.right - area.left, area.bottom - area.top);
     if width <= 0 || height <= 0 || aw <= 0 || ah <= 0 || (width <= aw && height <= ah) {
@@ -227,6 +295,7 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
 }
 
 /// Puts our procedure in front of the title's.
+#[cfg(windows)]
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
         return;
@@ -240,12 +309,8 @@ fn hook(hwnd: HWND) {
     }
 }
 
-extern "system" fn window_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+#[cfg(windows)]
+extern "win64" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
@@ -326,6 +391,7 @@ const RELAUNCHED_FROM: &str = "VICTORY_RELAUNCHED_FROM";
 
 /// Starts `victory` again with `args` (after the title has suspended); the
 /// new process waits until this one has ended.
+#[cfg(windows)]
 pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
     let mut me: HANDLE = std::ptr::null_mut();
@@ -355,8 +421,25 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
     }
 }
 
+/// Starts `victory` again with `args` (after the title has suspended); the
+/// new process waits until this one, named by its id, has ended.
+#[cfg(not(windows))]
+pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
+    let spawned = std::env::current_exe().and_then(|exe| {
+        std::process::Command::new(exe)
+            .args(&args)
+            .env(RELAUNCHED_FROM, std::process::id().to_string())
+            .spawn()
+    });
+    match spawned {
+        Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
+        Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),
+    }
+}
+
 /// In a relaunched `victory`: waits (30 s at most) for the process it
 /// replaces to be gone, so the two never share the title's files.
+#[cfg(windows)]
 pub fn wait_for_previous() {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
@@ -376,12 +459,46 @@ pub fn wait_for_previous() {
     }
 }
 
+/// In a relaunched `victory`: waits (30 s at most) for the process it
+/// replaces, named by its id, to be gone, so the two never share the
+/// title's files.
+#[cfg(not(windows))]
+pub fn wait_for_previous() {
+    let Some(pid) = std::env::var(RELAUNCHED_FROM)
+        .ok()
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+    else {
+        return;
+    };
+    // SAFETY: removing our own variable before any other thread reads it.
+    unsafe { std::env::remove_var(RELAUNCHED_FROM) };
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        // SAFETY: signal 0 sends nothing; it asks whether the process is
+        // there.
+        let asked = unsafe { libc::kill(pid, 0) };
+        // `EPERM`: still there, and not ours.
+        let error = std::io::Error::last_os_error().raw_os_error();
+        if asked != 0 && error == Some(libc::ESRCH) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
 fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+}
+
+/// No pipeline cache to save off Windows.
+#[cfg(not(windows))]
+fn end() {
+    std::process::exit(0);
 }
 
 pub(crate) fn module() -> HleModule {
@@ -406,7 +523,7 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
 
-    extern "system" fn noop(_: u8, _: *mut c_void) {}
+    extern "win64" fn noop(_: u8, _: *mut c_void) {}
 
     #[test]
     fn registrations_come_and_go() {
@@ -447,7 +564,7 @@ mod tests {
     /// What `recording_routine` saw: (context, flag) per call, in order.
     static CALLS: Mutex<Vec<(usize, u8)>> = Mutex::new(Vec::new());
 
-    extern "system" fn recording_routine(flag: u8, context: *mut c_void) {
+    extern "win64" fn recording_routine(flag: u8, context: *mut c_void) {
         CALLS.lock().unwrap().push((context as usize, flag));
     }
 
@@ -458,6 +575,53 @@ mod tests {
         assert_eq!(*CALLS.lock().unwrap(), [(10, 1), (11, 1), (20, 1), (21, 1)]);
     }
 
+    /// The order the routines below ran in, and how often each did.
+    static ORDER: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+    static CONSTRAINED_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static SUSPEND_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "win64" fn on_constrained(_: u8, _: *mut c_void) {
+        CONSTRAINED_RUNS.fetch_add(1, Ordering::SeqCst);
+        ORDER.lock().unwrap().push("constrained");
+    }
+
+    extern "win64" fn on_suspend(_: u8, _: *mut c_void) {
+        SUSPEND_RUNS.fetch_add(1, Ordering::SeqCst);
+        ORDER.lock().unwrap().push("suspend");
+    }
+
+    #[test]
+    fn registered_routines_run_constrained_first_and_go() {
+        let (mut constrain, mut suspend) = (0, 0);
+        let null = std::ptr::null_mut();
+        assert_eq!(
+            RegisterAppStateChangeNotification(Some(on_suspend), null, &mut suspend),
+            0
+        );
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(Some(on_constrained), null, &mut constrain),
+            0
+        );
+        assert_ne!(constrain, suspend);
+        // Only ours: other tests register routines of their own meanwhile.
+        let ours = |list: &[Registration], id: usize| -> Vec<Registration> {
+            list.iter().filter(|r| r.0 == id).copied().collect()
+        };
+        let constrained_now = ours(&constrained(), constrain);
+        let suspend_now = ours(&routines(), suspend);
+        assert_eq!((constrained_now.len(), suspend_now.len()), (1, 1));
+        constrain_then_suspend(&constrained_now, &suspend_now);
+        assert_eq!(*ORDER.lock().unwrap(), ["constrained", "suspend"]);
+        assert_eq!(CONSTRAINED_RUNS.load(Ordering::SeqCst), 1);
+        assert_eq!(SUSPEND_RUNS.load(Ordering::SeqCst), 1);
+
+        UnregisterAppConstrainedChangeNotification(constrain);
+        UnregisterAppStateChangeNotification(suspend);
+        assert!(ours(&constrained(), constrain).is_empty());
+        assert!(ours(&routines(), suspend).is_empty());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn oversized_windows_shrink_to_the_screen() {
         let area = RECT {
@@ -474,6 +638,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn configured_window_limit_fits_4k_into_1080p() {
         let area = RECT {
@@ -487,6 +652,7 @@ mod tests {
         assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
     }
 
+    #[cfg(windows)]
     #[test]
     fn configured_window_limit_still_respects_the_work_area() {
         let area = RECT {
@@ -502,6 +668,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn configured_window_limit_preserves_non_widescreen_proportions() {
         let area = RECT {
@@ -513,6 +680,7 @@ mod tests {
         assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
     }
 
+    #[cfg(windows)]
     #[test]
     fn window_limit_requires_two_positive_dimensions() {
         assert_eq!(parse_window_limit("1920x1080"), Some((1920, 1080)));
@@ -531,6 +699,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn hooked_windows_still_reach_the_title_procedure() {
         let null = std::ptr::null_mut();
@@ -560,6 +729,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     thread_local! {
         /// The system commands `recording` received, low four bits cleared.
         static COMMANDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -567,7 +737,8 @@ mod tests {
 
     /// Stands in for a title's procedure: notes system commands and acts
     /// on none of them (no menu loop, no minimising).
-    extern "system" fn recording(
+    #[cfg(windows)]
+    extern "win64" fn recording(
         hwnd: HWND,
         message: u32,
         wparam: WPARAM,
@@ -581,6 +752,7 @@ mod tests {
         unsafe { wm::DefWindowProcW(hwnd, message, wparam, lparam) }
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_keyboard_menu_never_reaches_the_title() {
         let null = std::ptr::null_mut();
