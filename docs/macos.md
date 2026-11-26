@@ -30,8 +30,8 @@ XAudio2 on FAudio or our own (M3).
 | | Pass criterion | State |
 |---|---|---|
 | M1 | The workspace builds, passes clippy (`-D warnings`) and its tests on macOS, both targets; the binaries start and report the macOS default folders; Windows CI stays green | macOS: passed (CI runs 1 and 3, Apple silicon runner, x86-64 under Rosetta 2). Windows: clippy passes; one test fails, `victory-gpu` `pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws`, on the runner's software renderer (WARP), in code this port has not changed; it needs a Windows machine with a GPU to tell whether WARP or the test is at fault |
-| M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: a stand-in title loads and runs | In progress. So far: the runtime crates are x86-64 only (the Apple silicon build is the tools); `extern "win64"` on title-facing code; a stand-in title any host builds (`tests/fixtures/pe-probe`, rust-lld, no Windows SDK); our loader (`victory_loader::MappedImage`) maps, relocates, binds and runs it: tests pass on Linux, on macOS under Rosetta 2 and on Windows (CI run 3); a TEB of ours per thread, with static TLS, reached through the title's `gs` accesses patched at mapping (`victory_loader::teb`; tests pass on Linux). Next: TLS, the TEB on `gs`, exceptions, `ROSETTA_ADVERTISE_AVX`, the low 4 GiB |
-| M2b | Our replacements for the host DLLs the title calls: its C runtime starts | |
+| M2a | Our own PE loader, the TEB on `gs`, SEH dispatch, fault handlers, `extern "win64"` on every title-facing function: a stand-in title loads and runs | In progress. Done: the runtime crates are x86-64 only (the Apple silicon build is the tools); `extern "win64"` on title-facing code; a stand-in title any host builds (`tests/fixtures/pe-probe`, rust-lld, no Windows SDK); our loader (`victory_loader::MappedImage`) maps, relocates, binds (delay imports ahead of time too), runs TLS callbacks and `DllMain`, and gives every unresolved import a stub that reports its first call (`UnimplementedPolicy`); a TEB of ours per thread, with static TLS, reached through the title's `gs` accesses patched at mapping (`victory_loader::teb`); faults in title code (SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE) taken on an alternate stack, the Zen 2 instructions the host lacks emulated (`clzero`, `monitorx`, `mwaitx`, `clwb`, SSE4a, `movntss`/`movntsd`), anything else a crash report without allocating (`victory_loader::faults`); x64 unwind data read and frames undone, handlers located (`victory_loader::unwind`); the low 4 GiB reserved at start and `ROSETTA_ADVERTISE_AVX` set by a relaunch (`apps/victory`). Tests pass on Linux and (CI) on Windows and macOS, both targets, except the low-memory test under Rosetta 2, fixed after CI run 9 (`__PAGEZERO` is the floor of the map, not a region). Next: SEH dispatch (`RtlDispatchException`'s work on the handlers the unwinder finds, `RaiseException`, `__C_specific_handler`), threads, then the title's entry |
+| M2b | Our replacements for the host DLLs the title calls: its C runtime starts | In progress: `victory-hle`'s `win32` module (built off Windows only; it serves `kernel32`, `kernelbase`, `ntdll` and the `api-ms-win-core-*` sets) has handles and the last error (8 exports), synchronization (66: events, semaphores, mutexes and the waits, critical sections, SRW locks, condition variables, `WaitOnAddress`, `InitOnce`, `SList`), memory (40: `VirtualAlloc` and family with reserve/commit kept here, heaps, `GlobalMemoryStatusEx`) and clocks, system information, processor features and the Windows version (33); 147 exports, with tests on Linux. Not yet: threads and dynamic TLS, files, the C runtime (`ucrt`: sizing needs the census of your dump), `RaiseException` and friends |
 | M2c | With your dump: the title reaches its frame loop headless (no GPU, no audio) for N minutes; every unimplemented import met is logged; memory use measured | |
 | M3 | SDL3 window, input, audio (XAudio2): the title's menu music plays and a pad moves through the menu | |
 | M4 | Metal back end: the menu, then the city street, render as on Windows; frame times and memory measured | |
@@ -80,24 +80,76 @@ the milestone that replaces it.
 
 - `apps/victory/src/run.rs`, `run`: refuses to run a title ("needs Windows
   for now"). M2.
-- `victory-loader`, `map` (our own loader): maps, relocates and binds an
-  image, registers its static TLS and patches its `gs` accesses; not yet
-  the exception table, delay imports, TLS callbacks or the entry point, and
-  an import nobody resolves fails the mapping instead of getting a reporting
-  stub. M2a.
+- `victory-loader`, `map` (our own loader): an import nobody resolves gets,
+  by `UnimplementedPolicy`, a refusal of the mapping (`Refuse`), a stub that
+  traps (`Trap`) or one that logs its first call and returns 0 (`Zero`);
+  `Zero` is what the tests use and what M2c runs the title with, so a title
+  that needs the result of such a call goes wrong later rather than at the
+  call. Delay imports are bound ahead of time, so `__delayLoadHelper2` is
+  never called. M2b/M2c.
 - `victory-loader`, `teb`: the PEB a title reads through `gs:[0x60]` is a
   zeroed block (`BeingDebugged` 0, no image base, no process parameters).
   `gs` accesses in any form but a `mov` (`cmp`, `movzx`, ...) make the
   mapping fail, naming them; `victory inspect --teb` lists an image's
   before it is run. A thread's TLS blocks for an image mapped after the
   thread attached appear when it attaches again. M2a/M2b.
-- `victory-loader`: steps 2 to 5 (mapping, binding, TLS, threads, crash
-  reporting, Zen 2 instruction emulation, patches of the title's code) are not
-  built. M2a.
+- `victory-loader`, `faults`: a fault in title code that is not a Zen 2
+  instruction to emulate ends the process with a crash report (registers,
+  the top of the stack) and exit code 128 + the signal; the title's own
+  handlers (`__try`, vectored handlers, `SetUnhandledExceptionFilter`) are
+  not yet called, though `unwind` finds them: SEH dispatch is M2a's next
+  step. Faults in our own code go to the handler that was installed before
+  ours (Rust's, which aborts). Up to 8 handlers of ours (`register`); the
+  alternate stack (64 KiB) is leaked when a thread ends. M2a.
+- `victory-loader`, `unwind`: a frame's handler and language-specific data
+  are located but never invoked (see `faults`); `backtrace` reads an image's
+  exception table again for every frame, and reads an epilogue a byte at a
+  time (one checked read a byte: fine for a crash report, to be made one
+  read when exceptions are dispatched often). The establisher frame of a
+  function with a frame register is computed from that register even when
+  `rip` is in the prologue before it is set, which Windows handles. M2a.
+- `victory-platform`, `low`: `free_ranges` counts the executable's
+  `__PAGEZERO` as mapped (the kernel raises the floor of the address map for
+  it, reporting no region); nothing else that is not a region is known. The
+  Apple silicon build, whose `__PAGEZERO` is 4 GiB, reports nothing free,
+  truthfully. M2a.
+- `victory-hle/src/modules/win32`, `sync`: alertable waits are ordinary ones
+  (no APCs); a mutex whose owner ends is never reported abandoned (no
+  thread's end is seen yet); `PulseEvent` releases nobody (waiters check
+  the event again when they wake, by which time it is clear);
+  `SignalObjectAndWait` is two steps, not one; a wait-all with the same
+  handle twice is not refused; a critical section's spin count is stored
+  and not used, and its `LockCount` is -1 free, 0 held (Windows encodes
+  waiters in it; nothing known reads it); named objects live for the
+  process (Windows frees them with their last handle) and their `Local\`
+  and `Global\` prefixes are part of the name; `INIT_ONCE_ASYNC` is
+  refused; an `SLIST_HEADER`'s sequence bytes are unused. Every signal
+  wakes every waiter through one condition variable, to be made finer when
+  it costs. M2b/M2c.
+- `victory-hle/src/modules/win32`, `memory`: `PAGE_GUARD` becomes a page
+  with no access (the one-shot guard fault is not kept); `VirtualQuery`
+  knows only reservations made through these functions, so what the host,
+  Rust or the loader own looks free; a decommitted page keeps its contents
+  until it is committed again (then zeroed); `GetWriteWatch` and
+  `ResetWriteWatch` fail (the Windows GPU path's, not a title's);
+  `HeapDestroy` frees none of the heap's blocks; `HEAP_REALLOC_IN_PLACE_ONLY`
+  is not honoured (a block may move); moveable `LocalAlloc`/`GlobalAlloc`
+  memory is a plain pointer; `VirtualLock` does nothing; the page file is
+  reported as large as physical memory. M2b/M2c.
+- `victory-hle/src/modules/win32`, `time`: `GetLocalTime` is UTC and
+  `GetTimeZoneInformation` reports no zone (bias 0); `GetSystemTimes` is
+  all zeros; `GetCurrentProcessorNumber` is always 0; processors are capped
+  at 64 (one group); `GetLogicalProcessorInformationEx` describes no caches
+  or groups; Windows is reported as 10, build 19044, the computer as
+  `VICTORY`, the directories as `C:\Windows`. On macOS the available
+  memory (`GlobalMemoryStatusEx`) comes from the kernel's page counts times
+  the kernel's page size (16 KiB under Rosetta 2 too; CI compares the two
+  builds' figures), unverified on a Mac at the time of writing. M2b.
 - `victory-hle/src/modules/kernel.rs`, the non-Windows `host` module: every
-  host call fails (null handles, zero lengths, no last error, no stack walk);
-  `exit`, `abort` and `TerminateProcess` end our process.
-  `SetThreadPriority` changes nothing and fails. M2a/M2b.
+  host call fails (null handles, zero lengths, no stack walk); `exit`,
+  `abort` and `TerminateProcess` end our process. `SetThreadPriority`
+  changes nothing and fails. The last error is the `win32` module's now
+  (`GetLastError`, in the TEB). M2b.
 - `victory-hle/src/host.rs`, non-Windows `imp::resolve`: no host DLL serves
   any import; on macOS this stays so, and our own implementations replace
   them. M2b.
@@ -242,3 +294,13 @@ figure is copies of title memory that a separate card needs (`victory-gpu`,
 `watch.rs`); with unified memory Metal can read buffers where the title
 writes them, and only textures in the console's tiled layouts need converting.
 M2c measures the footprint without a GPU, M4 with Metal.
+
+Found (CI run 9, macOS, 2026-11-26): the kernel maps nothing for an
+executable's `__PAGEZERO` segment; it raises the minimum address of the
+task's map instead (`vm_map_raise_min_offset` in xnu's `mach_loader.c`). So
+`mach_vm_region` reports no region there and a walk of the low 4 GiB finds
+it all free, while a fixed allocation in it fails. `free_ranges` reads the
+segment's size from the executable's header (`getsegbyname`) and counts it
+as mapped. The runtime and the platform crate's test binaries link with a
+one-page `__PAGEZERO` (`build.rs`); every other binary keeps the 4 GiB one
+and sees nothing free below 4 GiB.
