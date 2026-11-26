@@ -186,6 +186,8 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    relaunch_with_avx();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -268,6 +270,26 @@ fn main() -> Result<()> {
     }
 }
 
+/// Rosetta 2 runs AVX2 but reports it (CPUID) only with this variable in the
+/// environment (docs/macos.md), and the title and our own AVX2 paths look
+/// there: this program is re-run with it set when it is not.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn relaunch_with_avx() {
+    use std::os::unix::process::CommandExt;
+    const VAR: &str = "ROSETTA_ADVERTISE_AVX";
+    if std::env::var_os(VAR).is_some_and(|v| v == "1") {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let error = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(VAR, "1")
+        .exec();
+    eprintln!("victory: could not re-run with {VAR}=1 ({error}); AVX2 may be hidden");
+}
+
 /// What the commands of the runtime (the loader, the HLE and the GPU side,
 /// which run the title's x86-64 code) say in a build for another processor:
 /// on Apple silicon the tools are native and the runtime is the x86-64 build,
@@ -296,6 +318,35 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "cpu         : avx2 {}",
+        if std::arch::is_x86_feature_detected!("avx2") {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    println!("cpu         : {} (the tools build)", std::env::consts::ARCH);
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    {
+        let free = victory_platform::low::free_ranges();
+        match free.first() {
+            None => println!("low memory  : none free below 4 GiB"),
+            Some(lowest) => {
+                let total: usize = free.iter().map(|r| r.len).sum();
+                println!(
+                    "low memory  : {:.2} GiB free below 4 GiB in {} ranges, lowest {:#x}",
+                    total as f64 / (1u64 << 30) as f64,
+                    free.len(),
+                    lowest.start
+                );
+            }
+        }
+    }
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    println!("low memory  : n/a");
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

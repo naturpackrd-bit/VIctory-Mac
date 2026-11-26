@@ -643,6 +643,7 @@ dependencies = [
  "victory-hle",
  "victory-loader",
  "victory-pe",
+ "victory-platform",
  "victory-shader",
  "walkdir",
 ]

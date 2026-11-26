@@ -99,6 +99,16 @@ jobs:
               *) grep -F "needs Windows for now" run.txt ;;
             esac
           done
+      # The x86-64 runtime keeps the low 4 GiB for titles: a one-page
+      # __PAGEZERO, AVX2 seen through Rosetta 2's variable, low memory free.
+      - name: Low memory and AVX2 in the x86-64 build
+        run: |
+          bin=target/x86_64-apple-darwin/debug/victory
+          otool -l $bin | grep -A 3 __PAGEZERO | tee pagezero.txt
+          grep -E 'vmsize 0x0*1000$' pagezero.txt
+          $bin config | tee config2.txt
+          grep -E '^cpu +: avx2 yes' config2.txt
+          grep -E '^low memory +: [3-4]\.[0-9]+ GiB free below 4 GiB' config2.txt
 
   check:
     needs: [clippy, test-default, test-diagnostics, macos]
