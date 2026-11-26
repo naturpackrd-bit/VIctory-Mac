@@ -46,6 +46,7 @@ pub mod prepare;
 pub mod stubs;
 #[cfg(not(windows))]
 pub mod teb;
+pub mod unwind;
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;
