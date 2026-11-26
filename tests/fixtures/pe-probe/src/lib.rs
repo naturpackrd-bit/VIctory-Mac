@@ -6,6 +6,7 @@
 
 mod entry;
 mod faults;
+mod unwind;
 
 use core::arch::asm;
 use core::ffi::c_void;
