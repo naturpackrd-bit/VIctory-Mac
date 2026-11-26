@@ -352,6 +352,45 @@ four tests), `victory-hle` `kernel` (two, title paths above) and `storage`
   and unit-tests it). For M4, two ideas worth keeping: deciding a texture's
   upload at submission time after its staging refresh, and clamping a
   texture array view's mip range to the host copy's levels (`from_base`).
+- TaynanGT/Vice-Tay (2026-11-26, e2d158a): our `main` (c9c932c) plus 924
+  commits, merging several forks' work. Merged here, since the shader
+  translator serves the Metal back end as much as the D3D12 one and Apple
+  GPUs run 32-lane waves as NVIDIA does: `victory-shader` fixes with their
+  unit tests (`ds_bpermute_b32` permutes within each 32-lane half of a
+  wave64, as the ISA says, so such programs run in host waves of 32;
+  `v_mad_legacy_f32`/`v_mac_legacy_f32` fused with their sources' subnormals
+  flushed, as RDNA 2 runs them; `v_fmac_f32`'s VOP3 accumulator modifiers;
+  `v_mul_legacy_f32` taking a denormal as zero; `s_pack_{ll,lh,hh}_b32_b16`;
+  the thread-group info SGPR; a comparison sampler replacing the reduction
+  bits instead of OR-ing them (a minimum sampler became a maximum one); an
+  unmatched `saveexec` no longer ending the scan of a block's sections; a
+  `v_readlane` of a lane a `v_writelane` set in the same block reading what
+  was written; EXEC guards at a join excluding dead lane edges when
+  descriptors are classified; `s_bfm_b32` with literals; a scalar select on
+  a mask's SCC counted as a data use; console threads of a 2-D group given
+  to 32-lane host waves from a group counter, so each is given once (their
+  issue 1243); the loose-LDS last-resort form for console wave64 programs a
+  32-lane host would otherwise refuse (approximate, `VICTORY_WAVE_LDS_LOOSE=0`
+  turns it off); a wave64 program with no 32-lane form refused as
+  unsupported instead of failing at pipeline creation; `TRANSLATOR_VERSION`
+  2, so cached translations are redone. Also `xasync` completing a call
+  without holding its lock during the provider's cleanup and a block begun
+  again as soon as its result shows, and `xgamesave` keeping an older intact
+  save when the newest version's manifest names a blob that is gone (both
+  with tests). Left out: the table-strides root SRV (slot 252, typed d16
+  views through descriptor tables), which needs the D3D12 host to bind it
+  (their `victory-gpu` changes) and is for the Metal host to do in M4; a
+  NaN-to-zero guard on every colour export and typed store (on by default
+  there, with an off switch: a visual workaround that may hide translation
+  bugs, and a cost per export); two title shader digests hard-coded to pick the
+  wave-wide form (game-derived data, against the asset policy); the D3D12
+  renderer changes (35 files: 4 KiB placements except on AMD, descriptor,
+  texture, queue and residency fixes), `lifecycle`, `dstorage` and the
+  Windows `xmem`, none of which runs on macOS or can be run by the user or
+  CI on a GPU; XMA refill made the default in `audio` (a field width also
+  changed, unexplained; audio is M3's); scripted keys from a file in
+  `gameinput` (M3 replaces the input host on macOS); their benchmark
+  documentation and its policy allowance.
 
 ## Memory
 
