@@ -411,10 +411,12 @@ fn rva(base: u64, rva: i32) -> u64 {
 unsafe fn parse_fh3(base: u64, at: u64) -> Option<FuncInfo> {
     // SAFETY: the caller's tables, here and below.
     let fi: FuncInfo3 = unsafe { read(at) };
-    if !(EH_MAGIC_NUMBER1..=EH_MAGIC_NUMBER3).contains(&fi.magic_number) {
+    // The top three bits are `bbtFlags`, set by a BBT-processed binary.
+    let magic = fi.magic_number & 0x1FFF_FFFF;
+    if !(EH_MAGIC_NUMBER1..=EH_MAGIC_NUMBER3).contains(&magic) {
         return None;
     }
-    let flags = if fi.magic_number >= EH_MAGIC_NUMBER3 {
+    let flags = if magic >= EH_MAGIC_NUMBER3 {
         fi.eh_flags
     } else {
         0
@@ -1023,10 +1025,10 @@ pub(crate) fn type_matches(
     if adjectives & HT_IS_BAD_ALLOC_COMPAT != 0 && ct_properties & CT_IS_STD_BAD_ALLOC != 0 {
         return true;
     }
+    // A `catch (void*)` has no rule of its own: the compiler lists `.PEAX`
+    // among the catchable types of a thrown object pointer.
     let name = name.unwrap_or_default();
-    let void_pointer =
-        name == b".PEAX" && ct_properties & CT_IS_SIMPLE_TYPE != 0 && ct_name.starts_with(b".P");
-    if name != ct_name && !void_pointer {
+    if name != ct_name {
         return false;
     }
     let held = |ti: u32, ht: u32| ti_attributes & ti == 0 || adjectives & ht != 0;
@@ -1307,8 +1309,9 @@ unsafe extern "sysv64" fn cxx_throw(
         match current {
             Some(r) if is_cxx(&r) => record.information[..4].copy_from_slice(&r.information[..4]),
             Some(mut foreign) => {
-                // A foreign exception caught by `catch(...)`: raised again.
-                PROCESSING_THROW.with(|p| p.set(p.get() + 1));
+                // A foreign exception caught by `catch(...)`: raised again. It
+                // is not a C++ exception, so it does not count as one being
+                // thrown (no catch of it would count it down).
                 raise_from(&mut foreign, ctx)
             }
             None => terminate_because("`throw;` with no exception being handled"),
@@ -1659,6 +1662,14 @@ extern "win64" fn run_catch(catch: *mut Catch) -> u64 {
     let handling = push_handling(catch.record, catch.context);
     if cxx {
         PROCESSING_THROW.with(|p| p.set((p.get() - 1).max(0)));
+    }
+    if catch.unwind_help != 0 {
+        // The target unwind brought the frame to the try's state, which its
+        // ip says from here on: a throw inside the funclet that the same
+        // frame catches must unwind from the ip's state, not the slot's
+        // stale one (vcruntime refreshes the slot during its search).
+        // SAFETY: the frame's slot.
+        unsafe { write(catch.unwind_help, UNWIND_HELP_UNSET) };
     }
     RUNNING.with(|r| r.set(r.get() + 1));
     // SAFETY: the title's catch funclet, given its frame.
@@ -2159,10 +2170,11 @@ mod tests {
             "an empty name"
         );
         assert!(type_matches(HT_IS_STD_DOT_DOT, int, simple, b".M", 0));
-        // `void*` takes simple pointers.
-        assert!(type_matches(0, Some(b".PEAX"), simple, b".PEAD", 0));
+        // `void*` has no rule of its own: the compiler lists `.PEAX` among
+        // a thrown object pointer's catchable types.
+        assert!(type_matches(0, Some(b".PEAX"), simple, b".PEAX", 0));
+        assert!(!type_matches(0, Some(b".PEAX"), simple, b".PEAD", 0));
         assert!(!type_matches(0, Some(b".PEAX"), simple, b".H", 0));
-        assert!(!type_matches(0, Some(b".PEAX"), 0, b".PEAD", 0));
         // A const pointer is not caught by a handler that drops the const.
         assert!(!type_matches(
             0,

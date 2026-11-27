@@ -1377,8 +1377,11 @@ pub unsafe extern "win64" fn __C_specific_handler(
             if !holds(&s, pc) {
                 continue;
             }
-            if holds(&s, dc.target_ip) {
-                break; // the target lies in this scope: nothing more to run
+            // The target lies in this scope: nothing more to run. Only in
+            // the target frame: another frame of the same function (a
+            // recursion) has scopes holding that address too.
+            if flags & EXCEPTION_TARGET_UNWIND != 0 && holds(&s, dc.target_ip) {
+                break;
             }
             if s.target != 0 {
                 continue; // an `__except`

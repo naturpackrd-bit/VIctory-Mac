@@ -513,11 +513,15 @@ pub fn virtual_unwind(
         machine_frame |= parent.apply(ctx, None)?;
         info = &parent;
     }
-    let handler = if in_body && primary.flags & (FLAG_EHANDLER | FLAG_UHANDLER) != 0 {
+    // The handler is the primary's (the last info of the chain): a chained
+    // fragment (a shrink-wrapped save, a cold part) has none of its own, and
+    // Windows' `RtlVirtualUnwind` reports the function's. Whether the pc is
+    // in a prologue or epilogue is the fragment's own business, above.
+    let handler = if in_body && info.flags & (FLAG_EHANDLER | FLAG_UHANDLER) != 0 {
         Some(Handler {
-            flags: primary.flags & 3,
-            address: base + u64::from(read_u32(primary.tail)?),
-            data: primary.tail + 4,
+            flags: info.flags & 3,
+            address: base + u64::from(read_u32(info.tail)?),
+            data: info.tail + 4,
         })
     } else {
         None
@@ -801,9 +805,12 @@ mod tests {
         assert_eq!(ctx.rbx, 0x1111);
         assert_eq!(ctx.rsp, start + 8 + 0x20 + 8);
         assert_eq!(ctx.rip, 0x4000_4321);
-        // The handler is that of the entry rip was found in, and a chained
-        // entry has none: the parent's is not reported.
-        assert_eq!(unwound.handler, None);
+        // A chained entry has no handler of its own: the parent's (the
+        // function's) is reported, as Windows reports it.
+        assert_eq!(
+            unwound.handler.map(|h| (h.flags, h.address)),
+            Some((FLAG_EHANDLER, image.base() + 0x3000))
+        );
     }
 
     #[test]

@@ -214,7 +214,17 @@ the milestone that replaces it.
   by hand, never a compiler's output (the first title throw will tell); an
   exception cannot leave a catch funclet or a destructor run during an
   unwind (our own frames lie between, without unwind data), so such a throw
-  ends the process through `terminate` with a message; the `_set_se_translator`
+  ends the process through `terminate` with a message (a destructor
+  throwing during an unwind outside any catch reaches the unhandled filter
+  instead, so the UCRT's filter terminates, or a crash report follows); for
+  the same reason a title exception cannot cross one of our callbacks (a
+  `qsort` comparator, a thread procedure, a TLS callback, a `DllMain`, a
+  window procedure, an `atexit` function): it is unhandled there even when
+  a title frame above us would catch it; `std::uncaught_exceptions` stays
+  raised after an `__except` takes a C++ exception; a catch funclet left by
+  `longjmp` or `ExitThread` leaves the exception marked as being handled on
+  that thread; the tables' RVAs and counts are trusted (a corrupt table
+  faults in our code); the `_set_se_translator`
   translator is stored and never called; a `noexcept` function terminates
   when the unwind reaches it, not during the search; `longjmp`
   ignores the frame, so `__finally` blocks between are not run;
