@@ -522,6 +522,16 @@ impl LoaderLock {
     }
 }
 
+/// The loader lock of the title's process: held while a `DllMain` runs
+/// (start-up and late loads) and while a thread's start or end is told to
+/// the images, as Windows holds its own, so a thread starting during an
+/// initialisation waits for it.
+#[cfg(not(windows))]
+static LOADER_LOCK: LoaderLock = LoaderLock {
+    owner: std::sync::Mutex::new((None, 0)),
+    free: std::sync::Condvar::new(),
+};
+
 #[cfg(test)]
 mod absent_tests {
     use super::absent_title_dlls;
@@ -766,17 +776,17 @@ pub fn run(
     let images = Images {
         exe: exe_image,
         dlls: dlls.clone(),
+        attached: std::collections::HashSet::new(),
     };
     if IMAGES.set(std::sync::Mutex::new(images)).is_err() {
         anyhow::bail!("a title was mapped already");
     }
     victory_hle::modules::win32::threads::set_thread_notifier(notify_images);
     victory_hle::runtime::set_export_lookup(lookup);
-    let lock = LoaderLock::default();
     let late_dir = title_dir.to_owned();
     let late_hle = HleResolver::new(hle.host.clone());
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
-        late_load(file, &lock, &late_dir, &late_hle, policy).map_err(|e| format!("{e:#}"))
+        late_load(file, &LOADER_LOCK, &late_dir, &late_hle, policy).map_err(|e| format!("{e:#}"))
     }));
 
     if !execute {
@@ -792,14 +802,22 @@ pub fn run(
         .spawn(move || -> Result<u32> {
             use victory_loader::DLL_PROCESS_ATTACH;
             victory_loader::teb::attach_current_thread();
-            for (name, dll) in &dlls {
-                dll.notify(DLL_PROCESS_ATTACH)
-                    .map_err(|e| anyhow::anyhow!("{name}'s DllMain refused: {e}"))?;
-            }
-            // The executable's TLS callbacks; its entry point runs below.
-            exe_image
-                .notify(DLL_PROCESS_ATTACH)
-                .map_err(|e| anyhow::anyhow!("{}'s TLS callbacks failed: {e}", exe_image.name()))?;
+            // Under the loader lock, as Windows initialises: a thread a
+            // `DllMain` starts waits to be told of itself until every image
+            // is initialised, and only initialised images hear of it.
+            LOADER_LOCK.hold(|| -> Result<()> {
+                for (name, dll) in &dlls {
+                    dll.notify(DLL_PROCESS_ATTACH)
+                        .map_err(|e| anyhow::anyhow!("{name}'s DllMain refused: {e}"))?;
+                    mark_attached(dll.base());
+                }
+                // The executable's TLS callbacks; its entry point runs below.
+                exe_image.notify(DLL_PROCESS_ATTACH).map_err(|e| {
+                    anyhow::anyhow!("{}'s TLS callbacks failed: {e}", exe_image.name())
+                })?;
+                mark_attached(exe_image.base());
+                Ok(())
+            })?;
             let entry = exe_image
                 .entry_point()
                 .ok_or_else(|| anyhow::anyhow!("the executable has no entry point"))?;
@@ -826,6 +844,17 @@ struct Images {
     exe: &'static MappedImage,
     /// In the order they were mapped: each after the DLLs it imports.
     dlls: Vec<(String, &'static MappedImage)>,
+    /// The bases of the images whose `DLL_PROCESS_ATTACH` has run: the ones
+    /// told of threads.
+    attached: std::collections::HashSet<usize>,
+}
+
+/// Notes that the image at `base` has had its `DLL_PROCESS_ATTACH`.
+#[cfg(not(windows))]
+fn mark_attached(base: usize) {
+    if let Some(mut images) = images() {
+        images.attached.insert(base);
+    }
 }
 
 #[cfg(not(windows))]
@@ -862,24 +891,29 @@ fn title_path(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("G:\\{name}"))
 }
 
-/// Tells every image of a thread's start or end (`DLL_THREAD_*`), the DLLs
-/// in order and then the executable. The list is read first, so that the
-/// lock is not held while title code runs.
+/// Tells every initialised image of a thread's start or end
+/// (`DLL_THREAD_*`), the DLLs in order and then the executable, under the
+/// loader lock (a thread started by a `DllMain` waits for the
+/// initialisation to end, as on Windows). The list is read first, so that
+/// the images' lock is not held while title code runs.
 #[cfg(not(windows))]
 fn notify_images(reason: u32) {
-    let Some(list) = images().map(|images| {
-        images
-            .all()
-            .map(|(name, image)| (name.to_owned(), image))
-            .collect::<Vec<_>>()
-    }) else {
-        return;
-    };
-    for (name, image) in list {
-        if let Err(error) = image.notify(reason) {
-            tracing::warn!(image = name, reason, %error, "notifying a title image failed");
+    LOADER_LOCK.hold(|| {
+        let Some(list) = images().map(|images| {
+            images
+                .all()
+                .filter(|(_, image)| images.attached.contains(&image.base()))
+                .map(|(name, image)| (name.to_owned(), image))
+                .collect::<Vec<_>>()
+        }) else {
+            return;
+        };
+        for (name, image) in list {
+            if let Err(error) = image.notify(reason) {
+                tracing::warn!(image = name, reason, %error, "notifying a title image failed");
+            }
         }
-    }
+    });
 }
 
 /// `GetProcAddress` of a title image: its export `name`.
@@ -920,6 +954,15 @@ fn map_dll(
     visiting: &mut Vec<String>,
 ) -> Result<()> {
     if mapped.iter().any(|(m, _)| m.eq_ignore_ascii_case(name)) {
+        return Ok(());
+    }
+    // A DLL importing from the executable: the executable is mapped once,
+    // after its DLLs, never as a second copy here (the import gets a stub).
+    if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+        tracing::warn!(
+            dll = name,
+            "a title DLL imports from the executable: unresolved"
+        );
         return Ok(());
     }
     if visiting.iter().any(|v| v.eq_ignore_ascii_case(name)) {
@@ -1104,9 +1147,13 @@ fn late_load(
                 dll.base()
             );
         }
+        // The loading thread's TLS blocks for the new DLLs, before their
+        // `DllMain`s (which may use them) run on it.
+        victory_loader::teb::attach_current_thread();
         for (name, dll) in &new {
             dll.notify(victory_loader::DLL_PROCESS_ATTACH)
                 .map_err(|e| anyhow::anyhow!("{name}'s DllMain refused: {e}"))?;
+            mark_attached(dll.base());
         }
         Ok(new
             .iter()

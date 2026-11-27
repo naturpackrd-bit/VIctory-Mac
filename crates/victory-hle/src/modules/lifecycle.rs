@@ -313,6 +313,9 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     // Not on the calling thread: titles hand the suspend to their window
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
+        // The routines are title code: a TEB for its `gs:` accesses.
+        #[cfg(not(windows))]
+        victory_loader::teb::attach_current_thread();
         constrain_then_suspend(&constrain, &suspend);
         // A title that leaves through its message loop gets its chance.
         #[cfg(not(windows))]
@@ -320,6 +323,8 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
         finish("title suspended");
     });
     std::thread::spawn(move || {
+        #[cfg(not(windows))]
+        victory_loader::teb::attach_current_thread();
         std::thread::sleep(SUSPEND_DEADLINE);
         late("title did not finish suspending in time");
     });

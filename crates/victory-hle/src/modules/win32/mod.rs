@@ -10,6 +10,7 @@ pub mod handles;
 pub mod locale;
 pub mod memory;
 pub mod pipes;
+pub mod process;
 pub mod sync;
 pub mod threads;
 pub mod time;
@@ -27,6 +28,7 @@ pub(crate) fn module() -> HleModule {
     exports.extend(exceptions::exports());
     exports.extend(pipes::exports());
     exports.extend(locale::exports());
+    exports.extend(process::exports());
     HleModule {
         name: "win32",
         dlls: &[

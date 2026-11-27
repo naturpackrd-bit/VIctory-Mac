@@ -361,7 +361,6 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
         lock(&THREADS).insert(state.id, object.clone());
         object.cv.notify_all();
     }
-    notify(DLL_THREAD_ATTACH);
     {
         let mut state = lock(&object.state);
         while state.suspend_count > 0 {
@@ -372,6 +371,9 @@ extern "C" fn thread_main(arg: *mut c_void) -> *mut c_void {
         }
         state.running = true;
     }
+    // Only once resumed, as on Windows (a suspended thread has not started
+    // for the images).
+    notify(DLL_THREAD_ATTACH);
     let code = run_on_this_thread(start, parameter);
     finish(code);
     std::ptr::null_mut()
@@ -417,8 +419,11 @@ fn thread_or_error(handle: HANDLE) -> Option<Arc<ThreadObject>> {
 }
 
 /// A new thread running `start(parameter)`; with `CREATE_SUSPENDED` it waits
-/// for `ResumeThread`. `STACK_SIZE_PARAM_IS_A_RESERVATION` is ignored: the
-/// size is always the reservation.
+/// for `ResumeThread`. The size is the stack's reservation with
+/// `STACK_SIZE_PARAM_IS_A_RESERVATION`; without it, as on Windows, it is the
+/// initial commit and the reservation is the image's (`SizeOfStackReserve`,
+/// 1 MiB when unknown) or the commit rounded up to 1 MiB, whichever is
+/// larger (a `_beginthreadex(..., 64 KiB, ...)` thread gets a megabyte).
 pub extern "win64" fn CreateThread(
     _attributes: *mut c_void,
     stack_size: SIZE_T,
@@ -431,9 +436,12 @@ pub extern "win64" fn CreateThread(
         set_last_error(ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
+    const STACK_SIZE_PARAM_IS_A_RESERVATION: u32 = 0x10000;
+    let default = DEFAULT_STACK_SIZE.load(Ordering::Relaxed);
     let reserve = match stack_size {
-        0 => DEFAULT_STACK_SIZE.load(Ordering::Relaxed),
-        n => n,
+        0 => default,
+        n if flags & STACK_SIZE_PARAM_IS_A_RESERVATION != 0 => n,
+        commit => default.max(commit.checked_next_multiple_of(1 << 20).unwrap_or(commit)),
     };
     // The title's size, in whole granules, and one more for our own frames.
     let Some(stack) = reserve

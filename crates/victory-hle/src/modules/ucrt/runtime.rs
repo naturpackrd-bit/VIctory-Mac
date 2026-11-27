@@ -274,7 +274,26 @@ pub(crate) fn run_exit_hooks() {
     if EXIT_HOOKS_RAN.swap(true, Ordering::AcqRel) {
         return;
     }
+    // The executable's thread-local destructors first, as the UCRT's exit
+    // runs them: the callback MSVC's start-up registered, called as a TLS
+    // callback is for the process's end.
+    let callback = THREAD_LOCAL_EXIT_CALLBACK.load(Ordering::Acquire);
+    if callback != 0 {
+        type Callback = extern "win64" fn(*mut c_void, u32, *mut c_void);
+        // SAFETY: the title's `__dyn_tls_dtor_callback`, as registered.
+        let callback: Callback = unsafe { std::mem::transmute::<usize, Callback>(callback) };
+        callback(std::ptr::null_mut(), 0, std::ptr::null_mut());
+    }
     run_reversed(&ATEXIT);
+}
+
+static THREAD_LOCAL_EXIT_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// MSVC's start-up registers the callback that runs the executable's
+/// thread-local destructors at exit (`__dyn_tls_dtor_callback`); `exit`
+/// calls it with `DLL_PROCESS_DETACH` before the `atexit` functions.
+pub extern "win64" fn _register_thread_local_exe_atexit_callback(callback: usize) {
+    THREAD_LOCAL_EXIT_CALLBACK.store(callback, Ordering::Release);
 }
 
 /// Runs the exit hooks without ending the process.
@@ -450,15 +469,37 @@ fn arguments() -> Vec<String> {
 
 /// Arguments joined by spaces into a command line, each one with a space in
 /// it quoted.
+/// The arguments as one command line, quoted as `CommandLineToArgvW` (and
+/// the C runtime's parser) read it back: an argument with a space, a tab, a
+/// quote or nothing in it is quoted; inside, a quote becomes `\"` and the
+/// backslashes before a quote or the closing quote are doubled.
 fn command_line(arguments: &[String]) -> String {
     arguments
         .iter()
         .map(|a| {
-            if a.contains(' ') || a.contains('\t') {
-                format!("\"{a}\"")
-            } else {
-                a.clone()
+            if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+                return a.clone();
             }
+            let mut quoted = String::from('"');
+            let mut backslashes = 0;
+            for c in a.chars() {
+                match c {
+                    '\\' => backslashes += 1,
+                    '"' => {
+                        quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                        backslashes = 0;
+                        quoted.push('"');
+                    }
+                    other => {
+                        quoted.extend(std::iter::repeat_n('\\', backslashes));
+                        backslashes = 0;
+                        quoted.push(other);
+                    }
+                }
+            }
+            quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+            quoted.push('"');
+            quoted
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -1884,6 +1925,7 @@ pub(crate) fn exports() -> Vec<HleExport> {
         hle_export!(_register_onexit_function),
         hle_export!(_execute_onexit_table),
         hle_export!(_crt_atexit),
+        hle_export!(_register_thread_local_exe_atexit_callback),
         hle_export!(_crt_at_quick_exit),
         hle_export!(_cexit),
         hle_export!(_c_exit),
@@ -2384,6 +2426,15 @@ mod tests {
         // SAFETY: as above.
         assert!(!unsafe { *__p___wargv() }.is_null());
         assert_eq!(command_line(&["a b".into(), "c".into()]), "\"a b\" c");
+        assert_eq!(
+            command_line(&[
+                r#"say "hi""#.into(),
+                String::new(),
+                r"C:\dir\".into(),
+                r"x\ y".into()
+            ]),
+            r#""say \"hi\"" "" C:\dir\ "x\ y""#
+        );
         // SAFETY: the pointer `__p__pgmptr` made.
         let path = unsafe { CStr::from_ptr(*__p__pgmptr()) };
         assert!(path.to_str().is_ok_and(|p| p.starts_with(r"C:\title\")));
@@ -2391,6 +2442,6 @@ mod tests {
 
     #[test]
     fn every_export_is_listed() {
-        assert_eq!(exports().len(), 105);
+        assert_eq!(exports().len(), 106);
     }
 }

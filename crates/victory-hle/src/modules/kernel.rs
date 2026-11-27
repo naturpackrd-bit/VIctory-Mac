@@ -383,11 +383,14 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 }
 
 /// Off Windows, where the host has none: logged like [`exit`], then the
-/// process ends with `code`.
+/// process ends with `code`. As on Windows, no `atexit` function runs
+/// (titles call this to skip their static destructors; `exit` runs them);
+/// the C streams are flushed, as the C runtime's detach does.
 #[cfg(not(windows))]
 pub extern "win64" fn ExitProcess(code: u32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits the process");
-    host::exit(code as i32)
+    crate::modules::ucrt::stdio::_flushall();
+    std::process::exit(code as i32)
 }
 
 /// See [`exit`]; only the current process is logged.
@@ -497,11 +500,26 @@ fn title_argv(program: &str, args: &[String]) -> TitleArgv {
 fn argv() -> &'static TitleArgv {
     static ARGV: std::sync::OnceLock<TitleArgv> = std::sync::OnceLock::new();
     ARGV.get_or_init(|| {
-        // The program's name stays what the host says (as it was before).
-        let program = std::env::args_os().next().unwrap_or_default();
+        let host = || {
+            std::env::args_os()
+                .next()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        // On Windows the program's name is the host's, as before; off it the
+        // title's own path (`G:\game.exe`, as `__wargv[0]` and `_pgmptr`
+        // give it), so that a title finding its folder from `argv[0]` finds
+        // a drive we mount.
+        #[cfg(windows)]
+        let program = host();
+        #[cfg(not(windows))]
+        let program = runtime::main_image()
+            .and_then(runtime::image_path)
+            .map_or_else(host, |p| p.to_string_lossy().into_owned());
         let args = runtime::title_args();
         tracing::info!(?args, "the title's arguments");
-        title_argv(&program.to_string_lossy(), args)
+        title_argv(&program, args)
     })
 }
 
