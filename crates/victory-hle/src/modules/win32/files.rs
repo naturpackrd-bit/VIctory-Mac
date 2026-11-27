@@ -111,6 +111,11 @@ const INVALID_FILE_SIZE: u32 = u32::MAX;
 const FILE_TYPE_UNKNOWN: u32 = 0;
 const FILE_TYPE_DISK: u32 = 1;
 const FILE_TYPE_CHAR: u32 = 2;
+const FILE_TYPE_PIPE: u32 = 3;
+/// A pipe read with no writer left, as Windows reports it.
+const ERROR_BROKEN_PIPE: u32 = 109;
+/// A pipe written with no reader left.
+const ERROR_NO_DATA: u32 = 232;
 
 const FILE_BASIC_INFO: i32 = 0;
 const FILE_STANDARD_INFO: i32 = 1;
@@ -525,6 +530,14 @@ enum Kind {
     /// The `NUL` device: reads nothing, swallows writes.
     Null,
     Std(StdStream),
+    /// An end of an anonymous pipe (`CreatePipe`).
+    Pipe(PipeEnd),
+}
+
+/// Which end of a pipe a handle is.
+enum PipeEnd {
+    Reader(io::PipeReader),
+    Writer(io::PipeWriter),
 }
 
 /// A file handle's object (kind "file").
@@ -568,7 +581,13 @@ impl FileObject {
                 Ok(done)
             }
             Kind::Null | Kind::Std(StdStream::In) => Ok(0),
-            Kind::Directory { .. } | Kind::Std(_) => Err(ERROR_ACCESS_DENIED),
+            // What is there, at least a byte; none with no writer left.
+            Kind::Pipe(PipeEnd::Reader(pipe)) => match io::Read::read(&mut &*pipe, buffer) {
+                Ok(0) if !buffer.is_empty() => Err(ERROR_BROKEN_PIPE),
+                Ok(n) => Ok(n),
+                Err(e) => Err(io_error(&e)),
+            },
+            Kind::Directory { .. } | Kind::Std(_) | Kind::Pipe(_) => Err(ERROR_ACCESS_DENIED),
         }
     }
 
@@ -608,7 +627,14 @@ impl FileObject {
                 io::stderr().write_all(buffer).map_err(|e| io_error(&e))?;
                 Ok(buffer.len())
             }
-            Kind::Directory { .. } | Kind::Std(StdStream::In) => Err(ERROR_ACCESS_DENIED),
+            Kind::Pipe(PipeEnd::Writer(pipe)) => match (&*pipe).write_all(buffer) {
+                Ok(()) => Ok(buffer.len()),
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Err(ERROR_NO_DATA),
+                Err(e) => Err(io_error(&e)),
+            },
+            Kind::Directory { .. } | Kind::Std(StdStream::In) | Kind::Pipe(_) => {
+                Err(ERROR_ACCESS_DENIED)
+            }
         }
     }
 
@@ -617,7 +643,7 @@ impl FileObject {
         match &self.kind {
             Kind::File { file, .. } => file.metadata().map_err(|e| io_error(&e)),
             Kind::Directory { path, .. } => fs::metadata(path).map_err(|e| io_error(&e)),
-            Kind::Null | Kind::Std(_) => Err(ERROR_INVALID_FUNCTION),
+            Kind::Null | Kind::Std(_) | Kind::Pipe(_) => Err(ERROR_INVALID_FUNCTION),
         }
     }
 
@@ -626,6 +652,7 @@ impl FileObject {
         match &self.kind {
             Kind::File { .. } | Kind::Directory { .. } => Ok(self.metadata()?.len()),
             Kind::Null | Kind::Std(_) => Ok(0),
+            Kind::Pipe(_) => Err(ERROR_INVALID_FUNCTION),
         }
     }
 
@@ -638,7 +665,7 @@ impl FileObject {
             | Kind::Directory {
                 delete_on_close, ..
             } => Some(delete_on_close),
-            Kind::Null | Kind::Std(_) => None,
+            Kind::Null | Kind::Std(_) | Kind::Pipe(_) => None,
         }
     }
 }
@@ -1099,6 +1126,9 @@ pub extern "win64" fn WriteFileEx(
 /// position.
 fn seek(handle: HANDLE, distance: i64, method: u32) -> Result<u64, u32> {
     with_file(handle, |object| {
+        if matches!(object.kind, Kind::Pipe(_)) {
+            return Err(ERROR_INVALID_FUNCTION);
+        }
         let base = match method {
             FILE_BEGIN => 0,
             FILE_CURRENT => object.position.load(Ordering::Relaxed),
@@ -1193,6 +1223,7 @@ pub extern "win64" fn GetFileType(handle: HANDLE) -> DWORD {
         Ok(match object.kind {
             Kind::File { .. } | Kind::Directory { .. } => FILE_TYPE_DISK,
             Kind::Null | Kind::Std(_) => FILE_TYPE_CHAR,
+            Kind::Pipe(_) => FILE_TYPE_PIPE,
         })
     });
     kind.unwrap_or_else(|code| fail(code, FILE_TYPE_UNKNOWN))
@@ -1215,7 +1246,7 @@ pub extern "win64" fn SetEndOfFile(handle: HANDLE) -> BOOL {
         }
         Kind::Null => Ok(()),
         Kind::Directory { .. } => Err(ERROR_ACCESS_DENIED),
-        Kind::Std(_) => Err(ERROR_INVALID_FUNCTION),
+        Kind::Std(_) | Kind::Pipe(_) => Err(ERROR_INVALID_FUNCTION),
     }))
 }
 
@@ -1560,7 +1591,7 @@ pub extern "win64" fn GetFinalPathNameByHandleW(
 ) -> DWORD {
     let path = with_file(handle, |object| match object.kind {
         Kind::File { .. } | Kind::Directory { .. } => Ok(format!(r"\\?\{}", object.windows_path)),
-        Kind::Null | Kind::Std(_) => Err(ERROR_INVALID_FUNCTION),
+        Kind::Null | Kind::Std(_) | Kind::Pipe(_) => Err(ERROR_INVALID_FUNCTION),
     });
     match path {
         Ok(path) => copy_out(&path, buffer, len),
@@ -2226,6 +2257,17 @@ pub extern "win64" fn FindClose(handle: HANDLE) -> BOOL {
 }
 
 // The console.
+
+/// A new anonymous pipe's read and write handles (`CreatePipe`).
+pub(crate) fn create_pipe() -> Result<(usize, usize), u32> {
+    let (reader, writer) = io::pipe().map_err(|e| io_error(&e))?;
+    let end = |end, name: &str| {
+        let object = FileObject::new(Kind::Pipe(end), name.to_owned());
+        handles::insert(Arc::new(object))
+    };
+    let read = end(PipeEnd::Reader(reader), r"\\.\pipe\anonymous");
+    Ok((read, end(PipeEnd::Writer(writer), r"\\.\pipe\anonymous")))
+}
 
 /// The handles of the standard streams: made, and put in the table, once.
 fn std_handles() -> &'static [usize; 3] {

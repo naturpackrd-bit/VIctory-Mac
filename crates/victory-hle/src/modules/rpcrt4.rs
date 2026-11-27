@@ -20,7 +20,7 @@ const OUT_OF_MEMORY: i32 = 14;
 
 /// A version 4 GUID: 16 random bytes, the version nibble and the variant
 /// bits set.
-extern "win64" fn UuidCreate(uuid: *mut Guid) -> i32 {
+pub(crate) extern "win64" fn UuidCreate(uuid: *mut Guid) -> i32 {
     create(uuid, false)
 }
 

@@ -28,6 +28,60 @@ pub extern "win64" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
+/// Off Windows, where the host has none: the module `name` names (as
+/// [`GetModuleHandleW`]), or with `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`
+/// the image holding the address `name` is. Reference counts are not kept:
+/// title images stay loaded.
+#[cfg(not(windows))]
+pub extern "win64" fn GetModuleHandleExW(
+    flags: u32,
+    name: *const u16,
+    out: *mut *mut c_void,
+) -> i32 {
+    module_handle_ex(flags, name.cast(), out, || GetModuleHandleW(name))
+}
+
+/// See [`GetModuleHandleExW`].
+#[cfg(not(windows))]
+pub extern "win64" fn GetModuleHandleExA(
+    flags: u32,
+    name: *const u8,
+    out: *mut *mut c_void,
+) -> i32 {
+    module_handle_ex(flags, name.cast(), out, || GetModuleHandleA(name))
+}
+
+/// `GetModuleHandleEx`'s body; `by_name` looks the name up.
+#[cfg(not(windows))]
+fn module_handle_ex(
+    flags: u32,
+    name: *const c_void,
+    out: *mut *mut c_void,
+    by_name: impl FnOnce() -> *mut c_void,
+) -> i32 {
+    use crate::modules::win32::handles::{ERROR_INVALID_PARAMETER, set_last_error};
+    const PIN: u32 = 1;
+    const UNCHANGED_REFCOUNT: u32 = 2;
+    const FROM_ADDRESS: u32 = 4;
+    if out.is_null() || flags & (PIN | UNCHANGED_REFCOUNT) == PIN | UNCHANGED_REFCOUNT {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let module = if flags & FROM_ADDRESS != 0 {
+        victory_loader::images::find(name as usize)
+            .map_or(std::ptr::null_mut(), |image| image.base as *mut c_void)
+    } else {
+        by_name()
+    };
+    // SAFETY: checked non-null; the title's output.
+    unsafe { out.write(module) };
+    if module.is_null() {
+        set_last_error(ERROR_MOD_NOT_FOUND);
+        return 0;
+    }
+    1
+}
+
 /// A NUL-terminated string from the title.
 fn narrow(text: *const u8) -> String {
     // SAFETY: the title passes a NUL-terminated string.
@@ -515,6 +569,10 @@ pub(crate) fn module() -> HleModule {
             hle_export!(SetThreadPriority),
             #[cfg(not(windows))]
             hle_export!(ExitProcess),
+            #[cfg(not(windows))]
+            hle_export!(GetModuleHandleExW),
+            #[cfg(not(windows))]
+            hle_export!(GetModuleHandleExA),
         ],
     }
 }
@@ -872,6 +930,32 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    /// By name, as `GetModuleHandleW`; the address form needs a mapped
+    /// image, which only the loader registers.
+    #[cfg(not(windows))]
+    #[test]
+    fn module_handles_by_name_off_windows() {
+        use crate::modules::win32::handles::last_error;
+        victory_loader::teb::attach_current_thread();
+        let base = 0x7400_0000_0000usize;
+        runtime::set_image_path(base, std::path::Path::new(r"C:\title\Extra.dll"));
+        let mut out = std::ptr::null_mut();
+        assert_eq!(GetModuleHandleExW(0, w("extra.dll").as_ptr(), &mut out), 1);
+        assert_eq!(out as usize, base);
+        assert_eq!(GetModuleHandleExA(2, c"EXTRA".as_ptr().cast(), &mut out), 1);
+        assert_eq!(out as usize, base);
+        assert_eq!(GetModuleHandleExW(4, 0x10 as *const u16, &mut out), 0);
+        assert_eq!(
+            (out, last_error()),
+            (std::ptr::null_mut(), ERROR_MOD_NOT_FOUND)
+        );
+        assert_eq!(
+            GetModuleHandleExW(0, w("extra.dll").as_ptr(), std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(last_error(), 87);
     }
 
     /// No buffer: nothing written, the error says it was too small.

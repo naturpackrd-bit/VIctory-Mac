@@ -10,6 +10,10 @@
 
 pub mod apu;
 pub mod audio;
+#[cfg(not(windows))]
+pub mod bcrypt;
+#[cfg(not(windows))]
+pub mod com;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
@@ -26,6 +30,10 @@ pub mod net;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
+#[cfg(not(windows))]
+pub mod wer;
+#[cfg(not(windows))]
+pub mod window;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
@@ -73,6 +81,14 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(msvcp::module());
     #[cfg(not(windows))]
     all.push(ucrt::module());
+    #[cfg(not(windows))]
+    all.push(bcrypt::module());
+    #[cfg(not(windows))]
+    all.push(com::module());
+    #[cfg(not(windows))]
+    all.push(wer::module());
+    #[cfg(not(windows))]
+    all.push(window::module());
     #[cfg(not(windows))]
     all.push(win32::module());
     all

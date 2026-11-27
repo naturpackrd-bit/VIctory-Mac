@@ -157,59 +157,6 @@ pub extern "win64" fn CreateWindowExA(
     hwnd
 }
 
-/// Stands for the title's window off Windows: never null, never a host
-/// handle.
-#[cfg(not(windows))]
-static WINDOW: u8 = 0;
-
-/// Off Windows, a stand-in window handle ([`WINDOW`]'s address); nothing
-/// is created or recorded. The window arrives with M3's SDL3 work.
-#[cfg(not(windows))]
-pub extern "win64" fn CreateWindowExW(
-    _ex_style: u32,
-    _class: *const u16,
-    _name: *const u16,
-    _style: u32,
-    _x: i32,
-    _y: i32,
-    _width: i32,
-    _height: i32,
-    _parent: *mut c_void,
-    _menu: *mut c_void,
-    _instance: *mut c_void,
-    _param: *const c_void,
-) -> *mut c_void {
-    stand_in_window()
-}
-
-/// See [`CreateWindowExW`].
-#[cfg(not(windows))]
-pub extern "win64" fn CreateWindowExA(
-    _ex_style: u32,
-    _class: *const u8,
-    _name: *const u8,
-    _style: u32,
-    _x: i32,
-    _y: i32,
-    _width: i32,
-    _height: i32,
-    _parent: *mut c_void,
-    _menu: *mut c_void,
-    _instance: *mut c_void,
-    _param: *const c_void,
-) -> *mut c_void {
-    stand_in_window()
-}
-
-#[cfg(not(windows))]
-fn stand_in_window() -> *mut c_void {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!("no window off Windows yet (M3): a stand-in handle");
-    }
-    (&raw const WINDOW).cast_mut().cast()
-}
-
 /// A console title sizes its window to its render target (
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
@@ -367,6 +314,9 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
         constrain_then_suspend(&constrain, &suspend);
+        // A title that leaves through its message loop gets its chance.
+        #[cfg(not(windows))]
+        crate::modules::window::post_close_all();
         finish("title suspended");
     });
     std::thread::spawn(move || {
@@ -504,16 +454,22 @@ fn end() {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "lifecycle",
+        // Off Windows `window` serves the window API set.
+        #[cfg(windows)]
         dlls: &[
             "api-ms-win-core-psm-appnotify-*",
             "ext-ms-win-rtcore-ntuser-window-*",
         ],
+        #[cfg(not(windows))]
+        dlls: &["api-ms-win-core-psm-appnotify-*"],
         exports: vec![
             hle_export!(RegisterAppStateChangeNotification),
             hle_export!(UnregisterAppStateChangeNotification),
             hle_export!(RegisterAppConstrainedChangeNotification),
             hle_export!(UnregisterAppConstrainedChangeNotification),
+            #[cfg(windows)]
             hle_export!(CreateWindowExW),
+            #[cfg(windows)]
             hle_export!(CreateWindowExA),
         ],
     }
