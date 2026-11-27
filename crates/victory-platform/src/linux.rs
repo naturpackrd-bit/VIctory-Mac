@@ -82,24 +82,59 @@ impl Memory for Host {
     }
 }
 
+/// The soft `RLIMIT_STACK`; `None` when unlimited or unknown.
+fn stack_rlimit() -> Option<usize> {
+    // SAFETY: plain data, for which zero is a value; a query into it.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) } != 0
+        || limit.rlim_cur == libc::RLIM_INFINITY
+    {
+        return None;
+    }
+    usize::try_from(limit.rlim_cur).ok()
+}
+
+/// The stack in `maps` (`/proc/self/maps`) that holds `here`. The main
+/// thread's (`[stack]`) is listed as far as it has grown: its lowest
+/// address is then where it may grow to, its end less `rlimit` (the soft
+/// `RLIMIT_STACK`), but not below the end of the next lower mapping.
+fn stack_extent(maps: &str, here: usize, rlimit: Option<usize>) -> Option<(usize, usize)> {
+    let mut below = 0; // the end of the mapping before
+    for line in maps.lines() {
+        let Some((range, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+        if !(start..end).contains(&here) {
+            below = end;
+            continue;
+        }
+        if !rest.trim_end().ends_with("[stack]") {
+            return Some((start, end));
+        }
+        let low = rlimit.map_or(below, |limit| end.saturating_sub(limit).max(below));
+        return Some((low.min(start), end));
+    }
+    None
+}
+
 impl Thread for Host {
-    /// The mapping of `/proc/self/maps` that holds a local of this thread.
+    /// The mapping of `/proc/self/maps` that holds a local of this thread;
+    /// for the main thread, as far as it may grow ([`stack_extent`]).
     fn stack_bounds() -> (usize, usize) {
         let marker = 0u8;
         let here = &raw const marker as usize;
         let maps = std::fs::read_to_string("/proc/self/maps").expect("/proc/self/maps");
-        maps.lines()
-            .filter_map(|line| {
-                let (range, _) = line.split_once(' ')?;
-                let (start, end) = range.split_once('-')?;
-                let (start, end) = (
-                    usize::from_str_radix(start, 16).ok()?,
-                    usize::from_str_radix(end, 16).ok()?,
-                );
-                (start..end).contains(&here).then_some((start, end))
-            })
-            .next()
-            .expect("this thread's stack in /proc/self/maps")
+        stack_extent(&maps, here, stack_rlimit()).expect("this thread's stack in /proc/self/maps")
     }
 
     fn thread_id() -> u32 {
@@ -181,5 +216,54 @@ impl Dirs for Host {
 
     fn default_data_dir() -> Option<PathBuf> {
         crate::local_app_data("data")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAPS: &str = "\
+55d0c0000000-55d0c0021000 r-xp 00000000 08:01 1234 /usr/bin/victory
+7f0000000000-7f0000100000 rw-p 00000000 00:00 0
+7ffc00000000-7ffc00021000 rw-p 00000000 00:00 0                          [stack]
+";
+
+    #[test]
+    fn the_main_threads_stack_reaches_its_limit() {
+        let here = 0x7ffc_0002_0000;
+        // 132 KiB grown so far; 8 MiB allowed.
+        assert_eq!(
+            stack_extent(MAPS, here, Some(8 << 20)),
+            Some((0x7ffc_0002_1000 - (8 << 20), 0x7ffc_0002_1000))
+        );
+        // Not below the mapping under it, nor above what is mapped.
+        assert_eq!(
+            stack_extent(MAPS, here, Some(1 << 40)),
+            Some((0x7f00_0010_0000, 0x7ffc_0002_1000))
+        );
+        assert_eq!(
+            stack_extent(MAPS, here, Some(0x1000)),
+            Some((0x7ffc_0000_0000, 0x7ffc_0002_1000))
+        );
+        // Another thread's stack is the mapping itself.
+        assert_eq!(
+            stack_extent(MAPS, 0x7f00_0000_0040, Some(8 << 20)),
+            Some((0x7f00_0000_0000, 0x7f00_0010_0000))
+        );
+        assert_eq!(stack_extent(MAPS, 0x10, None), None);
+    }
+
+    #[test]
+    fn this_processs_main_thread_stack_spans_at_least_a_mebibyte() {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let line = maps.lines().find(|l| l.ends_with("[stack]")).unwrap();
+        let start = usize::from_str_radix(line.split('-').next().unwrap(), 16).unwrap();
+        let (low, high) = stack_extent(&maps, start, stack_rlimit()).unwrap();
+        assert!(high - low >= 1 << 20, "{low:#x}..{high:#x}");
+        if Host::thread_id() == Host::process_id() {
+            let (low, high) = Host::stack_bounds();
+            assert!(high - low >= 1 << 20, "{low:#x}..{high:#x}");
+        }
     }
 }

@@ -54,25 +54,63 @@ pub fn free_ranges_between(low: usize, high: usize) -> Vec<Range> {
 /// Reserves every free range below 4 GiB for titles (read-write memory from
 /// `Memory::allocate` at its address, then no access until `carve` hands a
 /// piece out), so nothing of the host's lands there later; returns what was
-/// taken now. A second call takes only what became free since.
+/// taken now. A range of which something else mapped a part meanwhile is
+/// read again, and what is still free in it taken ([`take_free`]). A
+/// second call takes only what became free since.
 pub fn reserve() -> Vec<Range> {
     let mut pieces = reserved();
-    let mut taken = Vec::new();
-    for range in free_ranges() {
-        // Something else may have mapped part of it since the map was read:
-        // the allocation then fails and the range is left to its owner.
-        if Host::allocate(range.len, Some(range.start)) != Some(range.start) {
-            continue;
-        }
-        // A refusal leaves the range read-write, but still ours: it is kept
-        // all the same, and made read-write again when carved.
-        // SAFETY: the whole of the allocation just made, which nothing
-        // refers into yet.
-        unsafe { Host::protect(range.start, range.len, Protection::NoAccess) };
-        pieces.push(range);
-        taken.push(range);
-    }
+    let taken = take_free(
+        free_ranges(),
+        |range| {
+            if Host::allocate(range.len, Some(range.start)) != Some(range.start) {
+                return false;
+            }
+            // A refusal leaves the range read-write, but still ours: it is
+            // kept all the same, and made read-write again when carved.
+            // SAFETY: the whole of the allocation just made, which nothing
+            // refers into yet.
+            unsafe { Host::protect(range.start, range.len, Protection::NoAccess) };
+            true
+        },
+        |range| free_ranges_between(range.start, range.start + range.len),
+    );
+    pieces.extend_from_slice(&taken);
     pieces.sort_by_key(|r| r.start);
+    taken
+}
+
+/// How many times [`take_free`] reads again the ranges it could not take.
+const RESERVE_ROUNDS: usize = 8;
+
+/// Takes each of `free` with `take`, lowest first. Something else may have
+/// mapped part of a range since the map was read: its allocation then
+/// fails, and what is still free within it (`free_within`) is taken in
+/// turn, round after round while a round takes something, at most
+/// [`RESERVE_ROUNDS`] times. What was taken, lowest first.
+fn take_free(
+    free: Vec<Range>,
+    mut take: impl FnMut(Range) -> bool,
+    mut free_within: impl FnMut(Range) -> Vec<Range>,
+) -> Vec<Range> {
+    let mut taken = Vec::new();
+    let mut pending = free;
+    for round in 0..=RESERVE_ROUNDS {
+        let before = taken.len();
+        let mut raced = Vec::new();
+        for range in pending {
+            if take(range) {
+                taken.push(range);
+            } else {
+                raced.push(range);
+            }
+        }
+        let stuck = round > 0 && taken.len() == before;
+        if raced.is_empty() || stuck || round == RESERVE_ROUNDS {
+            break;
+        }
+        pending = raced.into_iter().flat_map(&mut free_within).collect();
+    }
+    taken.sort_by_key(|r| r.start);
     taken
 }
 
@@ -434,6 +472,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_range_mapped_in_part_meanwhile_is_taken_around_that_part() {
+        let r = |start, len| Range { start, len };
+        // [0x15000, 0x16000) was mapped by someone else after the map was
+        // read; [0x40000, 0x50000) is free.
+        let taken_by_another = r(0x1_5000, 0x1000);
+        let overlaps = |a: Range, b: Range| a.start < b.start + b.len && b.start < a.start + a.len;
+        let mut tries = 0;
+        let taken = take_free(
+            vec![r(0x1_0000, 0x1_0000), r(0x4_0000, 0x1_0000)],
+            |range| {
+                tries += 1;
+                !overlaps(range, taken_by_another)
+            },
+            |range| {
+                assert_eq!(range, r(0x1_0000, 0x1_0000), "only the raced range");
+                vec![r(0x1_0000, 0x5000), r(0x1_6000, 0xA000)]
+            },
+        );
+        assert_eq!(
+            taken,
+            [
+                r(0x1_0000, 0x5000),
+                r(0x1_6000, 0xA000),
+                r(0x4_0000, 0x1_0000)
+            ]
+        );
+        assert_eq!(tries, 4);
+        // A range that is never taken is read again once, then left.
+        let mut reads = 0;
+        let taken = take_free(
+            vec![r(0x1_0000, 0x1000)],
+            |_| false,
+            |range| {
+                reads += 1;
+                vec![range]
+            },
+        );
+        assert_eq!((taken, reads), (Vec::new(), 1));
+        // One taken a piece per round stops after the rounds allowed.
+        let mut reads = 0;
+        let mut next = 0x10_0000;
+        let taken = take_free(
+            vec![r(0x1_0000, 0x1000)],
+            |range| range.start >= 0x10_0000,
+            |_| {
+                reads += 1;
+                next += 0x1000;
+                vec![r(next, 0x1000), r(0x2_0000, 0x1000)]
+            },
+        );
+        assert_eq!((taken.len(), reads), (RESERVE_ROUNDS, RESERVE_ROUNDS));
     }
 
     #[test]

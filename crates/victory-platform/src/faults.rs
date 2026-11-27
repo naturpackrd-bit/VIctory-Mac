@@ -55,6 +55,10 @@ pub struct Registers {
     pub rflags: u64,
     /// xmm0..xmm15, low then high qword; zero when the host gave no float state.
     pub xmm: [[u64; 2]; 16],
+    /// The upper halves of ymm0..ymm15, low then high qword, where the host
+    /// gave the AVX state. Only read from the signal context, never written
+    /// back: a resume through the signal context keeps them as they were.
+    pub ymm_upper: Option<[[u64; 2]; 16]>,
 }
 
 /// A fault, as a handler sees it.
@@ -62,8 +66,15 @@ pub struct Fault<'a> {
     pub kind: FaultKind,
     /// For `Access`: the address the instruction reached for (`si_addr`); 0 otherwise.
     pub address: usize,
-    /// For `Access`: whether the instruction wrote; false when unknown.
+    /// For `Access`: whether the instruction wrote (a page fault's error
+    /// code says so); false when unknown or not a page fault.
     pub write: bool,
+    /// The processor's trap number (Linux `REG_TRAPNO`, macOS
+    /// `__es.__trapno`): 14 a page fault, 13 a general protection fault;
+    /// `None` without a context.
+    pub trap: Option<u16>,
+    /// The trap's error code (`REG_ERR`, `__es.__err`); 0 when unknown.
+    pub error: u64,
     pub registers: &'a mut Registers,
 }
 
@@ -200,9 +211,11 @@ extern "C" fn on_signal(
     } else {
         0
     };
-    // Bit 1 of the page fault's error code: the access was a write.
     // SAFETY: the kernel's context for this signal, or null.
-    let write = kind == FaultKind::Access && unsafe { error_code(context) } & 2 != 0;
+    let (trap, error) = unsafe { trap_and_error(context) };
+    // Bit 1 of a page fault's error code: the access was a write. Another
+    // trap's error code means something else (`int 0x29`'s #GP has 0x14a).
+    let write = kind == FaultKind::Access && trap == Some(PAGE_FAULT) && error & 2 != 0;
     let handler = HANDLER.load(SeqCst);
     let mut registers = Registers::default();
     // SAFETY: (both) the kernel's context for this signal, of the type its
@@ -214,6 +227,8 @@ extern "C" fn on_signal(
             kind,
             address,
             write,
+            trap,
+            error,
             registers: &mut registers,
         })
     } else {
@@ -284,41 +299,52 @@ unsafe fn fault_address(info: *mut libc::siginfo_t) -> usize {
     unsafe { (*info).si_addr as usize }
 }
 
-/// The fault's error code (`REG_ERR`): for a page fault, bit 1 is set for
-/// a write; 0 without a context.
+/// The trap number of a page fault (#PF).
+pub const PAGE_FAULT: u16 = 14;
+/// The trap number of a general protection fault (#GP).
+pub const GENERAL_PROTECTION: u16 = 13;
+
+/// The fault's trap number (`REG_TRAPNO`) and error code (`REG_ERR`): for
+/// a page fault, bit 1 of the code is set for a write; `(None, 0)` without
+/// a context.
 ///
 /// # Safety
 /// `context` is null or the kernel's `ucontext_t` for a signal being
 /// handled.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-unsafe fn error_code(context: *mut libc::c_void) -> u64 {
+unsafe fn trap_and_error(context: *mut libc::c_void) -> (Option<u16>, u64) {
     if context.is_null() {
-        return 0;
+        return (None, 0);
     }
     // SAFETY: the caller's context.
     let mcontext = unsafe { &(*context.cast::<libc::ucontext_t>()).uc_mcontext };
-    mcontext.gregs[libc::REG_ERR as usize] as u64
+    (
+        Some(mcontext.gregs[libc::REG_TRAPNO as usize] as u16),
+        mcontext.gregs[libc::REG_ERR as usize] as u64,
+    )
 }
 
-/// The fault's error code (`__es.__err`): for a page fault, bit 1 is set
-/// for a write; 0 without a context.
+/// The fault's trap number (`__es.__trapno`) and error code
+/// (`__es.__err`): for a page fault, bit 1 of the code is set for a write;
+/// `(None, 0)` without a context.
 ///
 /// # Safety
 /// `context` is null or the kernel's `ucontext_t` for a signal being
 /// handled.
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-unsafe fn error_code(context: *mut libc::c_void) -> u64 {
+unsafe fn trap_and_error(context: *mut libc::c_void) -> (Option<u16>, u64) {
     if context.is_null() {
-        return 0;
+        return (None, 0);
     }
     // SAFETY: the caller's context, whose `uc_mcontext` points at the
     // machine state the kernel saved for the signal, or is null.
     unsafe {
         let mcontext = (*context.cast::<libc::ucontext_t>()).uc_mcontext;
         if mcontext.is_null() {
-            return 0;
+            return (None, 0);
         }
-        u64::from((*mcontext).__es.__err)
+        let es = &(*mcontext).__es;
+        (Some(es.__trapno), u64::from(es.__err))
     }
 }
 
@@ -401,9 +427,44 @@ unsafe fn read_registers(context: *mut libc::c_void, r: &mut Registers) -> bool 
             for (xmm, saved) in r.xmm.iter_mut().zip(fp._xmm.iter()) {
                 *xmm = qwords(saved.element);
             }
+            r.ymm_upper = ymm_upper((fp as *const libc::_libc_fpstate).cast());
         }
     }
     true
+}
+
+/// The upper halves of the ymm registers in the kernel's xsave area at
+/// `fx` (its legacy 512 bytes first): `None` unless the frame says it has
+/// the extended state (`fpx_sw_bytes.magic1`) with AVX in it; zeros where
+/// the saved state has AVX in its initial state (its `xstate_bv` bit clear).
+///
+/// # Safety
+/// `fx` points at the kernel's float state for a signal being handled.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe fn ymm_upper(fx: *const u8) -> Option<[[u64; 2]; 16]> {
+    const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+    const XFEATURE_YMM: u64 = 1 << 2;
+    /// `ymmh_space`: after the legacy area (512) and the xsave header (64).
+    const YMMH: usize = 576;
+    // SAFETY: the caller's float state: `fpx_sw_bytes` lies at 464 of its
+    // 512 bytes (magic1, extended_size, xfeatures); the xsave header and
+    // the AVX state follow where magic1 and extended_size say they do.
+    unsafe {
+        let magic1 = fx.add(464).cast::<u32>().read_unaligned();
+        let size = fx.add(468).cast::<u32>().read_unaligned() as usize;
+        let features = fx.add(472).cast::<u64>().read_unaligned();
+        if magic1 != FP_XSTATE_MAGIC1 || size < YMMH + 256 || features & XFEATURE_YMM == 0 {
+            return None;
+        }
+        let mut upper = [[0u64; 2]; 16];
+        if fx.add(512).cast::<u64>().read_unaligned() & XFEATURE_YMM != 0 {
+            let ymmh = fx.add(YMMH).cast::<[u64; 2]>();
+            for (i, half) in upper.iter_mut().enumerate() {
+                *half = ymmh.add(i).read_unaligned();
+            }
+        }
+        Some(upper)
+    }
 }
 
 /// Writes `r` back into the registers of `context`.
@@ -496,9 +557,30 @@ unsafe fn read_registers(context: *mut libc::c_void, r: &mut Registers) -> bool 
         for (i, register) in r.xmm.iter_mut().enumerate() {
             *register = xmm.add(i).read_unaligned();
         }
+        if (*context.cast::<libc::ucontext_t>()).uc_mcsize >= MCONTEXT_AVX64 {
+            let ymmh = mcontext.cast::<u8>().add(YMMH0).cast::<[u64; 2]>();
+            r.ymm_upper = Some(core::array::from_fn(|i| ymmh.add(i).read_unaligned()));
+        }
     }
     true
 }
+
+/// Where `__fpu_ymmh0` lies in `__darwin_mcontext_avx64` (and in the
+/// AVX-512 form, which begins as it does): the exception state (16 bytes)
+/// and the thread state (168), then `__darwin_x86_avx_state64`, whose
+/// float-state part (524) and `__avx_reserved1` (64) come first.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const YMMH0: usize = 16 + 168 + 524 + 64;
+/// The end of `__darwin_mcontext_avx64`'s ymm halves (before its tail
+/// padding): what `uc_mcsize` is at least when the kernel saved the AVX
+/// state, and more than the plain form's 712 bytes.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const MCONTEXT_AVX64: usize = YMMH0 + 16 * 16;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const _: () = assert!(
+    std::mem::offset_of!(libc::__darwin_mcontext64, __fs) == 16 + 168
+        && size_of::<libc::__darwin_x86_float_state64>() == 524
+);
 
 /// Writes `r` back into the registers of `context`.
 ///
@@ -599,6 +681,18 @@ mod tests {
         Handled::Resume
     }
 
+    /// The upper half of ymm1 the last [`ymm`] handler saw, as qwords
+    /// ANDed together (0 when it saw none).
+    static YMM1_UPPER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn ymm(fault: &mut Fault) -> Handled {
+        assert_eq!(fault.kind, FaultKind::IllegalInstruction);
+        let upper = fault.registers.ymm_upper.map_or(0, |u| u[1][0] & u[1][1]);
+        YMM1_UPPER.store(upper, SeqCst);
+        fault.registers.rip += 2;
+        Handled::Resume
+    }
+
     fn pass_breakpoints(fault: &mut Fault) -> Handled {
         assert_eq!(fault.kind, FaultKind::Breakpoint);
         Handled::Pass
@@ -638,6 +732,17 @@ mod tests {
                 options(nostack))
         };
         assert_eq!(value, 0x1122_3344_5566_7788);
+
+        if std::arch::is_x86_feature_detected!("avx") {
+            set(ymm);
+            // SAFETY: AVX, asked above: ymm1 all ones (`vcmpps` with
+            // predicate TRUE), then `ud2`, which the handler steps over.
+            unsafe {
+                asm!("vcmpps ymm1, ymm1, ymm1, 15", ".byte 0x0f, 0x0b", out("xmm1") _,
+                    options(nostack))
+            };
+            assert_eq!(YMM1_UPPER.load(SeqCst), u64::MAX, "the upper half of ymm1");
+        }
 
         set(pass_breakpoints);
         let value: u64;

@@ -46,14 +46,41 @@ pub struct GsSite {
     pub disp: u32,
 }
 
-/// Every `gs:[disp32]` access in `code`, in order.
+/// The legacy prefixes other than `gs` itself (`65`): segments, operand
+/// and address size, `lock`, `repne`, `rep`.
+fn is_legacy_prefix(byte: u8) -> bool {
+    matches!(
+        byte,
+        0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3
+    )
+}
+
+/// Every `gs:[disp32]` access in `code`, in order. An access with another
+/// legacy prefix, before `gs` or after it (`mov word gs:[d], ax`, `lock inc
+/// gs:[d]`), is [`GsAccess::Other`], starting at its first prefix: a form
+/// the loader does not patch, and names.
 pub fn gs_sites(code: &[u8]) -> Vec<GsSite> {
     let mut sites = Vec::new();
     let mut i = 0;
+    // Where the last site ended: prefixes before a site are looked for
+    // after it only.
+    let mut floor = 0;
     while i < code.len() {
         match gs_site(&code[i..], i) {
-            Some(site) => {
+            Some(mut site) => {
                 i += usize::from(site.len);
+                let prefixes = code[floor..site.offset]
+                    .iter()
+                    .rev()
+                    .take_while(|&&b| is_legacy_prefix(b))
+                    .count()
+                    .min(14);
+                if prefixes > 0 {
+                    site.offset -= prefixes;
+                    site.len += prefixes as u8;
+                    site.access = as_other(site.access);
+                }
+                floor = i;
                 sites.push(site);
             }
             None => i += 1,
@@ -62,24 +89,29 @@ pub fn gs_sites(code: &[u8]) -> Vec<GsSite> {
     sites
 }
 
+/// `access` as [`GsAccess::Other`]: a `mov` by its opcode.
+fn as_other(access: GsAccess) -> GsAccess {
+    match access {
+        GsAccess::Load64 | GsAccess::Load32 => GsAccess::Other(0x8B),
+        GsAccess::Store64 | GsAccess::Store32 => GsAccess::Other(0x89),
+        other => other,
+    }
+}
+
 /// The access at the start of `c`, if one starts there.
 fn gs_site(c: &[u8], offset: usize) -> Option<GsSite> {
     if *c.first()? != 0x65 {
         return None;
     }
-    let (rex, mut at) = match *c.get(1)? {
-        r @ 0x40..=0x4F => (r, 2),
-        _ => (0, 1),
+    // Other prefixes after `gs` make a form this does not patch (`mov ax,
+    // gs:[..]`, `lock inc gs:[..]`): still read, to be named.
+    let prefixed = c[1..].iter().take_while(|&&b| is_legacy_prefix(b)).count();
+    let (rex, mut at) = match *c.get(1 + prefixed)? {
+        r @ 0x40..=0x4F => (r, 2 + prefixed),
+        _ => (0, 1 + prefixed),
     };
     let opcode = *c.get(at)?;
     at += 1;
-    // Another prefix means a form this does not read (`mov ax, gs:[..]`).
-    if matches!(
-        opcode,
-        0x26 | 0x2E | 0x36 | 0x3E | 0x64..=0x67 | 0xF0 | 0xF2 | 0xF3
-    ) {
-        return None;
-    }
     let access = match opcode {
         0x8B if rex & 8 != 0 => GsAccess::Load64,
         0x8B => GsAccess::Load32,
@@ -91,6 +123,11 @@ fn gs_site(c: &[u8], offset: usize) -> Option<GsSite> {
             GsAccess::Other(0x0F00 | u16::from(second))
         }
         other => GsAccess::Other(u16::from(other)),
+    };
+    let access = if prefixed > 0 {
+        as_other(access)
+    } else {
+        access
     };
     let modrm = *c.get(at)?;
     if modrm & 0xC7 != 0x04 || *c.get(at + 1)? != 0x25 {
@@ -157,10 +194,42 @@ mod tests {
         assert!(gs_sites(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0, 0, 1, 0]).is_empty());
         // A different segment.
         assert!(gs_sites(&[0x64, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]).is_empty());
-        // An operand-size prefix after gs.
-        assert!(gs_sites(&[0x65, 0x66, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]).is_empty());
         // Cut short.
         assert!(gs_sites(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x58]).is_empty());
+    }
+
+    #[test]
+    fn prefixed_forms_are_reported_from_their_first_prefix() {
+        // mov word ptr gs:[0x68], ax: the operand size after gs
+        let s = one(&[0x65, 0x66, 0x89, 0x04, 0x25, 0x68, 0, 0, 0]);
+        assert_eq!(
+            (s.offset, s.access, s.disp),
+            (0, GsAccess::Other(0x89), 0x68)
+        );
+        // ... and before it: not a 32-bit store at the 65
+        let s = one(&[0x66, 0x65, 0x89, 0x04, 0x25, 0x68, 0, 0, 0]);
+        assert_eq!(
+            (s.offset, s.access, s.disp),
+            (0, GsAccess::Other(0x89), 0x68)
+        );
+        // mov ax, gs:[0x58], with REX after the prefix
+        let s = one(&[0x65, 0x66, 0x44, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]);
+        assert_eq!((s.access, s.reg, s.disp), (GsAccess::Other(0x8B), 8, 0x58));
+        // lock inc dword ptr gs:[0x10], either order
+        let s = one(&[0x65, 0xF0, 0xFF, 0x04, 0x25, 0x10, 0, 0, 0]);
+        assert_eq!((s.access, s.reg, s.disp), (GsAccess::Other(0xFF), 0, 0x10));
+        let s = one(&[0xF0, 0x65, 0xFF, 0x04, 0x25, 0x10, 0, 0, 0]);
+        assert_eq!((s.access, s.reg, s.disp), (GsAccess::Other(0xFF), 0, 0x10));
+        // rep and two prefixes before gs
+        let s = one(&[0xF3, 0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]);
+        assert_eq!(s.access, GsAccess::Other(0x8B));
+        let s = one(&[0x67, 0x66, 0x65, 0x89, 0x04, 0x25, 0x68, 0, 0, 0]);
+        assert_eq!((s.offset, s.access), (0, GsAccess::Other(0x89)));
+        // In a stream: the prefix before is the site's, nothing before it.
+        let code = [0x90, 0x66, 0x65, 0x89, 0x04, 0x25, 0x68, 0, 0, 0, 0xC3];
+        let sites = gs_sites(&code);
+        assert_eq!(sites.len(), 1);
+        assert_eq!((sites[0].offset, sites[0].len), (1, 9));
     }
 
     #[test]

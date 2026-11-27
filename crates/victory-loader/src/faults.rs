@@ -11,8 +11,10 @@ use std::ffi::c_int;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
-use victory_platform::Host;
-use victory_platform::faults::{Fault, FaultKind, Faults, Handled, Handler, Registers};
+use victory_platform::faults::{
+    Fault, FaultKind, Faults, GENERAL_PROTECTION, Handled, Handler, PAGE_FAULT, Registers,
+};
+use victory_platform::{Host, Memory, Protection};
 
 use crate::seh;
 
@@ -63,19 +65,20 @@ fn dispatch(fault: &mut Fault) -> Handled {
         return Handled::Resume;
     }
     let rip = fault.registers.rip as usize;
-    if crate::images::with_image(rip, |i| i.is_some()) != Some(true) {
-        return Handled::Pass; // our code or the host's, or the registry was locked
+    if !crate::images::is_title(rip) {
+        return Handled::Pass; // our code or the host's
     }
-    if to_exception(fault) {
-        return Handled::Resume;
-    }
+    let why = match to_exception(fault) {
+        Ok(()) => return Handled::Resume,
+        Err(why) => why,
+    };
     let mut buffer = [0u8; 2048];
     let mut out = Buf {
         bytes: &mut buffer,
         len: 0,
     };
     report(fault, &mut out);
-    let _ = writeln!(out, "  no stack left to dispatch it on: a stack overflow");
+    let _ = writeln!(out, "  {why}");
     let len = out.len;
     // SAFETY: our buffer's written bytes to stderr, then the end of the
     // process: both async-signal-safe.
@@ -85,55 +88,78 @@ fn dispatch(fault: &mut Fault) -> Handled {
     }
 }
 
-/// Bytes below the faulting rsp for the exception: its record, then its
-/// context at [`CONTEXT_AT`].
-const EXCEPTION_ROOM: u64 = 0x600;
+/// Bytes below the faulting rsp for the exception: its record, its context
+/// at [`CONTEXT_AT`], then the ymm upper halves at [`UPPER_AT`].
+const EXCEPTION_ROOM: u64 = 0x680;
 /// Where the context lies in [`EXCEPTION_ROOM`]: past the record, 16-aligned.
 const CONTEXT_AT: u64 = 0xA0;
+/// Where the upper halves of ymm0..15 lie in [`EXCEPTION_ROOM`], past the
+/// context: what the thread resumes with besides it (`seh::dispatch_entry`).
+const UPPER_AT: u64 = CONTEXT_AT + size_of::<seh::Context>() as u64;
 /// The stack the dispatch needs: the exception and our frames.
 const STACK_ROOM: u64 = EXCEPTION_ROOM + (64 << 10);
 const _: () = assert!(
     size_of::<seh::ExceptionRecord>() as u64 <= CONTEXT_AT
-        && CONTEXT_AT + size_of::<seh::Context>() as u64 <= EXCEPTION_ROOM
+        && UPPER_AT.is_multiple_of(16)
+        && UPPER_AT + size_of::<[[u64; 2]; 16]>() as u64 <= EXCEPTION_ROOM
 );
+
+/// Why a fault in title code is not dispatched: a thread of no TEB of ours
+/// has no stack bounds to check, and no alternate signal stack, so that an
+/// exception written below its rsp would lie over the kernel's signal frame.
+const NO_TEB: &str =
+    "a thread with no TEB (not created through CreateThread, not attached): no dispatch";
+/// Why a fault in title code is not dispatched: no room on its stack.
+const NO_STACK: &str = "no stack left to dispatch it on: a stack overflow";
 
 /// Turns a fault in title code into a Windows exception: its record and
 /// context written on the faulting thread's own stack, below its rsp, and
-/// the thread sent to `seh::dispatch_entry` there, which it runs once the
-/// signal handler returns (with the signal mask restored). False, changing
-/// nothing, when the stack has no room left for that (a stack overflow).
-fn to_exception(fault: &mut Fault) -> bool {
-    let limit = crate::teb::current_teb().map_or(0, |teb| {
-        // SAFETY: this thread's TEB, ours, alive for the thread's life; a
-        // read of it, which nothing in a signal handler can disturb.
-        unsafe { (*(teb as *const crate::teb::Teb)).stack_limit }
-    });
+/// the thread sent to `seh::dispatch_entry` there (`seh::fail_fast_entry`
+/// for a `__fastfail`), which it runs once the signal handler returns (with
+/// the signal mask restored). Why not, changing nothing, when the thread
+/// has no TEB of ours ([`NO_TEB`]) or its stack no room left ([`NO_STACK`]).
+fn to_exception(fault: &mut Fault) -> Result<(), &'static str> {
+    let Some(teb) = crate::teb::current_teb() else {
+        return Err(NO_TEB);
+    };
+    // SAFETY: this thread's TEB, ours, alive for the thread's life; a read
+    // of it, which nothing in a signal handler can disturb.
+    let limit = unsafe { (*(teb as *const crate::teb::Teb)).stack_limit };
     let regs = &mut *fault.registers;
     if regs.rsp < limit.saturating_add(STACK_ROOM) {
-        return false;
+        return Err(NO_STACK);
     }
-    let (code, parameters) = match fault.kind {
-        FaultKind::Access => (
-            seh::STATUS_ACCESS_VIOLATION,
-            Some([u64::from(fault.write), fault.address as u64]),
-        ),
-        FaultKind::IllegalInstruction => (seh::STATUS_ILLEGAL_INSTRUCTION, None),
-        FaultKind::Breakpoint => {
-            // Windows reports the `int3` itself, not the byte after it.
-            let mut byte = [0u8];
-            let before = regs.rip.wrapping_sub(1) as usize;
-            if <Host as victory_platform::Memory>::read_into(before, &mut byte) && byte[0] == 0xCC {
-                regs.rip -= 1;
-            }
-            (seh::STATUS_BREAKPOINT, None)
+    let mut code = [0u8; 16];
+    let code = read_code(regs.rip as usize, &mut code);
+    let raised = raised(fault.kind, fault.trap, fault.error, fault.address, code);
+    if fault.kind == FaultKind::Breakpoint && raised != Raised::FailFast {
+        // Windows reports the `int3` itself, not the byte after it.
+        let mut byte = [0u8];
+        let before = regs.rip.wrapping_sub(1) as usize;
+        if Host::read_into(before, &mut byte) && byte[0] == 0xCC {
+            regs.rip -= 1;
         }
-        FaultKind::Arithmetic => (seh::STATUS_INTEGER_DIVIDE_BY_ZERO, None),
-    };
-    let mut record = seh::ExceptionRecord::new(code, 0, regs.rip);
-    if let Some(parameters) = parameters {
-        record.number_parameters = 2;
-        record.information[..2].copy_from_slice(&parameters);
     }
+    let (record, entry) = match raised {
+        Raised::FailFast => {
+            let mut record = seh::ExceptionRecord::new(
+                seh::STATUS_STACK_BUFFER_OVERRUN,
+                seh::EXCEPTION_NONCONTINUABLE,
+                regs.rip,
+            );
+            record.number_parameters = 1;
+            record.information[0] = regs.rcx;
+            (record, seh::fail_fast_entry as *const () as u64)
+        }
+        Raised::Exception(code, parameters) => {
+            let mut record = seh::ExceptionRecord::new(code, 0, regs.rip);
+            if let Some(parameters) = parameters {
+                record.number_parameters = 2;
+                record.information[..2].copy_from_slice(&parameters);
+            }
+            (record, seh::dispatch_entry as *const () as u64)
+        }
+    };
     let base = (regs.rsp - EXCEPTION_ROOM) & !15;
     // SAFETY: the faulting thread's own stack below its rsp, which Win64
     // code keeps nothing in, and which has room (checked above).
@@ -143,8 +169,16 @@ fn to_exception(fault: &mut Fault) -> bool {
             (base + CONTEXT_AT) as *mut seh::Context,
             seh::Context::from_registers(regs),
         );
+        if let Some(upper) = regs.ymm_upper {
+            std::ptr::write((base + UPPER_AT) as *mut [[u64; 2]; 16], upper);
+        }
     }
-    regs.rip = seh::dispatch_entry as *const () as u64;
+    regs.rdx = if regs.ymm_upper.is_some() {
+        base + UPPER_AT
+    } else {
+        0
+    };
+    regs.rip = entry;
     regs.rdi = base;
     regs.rsi = base + CONTEXT_AT;
     // As after a call: rsp + 8 is 16-aligned at a SysV function's entry.
@@ -152,7 +186,140 @@ fn to_exception(fault: &mut Fault) -> bool {
     // Our code runs with the direction flag clear, as the SysV ABI has it,
     // and without single steps; the context keeps the title's flags.
     regs.rflags &= !(RFLAGS_DF | RFLAGS_TF);
-    true
+    Ok(())
+}
+
+/// The code at `rip`: 16 bytes, else those left in its page (the next one
+/// may not be mapped), else none.
+fn read_code(rip: usize, code: &mut [u8; 16]) -> &[u8] {
+    let page = Host::page_size();
+    let room = (page - rip % page).min(code.len());
+    if Host::read_into(rip, code) {
+        code
+    } else if Host::read_into(rip, &mut code[..room]) {
+        &code[..room]
+    } else {
+        &[]
+    }
+}
+
+/// What a fault in title code is raised as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Raised {
+    /// `int 0x29` (`__fastfail`): `STATUS_STACK_BUFFER_OVERRUN` with the
+    /// code in rcx, which ends the process with no handler asked.
+    FailFast,
+    /// An exception: its code, and its two parameters if it has them.
+    Exception(u32, Option<[u64; 2]>),
+}
+
+/// What a fault is raised as, from its kind, its trap number and error
+/// code, the address it reached for, and the code at its rip (what could
+/// be read of it). `CD 29` is a fail-fast whatever the signal; a page fault
+/// an access violation that reads (0), writes (1) or executes (8); a #GP a
+/// privileged instruction, else an access violation of no address (a
+/// non-canonical one); any other trap goes by the signal.
+fn raised(kind: FaultKind, trap: Option<u16>, error: u64, address: usize, code: &[u8]) -> Raised {
+    if code.starts_with(&[0xCD, 0x29]) {
+        return Raised::FailFast;
+    }
+    let violation = |what: u64, address: u64| {
+        Raised::Exception(seh::STATUS_ACCESS_VIOLATION, Some([what, address]))
+    };
+    match trap {
+        Some(PAGE_FAULT) => {
+            let what = match error {
+                e if e & 0x10 != 0 => 8, // an instruction fetch
+                e if e & 2 != 0 => 1,
+                _ => 0,
+            };
+            return violation(what, address as u64);
+        }
+        Some(GENERAL_PROTECTION) if privileged(code) => {
+            return Raised::Exception(seh::STATUS_PRIVILEGED_INSTRUCTION, None);
+        }
+        Some(GENERAL_PROTECTION) => return violation(0, 0),
+        _ => {}
+    }
+    match kind {
+        FaultKind::Access => violation(0, address as u64),
+        FaultKind::IllegalInstruction => Raised::Exception(seh::STATUS_ILLEGAL_INSTRUCTION, None),
+        FaultKind::Breakpoint => Raised::Exception(seh::STATUS_BREAKPOINT, None),
+        FaultKind::Arithmetic => Raised::Exception(seh::STATUS_INTEGER_DIVIDE_BY_ZERO, None),
+    }
+}
+
+/// Whether `code` starts with an instruction user mode may not run (a
+/// #GP): `hlt`, `cli`, `sti`, `in`, `out`, `ins`, `outs`, `rdmsr`,
+/// `wrmsr`, a move to or from a control or debug register, `clts`, `invd`,
+/// `wbinvd`; after any legacy prefixes and a REX.
+fn privileged(code: &[u8]) -> bool {
+    let prefixes = code
+        .iter()
+        .take_while(|&&b| {
+            matches!(
+                b,
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64..=0x67 | 0xF0 | 0xF2 | 0xF3
+            )
+        })
+        .count();
+    let mut code = &code[prefixes..];
+    if let [0x40..=0x4F, rest @ ..] = code {
+        code = rest;
+    }
+    matches!(
+        code,
+        [0xF4 | 0xFA | 0xFB | 0x6C..=0x6F | 0xE4..=0xE7 | 0xEC..=0xEF, ..]
+            | [0x0F, 0x06 | 0x08 | 0x09 | 0x20..=0x23 | 0x30 | 0x32, ..]
+    )
+}
+
+/// The protection the loader gave the code page at `page` (`map.rs`, from
+/// the sections in it), as its image's section table has it (mapped
+/// read-only at the image's base): read-write-execute where a section in
+/// the page is writable, else read-execute (also for a page in no image of
+/// ours, or headers that cannot be read). Nothing allocates or locks.
+fn code_protection(page: usize, page_size: usize) -> Protection {
+    let writable = crate::images::title_base(page)
+        .and_then(|base| page_writable(base, page - base, page_size))
+        .unwrap_or(false);
+    if writable {
+        Protection::ReadWriteExecute
+    } else {
+        Protection::ReadExecute
+    }
+}
+
+/// Whether a section with write lies in the `page_size` bytes at `rva` of
+/// the image at `base`, from its headers in memory; `None` when they cannot
+/// be read.
+fn page_writable(base: usize, rva: usize, page_size: usize) -> Option<bool> {
+    let read = |at: usize, bytes: &mut [u8]| Host::read_into(at, bytes).then_some(());
+    let mut word = [0u8; 4];
+    read(base + 0x3C, &mut word)?; // e_lfanew
+    let nt = base + u32::from_le_bytes(word) as usize;
+    let mut file_header = [0u8; 24]; // the signature, then IMAGE_FILE_HEADER
+    read(nt, &mut file_header)?;
+    let sections = usize::from(u16::from_le_bytes([file_header[6], file_header[7]]));
+    let optional = usize::from(u16::from_le_bytes([file_header[20], file_header[21]]));
+    let mut writable = false;
+    for i in 0..sections.min(96) {
+        let mut header = [0u8; 40];
+        read(nt + 24 + optional + 40 * i, &mut header)?;
+        let field = |at: usize| {
+            u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+        };
+        // VirtualSize (0: the raw size, as `map.rs` takes it), VirtualAddress.
+        let size = match field(8) {
+            0 => field(16),
+            n => n,
+        } as usize;
+        let start = field(12) as usize;
+        if start < rva + page_size && rva < start + size {
+            writable |= field(36) & crate::map::SCN_MEM_WRITE != 0;
+        }
+    }
+    Some(writable)
 }
 
 /// The flags' trap (single step) and direction bits.
@@ -268,12 +435,12 @@ fn report_state(r: &Registers, out: &mut impl Write) {
     let _ = write!(out, "  stack:");
     for i in 0..8 {
         let mut value = [0u8; 8];
-        if !<Host as victory_platform::Memory>::read_into(r.rsp as usize + 8 * i, &mut value) {
+        if !Host::read_into(r.rsp as usize + 8 * i, &mut value) {
             break;
         }
         let value = u64::from_le_bytes(value);
         let _ = write!(out, " {value:#x}");
-        if crate::images::with_image(value as usize, |i| i.is_some()) == Some(true) {
+        if crate::images::is_title(value as usize) {
             let _ = write!(out, " (");
             locate(value, out);
             let _ = write!(out, ")");
@@ -291,8 +458,8 @@ mod decode;
 /// The Zen 2 instructions titles use and this processor may lack, done in
 /// the handler: what `crash.rs` and `console_insn.rs` do on Windows.
 mod zen2 {
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     use super::decode::{self, ConsoleOnly};
     use victory_platform::faults::Registers;
@@ -306,18 +473,10 @@ mod zen2 {
     pub(super) fn emulate(regs: &mut Registers) -> bool {
         let rip = regs.rip as usize;
         let mut code = [0u8; 16];
-        // The 16 bytes, else those left in the page (the next one may not
-        // be mapped).
-        let page = Host::page_size();
-        let room = (page - rip % page).min(code.len());
-        let n = if Host::read_into(rip, &mut code) {
-            code.len()
-        } else if Host::read_into(rip, &mut code[..room]) {
-            room
-        } else {
+        let code = super::read_code(rip, &mut code);
+        if code.is_empty() {
             return false;
-        };
-        let code = &code[..n];
+        }
         let len = match decode::decode(code) {
             Some((ConsoleOnly::Clzero, len)) => {
                 clzero(regs, &code[..len]);
@@ -415,8 +574,12 @@ mod zen2 {
     /// the new three, never a mix: an aligned qword's where they lie in one,
     /// else an aligned 16 bytes' (`cmpxchg16b`, where the processor has it).
     /// Bytes that cross 16 aligned ones are left, and emulated at each fault
-    /// as before. The page is made writable for the store and read-execute
-    /// after; left as it is if the host refuses.
+    /// as before. The page is made writable for the store and given back
+    /// the protection the loader gave it after ([`super::code_protection`]);
+    /// left as it is if the host refuses. One patch at a time in the
+    /// process ([`PATCHING`]): false, patching nothing, while another
+    /// thread's is under way (the instruction is stepped over all the same,
+    /// and patched at a later fault).
     fn patch(at: usize, with: [u8; 3]) -> bool {
         let wide = if at % 8 <= 5 {
             false
@@ -428,8 +591,13 @@ mod zen2 {
         if wide && !std::arch::is_x86_feature_detected!("cmpxchg16b") {
             return false;
         }
+        // Held until the page is read-execute again (dropped last).
+        let Some(_patching) = take(&PATCHING) else {
+            return false;
+        };
         let page = Host::page_size();
         let start = at & !(page - 1);
+        let after = super::code_protection(start, page);
         // SAFETY: the title's code page (the bytes lie in 16 aligned ones,
         // so in one page), from `Host::allocate` as the loader maps it;
         // nothing holds a reference into it. The store is to its bytes, made
@@ -445,8 +613,31 @@ mod zen2 {
                 store_8(at, with);
                 true
             };
-            Host::protect(start, page, Protection::ReadExecute);
+            Host::protect(start, page, after);
             patched
+        }
+    }
+
+    /// Held by the thread patching a page of code ([`patch`]): without it,
+    /// two threads patching the same page race, and one stores into the
+    /// page the other has just made read-execute again, which faults inside
+    /// the signal handler and ends the process (several job workers that
+    /// reach the same idle loop together, under Rosetta 2).
+    pub(super) static PATCHING: AtomicBool = AtomicBool::new(false);
+
+    /// `flag` taken until the guard drops; `None` while another holds it.
+    pub(super) fn take(flag: &AtomicBool) -> Option<Taken<'_>> {
+        flag.compare_exchange(false, true, Acquire, Relaxed)
+            .is_ok()
+            .then_some(Taken(flag))
+    }
+
+    /// A flag [`take`] took, given back when dropped.
+    pub(super) struct Taken<'a>(&'a AtomicBool);
+
+    impl Drop for Taken<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Release);
         }
     }
 
@@ -690,7 +881,8 @@ mod tests {
             base: 0x7000_0000,
             size: 0x1000,
             exception_table: None,
-        });
+        })
+        .unwrap();
         let stack: [u64; 8] = [0x7000_0010, 1, 2, 3, 4, 5, 6, 7];
         let mut registers = Registers {
             rip: 0x7000_0123,
@@ -702,6 +894,8 @@ mod tests {
             kind: FaultKind::Access,
             address: 0x10,
             write: false,
+            trap: Some(PAGE_FAULT),
+            error: 4,
             registers: &mut registers,
         };
         let mut text = String::new();
@@ -747,8 +941,18 @@ mod tests {
     #[repr(align(64))]
     struct Lines([u8; 128]);
 
+    /// Held by the tests that patch: one patch at a time in the process
+    /// ([`zen2::PATCHING`]), so that two of them at once would see a patch
+    /// refused.
+    static PATCH_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn patch_tests() -> std::sync::MutexGuard<'static, ()> {
+        PATCH_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn zen2_emulates_clzero_monitorx_mwaitx() {
+        let _one = patch_tests();
         let mut lines = Lines([0xaa; 128]);
         let page = Host::page_size();
         let code = code_page(&[0x0f, 0x01, 0xfc, 0x0f, 0x01, 0xfa, 0x0f, 0x01, 0xfb, 0xc3]);
@@ -783,6 +987,7 @@ mod tests {
     #[test]
     fn wait_patches_are_single_stores_or_none() {
         const OFFSETS: [usize; 5] = [0, 5, 6, 13, 14];
+        let _one = patch_tests();
         let page = Host::page_size();
         let mut code = [0x90u8; 5 * 32];
         for (k, offset) in OFFSETS.iter().enumerate() {
@@ -815,5 +1020,130 @@ mod tests {
         }
         // SAFETY: our page, no longer used.
         assert!(unsafe { Host::free(base, page) });
+    }
+
+    #[test]
+    fn a_patch_waits_for_no_other() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let held = zen2::take(&flag).expect("a free flag");
+        std::thread::scope(|s| {
+            let other = s.spawn(|| zen2::take(&flag).is_some());
+            assert!(!other.join().unwrap(), "refused while another holds it");
+        });
+        drop(held);
+        let again = std::thread::scope(|s| s.spawn(|| zen2::take(&flag).is_some()).join());
+        assert!(again.unwrap(), "taken once given back");
+    }
+
+    #[test]
+    fn traps_map_to_windows_exceptions() {
+        use FaultKind::*;
+        let av = |what, at| Raised::Exception(seh::STATUS_ACCESS_VIOLATION, Some([what, at]));
+        let nop = [0x90u8];
+        // Page faults: read, write, execute (instruction fetch, write clear).
+        assert_eq!(raised(Access, Some(14), 0x4, 0x10, &nop), av(0, 0x10));
+        assert_eq!(raised(Access, Some(14), 0x6, 0x10, &nop), av(1, 0x10));
+        assert_eq!(raised(Access, Some(14), 0x15, 0x10, &nop), av(8, 0x10));
+        // `int 0x29` (#GP, error 0x14a): a fail-fast, not a write; whatever
+        // the signal.
+        let ff = [0xCD, 0x29, 0x90];
+        assert_eq!(raised(Access, Some(13), 0x14a, 0, &ff), Raised::FailFast);
+        let sigill = raised(IllegalInstruction, None, 0, 0, &ff);
+        assert_eq!(sigill, Raised::FailFast);
+        let not = [0xCD, 0x2A];
+        assert_ne!(raised(Access, Some(13), 0x14a, 0, &not), Raised::FailFast);
+        // #GP: privileged instructions, else a non-canonical address.
+        let gp = |code: &[u8]| raised(Access, Some(13), 0, 0, code);
+        let privileged = Raised::Exception(seh::STATUS_PRIVILEGED_INSTRUCTION, None);
+        for code in [
+            &[0xF4][..],               // hlt
+            &[0xFA],                   // cli
+            &[0xEC],                   // in al, dx
+            &[0xE6, 0x80],             // out 0x80, al
+            &[0x0F, 0x32],             // rdmsr
+            &[0x0F, 0x30],             // wrmsr
+            &[0x0F, 0x20, 0xC0],       // mov rax, cr0
+            &[0x44, 0x0F, 0x22, 0xC0], // mov cr8, rax
+            &[0x66, 0xED],             // in ax, dx
+        ] {
+            assert_eq!(gp(code), privileged, "{code:02x?}");
+        }
+        assert_eq!(gp(&[0x48, 0x8B, 0x00]), av(0, 0));
+        assert_eq!(gp(&[]), av(0, 0));
+        // Other traps go by the signal.
+        assert_eq!(raised(Access, Some(17), 0, 0x21, &nop), av(0, 0x21));
+        assert_eq!(raised(Access, None, 0, 0x21, &nop), av(0, 0x21));
+        assert_eq!(
+            raised(IllegalInstruction, Some(6), 0, 0, &[0x0F, 0x0B]),
+            Raised::Exception(seh::STATUS_ILLEGAL_INSTRUCTION, None)
+        );
+        assert_eq!(
+            raised(Breakpoint, Some(3), 0, 0, &nop),
+            Raised::Exception(seh::STATUS_BREAKPOINT, None)
+        );
+        assert_eq!(
+            raised(Arithmetic, Some(0), 0, 0, &nop),
+            Raised::Exception(seh::STATUS_INTEGER_DIVIDE_BY_ZERO, None)
+        );
+    }
+
+    #[test]
+    fn a_thread_with_no_teb_is_not_dispatched() {
+        let why = std::thread::spawn(|| {
+            let stack = [0u64; 8];
+            let mut registers = Registers {
+                rip: 0x7100_0000,
+                rsp: stack.as_ptr() as u64 + 0x100_0000,
+                ..Registers::default()
+            };
+            let before = registers;
+            let mut fault = Fault {
+                kind: FaultKind::Access,
+                address: 0,
+                write: false,
+                trap: Some(PAGE_FAULT),
+                error: 4,
+                registers: &mut registers,
+            };
+            let why = to_exception(&mut fault);
+            assert_eq!(registers, before, "nothing changed");
+            why
+        })
+        .join()
+        .unwrap();
+        assert_eq!(why, Err(NO_TEB));
+        assert!(NO_TEB.contains("a thread with no TEB"));
+    }
+
+    #[test]
+    fn a_patched_page_gets_its_sections_protection_back() {
+        // Headers of a fake image: e_lfanew 0x40; two sections, .text
+        // (read-execute) at 0x1000 and a writable code section at 0x3000
+        // whose VirtualSize is 0 (its raw size, 0x1800, counts).
+        let mut image = vec![0u8; 0x400];
+        image[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        let nt = 0x40;
+        image[nt + 6..nt + 8].copy_from_slice(&2u16.to_le_bytes());
+        image[nt + 20..nt + 22].copy_from_slice(&0xF0u16.to_le_bytes());
+        let table = nt + 24 + 0xF0;
+        let mut section = |i: usize, size: u32, rva: u32, raw: u32, flags: u32| {
+            let at = table + 40 * i;
+            image[at + 8..at + 12].copy_from_slice(&size.to_le_bytes());
+            image[at + 12..at + 16].copy_from_slice(&rva.to_le_bytes());
+            image[at + 16..at + 20].copy_from_slice(&raw.to_le_bytes());
+            image[at + 36..at + 40].copy_from_slice(&flags.to_le_bytes());
+        };
+        section(0, 0x1800, 0x1000, 0x1800, 0x6000_0020);
+        section(1, 0, 0x3000, 0x1800, 0xE000_0020);
+        let base = image.as_ptr() as usize;
+        let writable = |rva| page_writable(base, rva, 0x1000);
+        assert_eq!(writable(0x1000), Some(false));
+        assert_eq!(writable(0x2000), Some(false));
+        assert_eq!(writable(0x3000), Some(true));
+        assert_eq!(writable(0x4000), Some(true), "the raw size");
+        assert_eq!(writable(0x5000), Some(false), "past both");
+        // A page in no image of ours: read-execute, as before.
+        let protection = code_protection(0x7200_0000, 0x1000);
+        assert_eq!(protection, Protection::ReadExecute);
     }
 }

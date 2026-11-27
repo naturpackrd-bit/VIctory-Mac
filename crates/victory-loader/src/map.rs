@@ -29,7 +29,7 @@ use crate::{DLL_PROCESS_ATTACH, ImportResolver, Resolution};
 
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
-const SCN_MEM_WRITE: u32 = 0x8000_0000;
+pub(crate) const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 /// How many images may have static TLS at once: the slots of a thread's
 /// TLS array (`teb`).
@@ -58,6 +58,8 @@ pub enum MapError {
     GsAccesses(Vec<String>),
     #[error("no memory for the stubs of unresolved imports")]
     Stubs,
+    #[error(transparent)]
+    Images(#[from] crate::images::TooManyImages),
     #[error("the image's DllMain refused to attach")]
     EntryRefused,
 }
@@ -149,7 +151,7 @@ impl MappedImage {
                 .info
                 .exception_table
                 .map(|(rva, len)| (image.base + rva as usize, len as usize)),
-        });
+        })?;
         Ok(image)
     }
 

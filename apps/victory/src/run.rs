@@ -645,6 +645,10 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::stubs::UnimplementedPolicy;
 
+    // The title's addresses below 4 GiB are kept for it first, while as
+    // little as can be of ours is mapped (a tools build of a test binary may
+    // have none free).
+    let free: usize = victory_platform::low::reserve().iter().map(|r| r.len).sum();
     if execute {
         check_cpu_features()?;
     }
@@ -659,13 +663,6 @@ pub fn run(
     if info.is_dll() {
         anyhow::bail!("{} is a DLL, not a title executable", exe.display());
     }
-    // The title's addresses below 4 GiB are kept for it before anything is
-    // mapped (a tools build of a test binary may have none free).
-    let free: usize = victory_platform::low::free_ranges()
-        .iter()
-        .map(|r| r.len)
-        .sum();
-    victory_platform::low::reserve();
     println!(
         "low memory     {:.2} GiB reserved below 4 GiB",
         free as f64 / (1u64 << 30) as f64

@@ -3492,7 +3492,8 @@ mod tests {
         let path = format!(r"{dir}\held.txt");
         let stream = open(&path, "w");
         assert_eq!(write_text(stream, "kept"), 4);
-        assert_eq!(bytes_of(&path), b"", "buffered until flushed");
+        // Not asserted "buffered until flushed": another test's `_flushall`
+        // or `fflush(NULL)` running at the same time flushes this stream too.
         // Other tests' streams are flushed too; this one's flush is what
         // is checked.
         assert!(flush_all().0 >= 1);

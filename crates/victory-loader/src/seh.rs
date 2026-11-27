@@ -237,6 +237,8 @@ pub const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
 pub const STATUS_INTEGER_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
 pub const STATUS_INTEGER_OVERFLOW: u32 = 0xC000_0095;
 pub const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xC000_0096;
+/// `__fastfail` (`int 0x29`), the fail-fast code in its first parameter.
+pub const STATUS_STACK_BUFFER_OVERRUN: u32 = 0xC000_0409;
 pub const STATUS_STACK_OVERFLOW: u32 = 0xC000_00FD;
 pub const STATUS_NONCONTINUABLE_EXCEPTION: u32 = 0xC000_0025;
 pub const STATUS_INVALID_DISPOSITION: u32 = 0xC000_0026;
@@ -277,6 +279,7 @@ pub(crate) fn status_name(code: u32) -> &'static str {
         STATUS_INTEGER_DIVIDE_BY_ZERO => "STATUS_INTEGER_DIVIDE_BY_ZERO",
         STATUS_INTEGER_OVERFLOW => "STATUS_INTEGER_OVERFLOW",
         STATUS_PRIVILEGED_INSTRUCTION => "STATUS_PRIVILEGED_INSTRUCTION",
+        STATUS_STACK_BUFFER_OVERRUN => "STATUS_STACK_BUFFER_OVERRUN",
         STATUS_STACK_OVERFLOW => "STATUS_STACK_OVERFLOW",
         STATUS_NONCONTINUABLE_EXCEPTION => "STATUS_NONCONTINUABLE_EXCEPTION",
         STATUS_INVALID_DISPOSITION => "STATUS_INVALID_DISPOSITION",
@@ -371,6 +374,7 @@ impl Context {
             rip: self.rip,
             rflags: u64::from(self.eflags),
             xmm: core::array::from_fn(|i| self.xmm(i)),
+            ymm_upper: None,
         }
     }
 
@@ -954,6 +958,17 @@ pub fn dispatch_exception(record: &mut ExceptionRecord, ctx: &mut Context) -> bo
 /// when none takes it, the unhandled-exception filter, then the crash
 /// report and the end of the process.
 pub fn raise(record: &mut ExceptionRecord, ctx: &mut Context) -> ! {
+    raise_resuming(record, ctx, None)
+}
+
+/// [`raise`], the thread going on with the upper halves of ymm0..15
+/// `upper` (a fault's: the context has the xmm halves only, and the
+/// handlers' own code clears the upper ones, `vzeroupper`).
+fn raise_resuming(
+    record: &mut ExceptionRecord,
+    ctx: &mut Context,
+    upper: Option<&[[u64; 2]; 16]>,
+) -> ! {
     if dispatch_exception(record, ctx) {
         let mut pointers = ExceptionPointers {
             record,
@@ -961,7 +976,7 @@ pub fn raise(record: &mut ExceptionRecord, ctx: &mut Context) -> ! {
         };
         call_handlers(&CONTINUE, &mut pointers);
         // SAFETY: the context a handler has the thread go on in.
-        unsafe { RtlRestoreContext(ctx, ptr::null()) }
+        unsafe { restore(ctx, upper) }
     }
     if let Some(filter) = unhandled_filter() {
         let pointers = ExceptionPointers {
@@ -970,13 +985,64 @@ pub fn raise(record: &mut ExceptionRecord, ctx: &mut Context) -> ! {
         };
         match filter((&raw const pointers).cast()) {
             // SAFETY: as above.
-            EXCEPTION_CONTINUE_EXECUTION => unsafe { RtlRestoreContext(ctx, ptr::null()) },
+            EXCEPTION_CONTINUE_EXECUTION => unsafe { restore(ctx, upper) },
             // SAFETY: the end of the process, with the exception's code.
             EXCEPTION_EXECUTE_HANDLER => unsafe { _exit(record.code as c_int) },
             _ => {}
         }
     }
     fatal(record, ctx)
+}
+
+/// The thread goes on in `ctx`, as [`RtlRestoreContext`] has it, with the
+/// upper halves of ymm0..15 `upper` where there are some and the processor
+/// has AVX: put in first (`vinsertf128`), and kept by the SSE moves of
+/// `RtlRestoreContext`, which leave them alone.
+///
+/// # Safety
+/// As [`RtlRestoreContext`].
+unsafe fn restore(ctx: &Context, upper: Option<&[[u64; 2]; 16]>) -> ! {
+    match upper {
+        // SAFETY: the caller's context; the processor has AVX.
+        Some(upper) if std::arch::is_x86_feature_detected!("avx") => unsafe {
+            restore_with_upper(ctx, upper)
+        },
+        // SAFETY: the caller's context.
+        _ => unsafe { RtlRestoreContext(ctx, ptr::null()) },
+    }
+}
+
+/// The upper halves of ymm0..15 from `upper` (`rdx`), then
+/// [`RtlRestoreContext`] of `ctx` (`rcx`).
+///
+/// # Safety
+/// As [`RtlRestoreContext`]; the processor has AVX.
+#[unsafe(naked)]
+unsafe extern "win64" fn restore_with_upper(
+    ctx: *const Context,
+    upper: *const [[u64; 2]; 16],
+) -> ! {
+    naked_asm!(
+        "vinsertf128 ymm0, ymm0, xmmword ptr [rdx], 1",
+        "vinsertf128 ymm1, ymm1, xmmword ptr [rdx + 0x10], 1",
+        "vinsertf128 ymm2, ymm2, xmmword ptr [rdx + 0x20], 1",
+        "vinsertf128 ymm3, ymm3, xmmword ptr [rdx + 0x30], 1",
+        "vinsertf128 ymm4, ymm4, xmmword ptr [rdx + 0x40], 1",
+        "vinsertf128 ymm5, ymm5, xmmword ptr [rdx + 0x50], 1",
+        "vinsertf128 ymm6, ymm6, xmmword ptr [rdx + 0x60], 1",
+        "vinsertf128 ymm7, ymm7, xmmword ptr [rdx + 0x70], 1",
+        "vinsertf128 ymm8, ymm8, xmmword ptr [rdx + 0x80], 1",
+        "vinsertf128 ymm9, ymm9, xmmword ptr [rdx + 0x90], 1",
+        "vinsertf128 ymm10, ymm10, xmmword ptr [rdx + 0xA0], 1",
+        "vinsertf128 ymm11, ymm11, xmmword ptr [rdx + 0xB0], 1",
+        "vinsertf128 ymm12, ymm12, xmmword ptr [rdx + 0xC0], 1",
+        "vinsertf128 ymm13, ymm13, xmmword ptr [rdx + 0xD0], 1",
+        "vinsertf128 ymm14, ymm14, xmmword ptr [rdx + 0xE0], 1",
+        "vinsertf128 ymm15, ymm15, xmmword ptr [rdx + 0xF0], 1",
+        "xor edx, edx",
+        "jmp {restore}",
+        restore = sym RtlRestoreContext,
+    )
 }
 
 /// The end of the process for an exception of `code` that cannot go on
@@ -993,7 +1059,8 @@ fn fail(code: u32, ctx: &Context) -> ! {
 fn fatal(record: &ExceptionRecord, ctx: &Context) -> ! {
     let mut registers = ctx.to_registers();
     let kind = match record.code {
-        STATUS_ACCESS_VIOLATION => FaultKind::Access,
+        // A fail-fast comes as the #GP of `int 0x29`: SIGSEGV.
+        STATUS_ACCESS_VIOLATION | STATUS_STACK_BUFFER_OVERRUN => FaultKind::Access,
         STATUS_ILLEGAL_INSTRUCTION | STATUS_PRIVILEGED_INSTRUCTION => FaultKind::IllegalInstruction,
         STATUS_BREAKPOINT | STATUS_SINGLE_STEP => FaultKind::Breakpoint,
         _ => FaultKind::Arithmetic,
@@ -1006,6 +1073,8 @@ fn fatal(record: &ExceptionRecord, ctx: &Context) -> ! {
             0
         },
         write: record.information[0] == 1,
+        trap: None,
+        error: 0,
         registers: &mut registers,
     };
     let mut text = String::new();
@@ -1038,13 +1107,30 @@ pub unsafe fn fail_fast(record: *const ExceptionRecord, ctx: *const Context) -> 
 }
 
 /// Where a fault in title code goes on (`faults.rs` resumes the thread
-/// here, on its own stack, with the exception it built below it).
+/// here, on its own stack, with the exception it built below it, and the
+/// upper halves of its ymm registers when the host gave them, or null).
 ///
 /// # Safety
-/// `record` and `ctx` point at the exception, which nothing else uses.
-pub unsafe extern "C" fn dispatch_entry(record: *mut ExceptionRecord, ctx: *mut Context) -> ! {
+/// `record` and `ctx` point at the exception, which nothing else uses;
+/// `upper` is null or points at 16 upper halves.
+pub unsafe extern "C" fn dispatch_entry(
+    record: *mut ExceptionRecord,
+    ctx: *mut Context,
+    upper: *const [[u64; 2]; 16],
+) -> ! {
+    // SAFETY: the caller's exception, and halves or null.
+    unsafe { raise_resuming(&mut *record, &mut *ctx, upper.as_ref()) }
+}
+
+/// Where a fail-fast in title code (`int 0x29`) goes on, as a fault goes
+/// on in [`dispatch_entry`]: reported with no handler asked, as Windows
+/// does, and the end of the process ([`fail_fast`]).
+///
+/// # Safety
+/// `record` and `ctx` point at the exception.
+pub unsafe extern "C" fn fail_fast_entry(record: *const ExceptionRecord, ctx: *const Context) -> ! {
     // SAFETY: the caller's exception.
-    unsafe { raise(&mut *record, &mut *ctx) }
+    unsafe { fail_fast(record, ctx) }
 }
 
 /// `RtlUnwindEx`'s work: from `ctx` (where the walk starts, and the context
@@ -1461,6 +1547,57 @@ mod tests {
             capture = sym RtlCaptureContext,
             restore = sym RtlRestoreContext,
         )
+    }
+
+    static mut UPPER_CAPTURED: Context = Context::zeroed();
+    static mut UPPER_PASSES: u64 = 0;
+    static mut UPPER: [[u64; 2]; 16] = [[0; 2]; 16];
+    static mut YMM15_HIGH: [u64; 2] = [0; 2];
+
+    /// Captures a context; on the first pass, clears the ymm upper halves
+    /// and restores it with those of [`UPPER`]; then keeps ymm15's.
+    #[unsafe(naked)]
+    extern "win64" fn upper_round_trip() {
+        naked_asm!(
+            "push rbx",
+            "sub rsp, 32",
+            "lea rcx, [rip + {ctx}]",
+            "call {capture}",
+            "inc qword ptr [rip + {passes}]",
+            "cmp qword ptr [rip + {passes}], 1",
+            "jne 2f",
+            "vzeroupper",
+            "lea rcx, [rip + {ctx}]",
+            "lea rdx, [rip + {upper}]",
+            "call {restore}",
+            "2:",
+            "vextractf128 xmmword ptr [rip + {high}], ymm15, 1",
+            "add rsp, 32",
+            "pop rbx",
+            "ret",
+            ctx = sym UPPER_CAPTURED,
+            passes = sym UPPER_PASSES,
+            upper = sym UPPER,
+            high = sym YMM15_HIGH,
+            capture = sym RtlCaptureContext,
+            restore = sym restore_with_upper,
+        )
+    }
+
+    #[test]
+    fn a_restore_puts_the_ymm_upper_halves_back() {
+        if !std::arch::is_x86_feature_detected!("avx") {
+            return;
+        }
+        // SAFETY: ours, read by `upper_round_trip` on this thread only.
+        unsafe { (&raw mut UPPER).cast::<[u64; 2]>().add(15).write([1, 2]) };
+        upper_round_trip();
+        // SAFETY: written by `upper_round_trip` on this thread, which is done.
+        let passes = unsafe { (&raw const UPPER_PASSES).read() };
+        // SAFETY: as above.
+        let high = unsafe { (&raw const YMM15_HIGH).read() };
+        assert_eq!(passes, 2);
+        assert_eq!(high, [1, 2]);
     }
 
     #[test]

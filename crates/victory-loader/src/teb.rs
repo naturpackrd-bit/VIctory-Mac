@@ -19,7 +19,8 @@
 //! ([`attach_current_thread`] may be called at any time).
 //!
 //! Not yet (docs/macos.md): TLS callbacks; a PEB with contents (titles get
-//! a zeroed one); `gs` accesses in other forms than a `mov` (mapping refuses
+//! a zeroed one); `gs` accesses in other forms than a `mov`, a `mov` with
+//! another prefix (`66`, `F0`, ...) and a store of `rsp` (mapping refuses
 //! the image and names them; `victory inspect --teb` lists an image's).
 
 use std::cell::RefCell;
@@ -342,6 +343,11 @@ fn encode(access: GsAccess, reg: u8, disp: u32) -> Option<Vec<u8>> {
         // With a scratch register saved around it: `mov scratch, gs:[slot]`,
         // `mov [scratch + disp], reg`.
         GsAccess::Store64 | GsAccess::Store32 => {
+            if reg == 4 {
+                // A store of rsp: inside the thunk, rsp is the caller's less
+                // 16 (`call`, `push`). Never seen (MSVC does not emit it).
+                return None;
+            }
             let scratch = if reg == 0 { 1 } else { 0 };
             code.push(0x50 + scratch); // push
             mov_reg_gs(&mut code, scratch, slot);
@@ -499,8 +505,13 @@ mod tests {
         );
         assert!(encode(GsAccess::Other(0x39), 1, 0x10).is_none(), "cmp");
         assert!(
-            encode(GsAccess::Store64, 4, 0x58).is_some(),
-            "a store of rsp is a plain store"
+            encode(GsAccess::Store64, 4, 0x58).is_none(),
+            "a store of rsp, which the thunk's own call and push move"
+        );
+        assert!(encode(GsAccess::Store32, 4, 0x58).is_none(), "esp");
+        assert!(
+            encode(GsAccess::Store64, 12, 0x58).is_some(),
+            "r12 is not rsp"
         );
     }
 

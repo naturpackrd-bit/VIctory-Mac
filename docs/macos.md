@@ -104,16 +104,43 @@ the milestone that replaces it.
   offset, an indexed slot) are neither patched nor reported and read the
   host thread's segment (MSVC emits the absolute form for the TEB fields
   it knows); `victory inspect --teb` lists an image's absolute ones before
-  it is run. A thread's TLS blocks for an image mapped after the
-  thread attached appear when it attaches again. M2a/M2b.
+  it is run. A `mov` with another legacy prefix before or after `gs`
+  (`mov word gs:[d], ax`, `lock inc gs:[d]`, `rep`) is reported as another
+  instruction from its first prefix, so the mapping fails naming it; so
+  does a store of `rsp` (`mov gs:[d], rsp`, which inside the thunk would
+  store the thunk's own rsp; MSVC does not emit it). A thread's TLS blocks
+  for an image mapped after the thread attached appear when it attaches
+  again. M2a/M2b.
 - `victory-loader`, `faults`: a fault in title code that is not a Zen 2
   instruction to emulate is handed to `seh` on the thread's own stack; a
   thread with no room left there (a stack overflow) gets the old crash
   report (registers, the top of the stack) and exit code 128 + the signal,
-  a path no test has run. Faults in our own code go to the handler that
-  was installed before ours (Rust's, which aborts). Up to 8 handlers of
-  ours (`register`); the alternate stack (64 KiB) is leaked when a thread
-  ends. M2a.
+  a path no test has run; so does a thread with no TEB of ours (not created
+  through `CreateThread`, not attached), which has no stack bounds to check
+  and no alternate stack. Title code is told from ours by a lock-free copy
+  of the images' ranges (at most 64 images mapped at once). The trap number
+  decides the exception: `int 0x29` (`__fastfail`, a #GP whose error code
+  has the write bit) ends the title with `STATUS_STACK_BUFFER_OVERRUN`
+  (the code in its parameter) and a crash report, asking no handler, as
+  Windows does, whatever the signal (what Rosetta 2 raises for it is
+  unverified); a #GP of a privileged instruction (`hlt`, `cli`, `in`/`out`,
+  `rdmsr`/`wrmsr`, a control register move, ...) is
+  `STATUS_PRIVILEGED_INSTRUCTION`, any other #GP an access violation with
+  no address (a non-canonical one); a page fault's first parameter is 0, 1
+  or 8 (an instruction fetch). The Zen 2 patcher of `monitorx`/`mwaitx`
+  patches one page at a time in the process (a patch while another is under
+  way is skipped, the instruction stepped over, and patched at a later
+  fault), and gives the page back the protection the loader gave it, read
+  from the image's section table (read-write-execute when a section in it
+  is writable, else read-execute). A fault resumed after a fix-up (a
+  vectored handler, `EXCEPTION_CONTINUE_EXECUTION`) goes back through
+  `RtlRestoreContext` on the thread's own stack, not through the signal
+  frame, so the ymm upper halves the host saved (Linux's xsave area,
+  macOS's `__darwin_mcontext_avx64`) are kept beside the context and put
+  back (`vinsertf128`) when the processor has AVX; the AVX-512 state is
+  not. Faults in our own code go to the handler that was installed before
+  ours (Rust's, which aborts). Up to 8 handlers of ours (`register`); the
+  alternate stack (64 KiB) is leaked when a thread ends. M2a.
 - `victory-loader`, `seh`: the context of a fault always carries MXCSR
   `0x1F80`, so resuming drops a rounding mode the title set; every SIGFPE
   is `STATUS_INTEGER_DIVIDE_BY_ZERO` and every SIGTRAP `STATUS_BREAKPOINT`
@@ -123,9 +150,10 @@ the milestone that replaces it.
   pointers; `RtlCaptureStackBackTrace` returns no frames (its callers are
   our own frames, which have no unwind data); the `CONTEXT_*` flags are the
   bare bits without `CONTEXT_AMD64`; collided unwinds and noncontinuable
-  exceptions have the code paths and no test; a thread with no TEB counts
-  its stack limit as 0. Nothing of this has run on macOS, where
-  `__es.__err` gives the write bit (compile-checked only). M2a/M2c.
+  exceptions have the code paths and no test. Nothing of this has run on
+  macOS, where `__es.__trapno` and `__es.__err` give the trap and the write
+  bit, and `uc_mcsize` says whether the ymm upper halves are there
+  (compile-checked only). M2a/M2c.
 - `victory-loader`, `unwind`: `backtrace` reads an image's
   exception table again for every frame, and reads an epilogue a byte at a
   time (one checked read a byte: fine for a crash report, to be made one
@@ -648,3 +676,11 @@ segment's size from the executable's header (`getsegbyname`) and counts it
 as mapped. The runtime and the platform crate's test binaries link with a
 one-page `__PAGEZERO` (`build.rs`); every other binary keeps the 4 GiB one
 and sees nothing free below 4 GiB.
+
+The runner reserves the low 4 GiB as the first thing `victory run` does,
+before the title's file is read, hashed or parsed, so that as little as
+possible of ours is mapped there by then (`low::reserve`). A free range of
+which something else maps a page between the reading of the map and the
+allocation is not left whole: the map is read again within it and what is
+still free there taken, round after round while a round takes something
+(at most 8).
