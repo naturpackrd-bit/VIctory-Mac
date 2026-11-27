@@ -66,6 +66,8 @@ fn wide(text: *const u16) -> String {
 }
 
 /// Whether `handle` names an algorithm provider.
+const BCRYPT_RNG_ALG_HANDLE: usize = 0x81;
+
 fn is_algorithm(handle: *mut c_void) -> bool {
     handles::get(handle as usize).is_some_and(|object| {
         let any: &dyn Any = &*object;
@@ -120,7 +122,10 @@ pub extern "win64" fn BCryptGenRandom(
     flags: u32,
 ) -> NTSTATUS {
     let system = flags & BCRYPT_USE_SYSTEM_PREFERRED_RNG != 0;
-    if !(system && handle.is_null()) && !is_algorithm(handle) {
+    // `BCRYPT_RNG_ALG_HANDLE`: Windows 10's pseudo-handle for the system
+    // generator, usable without opening a provider.
+    let pseudo = handle as usize == BCRYPT_RNG_ALG_HANDLE;
+    if !(system && handle.is_null()) && !pseudo && !is_algorithm(handle) {
         return STATUS_INVALID_HANDLE;
     }
     if len == 0 {

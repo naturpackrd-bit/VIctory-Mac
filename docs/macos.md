@@ -267,7 +267,8 @@ the milestone that replaces it.
   title `std::vector::at` out of range will tell. Nothing of it has run on
   macOS or under a title. M2b/M2c.
 - `victory-hle/src/modules/bcrypt.rs`: only the RNG algorithm opens
-  (`getentropy`); every hash, cipher, key and property call fails with
+  (`getentropy`; the `BCRYPT_RNG_ALG_HANDLE` pseudo-handle works too);
+  every hash, cipher, key and property call fails with
   `STATUS_NOT_SUPPORTED` (a warning once each). The census says which the
   title wants. M2b/M2c.
 - `victory-hle/src/modules/com.rs`: no class registry, so `CoCreateInstance`
@@ -284,7 +285,8 @@ the milestone that replaces it.
   (`ERROR_BROKEN_PIPE`, `ERROR_NO_DATA`) are from memory of Windows.
 - `victory-hle/src/modules/win32/locale.rs`: en-US alone (every valid
   locale name gets its data, others `ERROR_INVALID_PARAMETER`); code pages
-  1252 and 437 are read as Latin-1, 65001 as UTF-8, no other; comparisons
+  1252 and 437 are read as Latin-1, 65001 as UTF-8, no other (and
+  `IsValidCodePage` says so); comparisons
   and sort keys are by code unit with simple case folding (no linguistic
   order, no normalization: `FoldStringW` copies); `FormatMessageW`'s system
   table holds the common errors only (others `ERROR_MR_MID_NOT_FOUND`) and

@@ -399,9 +399,9 @@ pub extern "win64" fn GetCPInfoExW(page_id: u32, _flags: u32, out: *mut CPINFOEX
     TRUE
 }
 
-/// The pages Windows always has that matter here.
+/// The pages the converters here take (no UTF-7, no UTF-16 pages).
 pub extern "win64" fn IsValidCodePage(page: u32) -> BOOL {
-    BOOL::from(matches!(page, 1252 | 437 | 65001 | 1200 | 1201 | 65000))
+    BOOL::from(matches!(page, 1252 | 437 | 65001))
 }
 
 /// No page here has lead bytes.
@@ -587,6 +587,8 @@ pub extern "win64" fn LCIDToLocaleName(lcid: u32, out: *mut u16, cch: i32, _flag
 const LOCALE_NOUSEROVERRIDE: u32 = 0x8000_0000;
 const LOCALE_USE_CP_ACP: u32 = 0x4000_0000;
 const LOCALE_RETURN_NUMBER: u32 = 0x2000_0000;
+/// English month names have no genitive form: the same names.
+const LOCALE_RETURN_GENITIVE_NAMES: u32 = 0x1000_0000;
 const LOCALE_ALLOW_NEUTRAL_NAMES: u32 = 0x0800_0000;
 
 const DAYS: [&str; 7] = [
@@ -644,8 +646,8 @@ fn locale_info(lctype: u32) -> Option<(String, bool)> {
         0x15 => text("USD"),
         0x16 => text("."),
         0x17 => text(","),
-        0x19 => number("2"),
-        0x1B => number("0"),
+        0x19 | 0x1A => number("2"),
+        0x1B | 0x74 | 0x75 => number("0"),
         0x1C => number("0"),
         0x1D => text("/"),
         0x1E => text(":"),
@@ -704,7 +706,8 @@ fn locale_value(lctype: u32) -> Result<Result<String, u32>, u32> {
     let flags = LOCALE_NOUSEROVERRIDE
         | LOCALE_USE_CP_ACP
         | LOCALE_RETURN_NUMBER
-        | LOCALE_ALLOW_NEUTRAL_NAMES;
+        | LOCALE_ALLOW_NEUTRAL_NAMES
+        | LOCALE_RETURN_GENITIVE_NAMES;
     let (value, numeric) = locale_info(lctype & !flags).ok_or(ERROR_INVALID_FLAGS)?;
     if lctype & LOCALE_RETURN_NUMBER == 0 {
         return Ok(Ok(value));
@@ -787,6 +790,7 @@ pub extern "win64" fn EnumSystemLocalesEx(
 
 const LCMAP_LOWERCASE: u32 = 0x100;
 const LCMAP_UPPERCASE: u32 = 0x200;
+const LCMAP_TITLECASE: u32 = LCMAP_LOWERCASE | LCMAP_UPPERCASE;
 const LCMAP_SORTKEY: u32 = 0x400;
 const LCMAP_BYTEREV: u32 = 0x800;
 const LCMAP_HIRAGANA: u32 = 0x10_0000;
@@ -821,6 +825,27 @@ fn simple_lower(c: char) -> char {
 }
 
 /// Maps each character of `text` (a lone surrogate stays as it is).
+/// Each word's first letter upper-cased and the rest lower-cased (a word
+/// is a run of letters and digits).
+fn title_case(text: &[u16]) -> Vec<u16> {
+    let mut start = true;
+    let mut out = Vec::with_capacity(text.len());
+    for c in char::decode_utf16(text.iter().copied()) {
+        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+        let mapped = if !c.is_alphanumeric() {
+            start = true;
+            c
+        } else if start {
+            start = false;
+            simple_upper(c)
+        } else {
+            simple_lower(c)
+        };
+        out.extend(mapped.encode_utf16(&mut [0; 2]).iter().copied());
+    }
+    out
+}
+
 fn map_units(text: &[u16], map: impl Fn(char) -> char) -> Vec<u16> {
     let mut out = Vec::with_capacity(text.len());
     for c in char::decode_utf16(text.iter().copied()) {
@@ -884,12 +909,15 @@ fn lc_map(flags: u32, src: *const u16, len: i32, out: *mut u16, cch: i32) -> i32
         let ignore = flags & (NORM_IGNORECASE | LINGUISTIC_IGNORECASE) != 0;
         return put(&sort_key(text, ignore), out.cast::<u8>(), cch);
     }
-    if case == LCMAP_LOWERCASE | LCMAP_UPPERCASE || flags & (case | others) == 0 {
+    if flags & (case | others) == 0 {
         return fail(ERROR_INVALID_FLAGS, 0);
     }
     let mut mapped = match case {
         LCMAP_UPPERCASE => map_units(text, simple_upper),
         LCMAP_LOWERCASE => map_units(text, simple_lower),
+        // `LCMAP_TITLECASE` (both bits): each word's first letter up, the
+        // rest down.
+        LCMAP_TITLECASE => title_case(text),
         // Kana, widths and Chinese scripts: no tables, kept as they are.
         _ => text.to_vec(),
     };
@@ -1132,6 +1160,10 @@ pub extern "win64" fn FoldStringW(
     if flags == 0 {
         return fail(ERROR_INVALID_FLAGS, 0);
     }
+    // In place is refused, as on Windows (the copy would overlap).
+    if !out.is_null() && std::ptr::eq(src, out) {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
     let Some(text) = units(src, len, true).filter(|t| !t.is_empty()) else {
         return fail(ERROR_INVALID_PARAMETER, 0);
     };
@@ -1154,12 +1186,31 @@ fn lstr_order(a: &[u16], b: &[u16], ignore_case: bool) -> i32 {
     compare(a, b, ignore_case) - 2
 }
 
-/// Copies `src` and a NUL to `dst`, `max` units in all at most.
+/// The units of the string at `text` up to its NUL or `most` units,
+/// whichever comes first (the title's source may have no NUL within reach).
+fn lstr_bounded<'a, T: Unit>(text: *const T, most: usize) -> &'a [T] {
+    if text.is_null() {
+        return &[];
+    }
+    // SAFETY: the title's string, read one unit at a time up to `most`.
+    let n = (0..most)
+        .take_while(|&i| unsafe { text.add(i).read() } != T::default())
+        .count();
+    // SAFETY: `n` units were just read there.
+    unsafe { std::slice::from_raw_parts(text, n) }
+}
+
+/// Copies `src` and a NUL to `dst`, `max` units in all at most (and reads
+/// no more of `src` than fit).
 fn lstr_copy<T: Unit>(dst: *mut T, src: *const T, max: usize) -> *mut T {
     if dst.is_null() || max == 0 {
         return dst;
     }
-    let text = lstr(src);
+    let text = if max == usize::MAX {
+        lstr(src)
+    } else {
+        lstr_bounded(src, max - 1)
+    };
     let n = text.len().min(max - 1);
     // SAFETY: the title's buffer holds `max` units (all of `src` and its
     // NUL for the unbounded copies).
@@ -1587,14 +1638,19 @@ fn message(
     } else {
         return Err(ERROR_INVALID_PARAMETER);
     };
-    let slots = if args.is_null() || flags & FORMAT_MESSAGE_ARGUMENT_ARRAY != 0 {
-        args.cast::<u64>()
+    let ignore = flags & FORMAT_MESSAGE_IGNORE_INSERTS != 0;
+    let slots = if ignore || args.is_null() || flags & FORMAT_MESSAGE_ARGUMENT_ARRAY != 0 {
+        // Ignored inserts read no arguments at all, as on Windows.
+        if ignore {
+            std::ptr::null()
+        } else {
+            args.cast::<u64>()
+        }
     } else {
         // SAFETY: a `va_list *`: a pointer to the list's first slot.
         unsafe { args.cast::<*const u64>().read_unaligned() }
     };
     let arguments = Arguments { slots, wide };
-    let ignore = flags & FORMAT_MESSAGE_IGNORE_INSERTS != 0;
     let width = flags & FORMAT_MESSAGE_MAX_WIDTH_MASK;
     format_message(&text, Some(&arguments), ignore, width).ok_or(ERROR_INVALID_PARAMETER)
 }
@@ -2919,6 +2975,66 @@ mod tests {
         assert_eq!((count, last_error()), (1, ERROR_INSUFFICIENT_BUFFER));
         assert_eq!(GetProcessGroupAffinity(nil(), &mut count, &mut group), TRUE);
         assert_eq!(group, 0);
+    }
+
+    /// A bounded copy reads no further than it copies; title case; the
+    /// genitive-names flag; a null-free sort.
+    #[test]
+    fn bounded_copies_title_case_and_genitive_names() {
+        attach();
+        // A 16-byte field with no NUL, followed by nothing readable we rely
+        // on: only the 7 units that fit are read and copied.
+        let field: [u8; 16] = *b"0123456789abcdef";
+        let mut dst = [0xAAu8; 8];
+        assert_eq!(
+            lstrcpynA(dst.as_mut_ptr(), field.as_ptr(), 8),
+            dst.as_mut_ptr()
+        );
+        assert_eq!(&dst, b"0123456\0");
+        let text = w("hello wORLD 2nd");
+        let mut out = [0u16; 16];
+        let n = LCMapStringEx(
+            std::ptr::null(),
+            LCMAP_TITLECASE,
+            text.as_ptr(),
+            -1,
+            out.as_mut_ptr(),
+            16,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+        assert_eq!(n, 16);
+        assert_eq!(String::from_utf16(&out[..15]).unwrap(), "Hello World 2nd");
+        let mut month = [0u16; 16];
+        let n = GetLocaleInfoEx(
+            std::ptr::null(),
+            0x38 | LOCALE_RETURN_GENITIVE_NAMES,
+            month.as_mut_ptr(),
+            16,
+        );
+        assert_eq!(n, 8);
+        assert_eq!(String::from_utf16(&month[..7]).unwrap(), "January");
+        let mut digits = [0u16; 2];
+        assert_eq!(
+            GetLocaleInfoEx(
+                std::ptr::null(),
+                0x1A | LOCALE_RETURN_NUMBER,
+                digits.as_mut_ptr(),
+                2
+            ),
+            2
+        );
+        assert_eq!(digits, [2, 0]);
+        assert_eq!(IsValidCodePage(65000), FALSE);
+        assert_eq!(IsValidCodePage(65001), TRUE);
+        // In place is refused.
+        let mut same = w("abc");
+        assert_eq!(
+            FoldStringW(0x40, same.as_ptr(), -1, same.as_mut_ptr(), 4),
+            0
+        );
+        assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
     }
 
     #[test]

@@ -68,8 +68,18 @@ fn module_handle_ex(
         return 0;
     }
     let module = if flags & FROM_ADDRESS != 0 {
+        // A title image holding the address, else the pseudo module of one
+        // of our exports (a title passing `&GetProcAddress` to find
+        // kernel32).
         victory_loader::images::find(name as usize)
-            .map_or(std::ptr::null_mut(), |image| image.base as *mut c_void)
+            .map(|image| image.base as *mut c_void)
+            .or_else(|| {
+                registry()
+                    .iter()
+                    .find(|m| m.exports.iter().any(|e| e.address == name as usize))
+                    .map(handle)
+            })
+            .unwrap_or(std::ptr::null_mut())
     } else {
         by_name()
     };
@@ -951,6 +961,10 @@ mod tests {
             (out, last_error()),
             (std::ptr::null_mut(), ERROR_MOD_NOT_FOUND)
         );
+        // One of our exports' addresses names its pseudo module.
+        let ours = GetProcAddress as *const () as *const u16;
+        assert_eq!(GetModuleHandleExW(4, ours, &mut out), 1);
+        assert_eq!(out, GetModuleHandleW(w("kernel32.dll").as_ptr()));
         assert_eq!(
             GetModuleHandleExW(0, w("extra.dll").as_ptr(), std::ptr::null_mut()),
             0

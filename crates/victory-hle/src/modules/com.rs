@@ -27,6 +27,8 @@ type HRESULT = i32;
 const S_OK: HRESULT = 0;
 const S_FALSE: HRESULT = 1;
 const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
+/// A null output pointer.
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 #[allow(dead_code)]
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
@@ -227,7 +229,7 @@ pub extern "win64" fn CoCreateInstance(
     out: *mut *mut c_void,
 ) -> HRESULT {
     if out.is_null() {
-        return E_INVALIDARG;
+        return E_POINTER;
     }
     // SAFETY: checked non-null; the title's output.
     unsafe { out.write(std::ptr::null_mut()) };
@@ -640,13 +642,14 @@ fn copy_bstr(text: u64) -> Option<u64> {
 /// # Safety
 /// Both point at elements of that type.
 unsafe fn copy_element(vt: u16, from: *const u8, to: *mut u8) -> bool {
-    // SAFETY: the caller's elements.
+    // SAFETY: the caller's elements; the 8-byte pointer is read only for
+    // the types that hold one (a 1, 2 or 4-byte element is narrower).
     unsafe {
-        let pointer = from.cast::<u64>().read_unaligned();
+        let pointer = || from.cast::<u64>().read_unaligned();
         let copied = match vt {
-            VT_LPSTR => copy_bytes(pointer, string_bytes(pointer, 1)),
-            VT_LPWSTR => copy_bytes(pointer, string_bytes(pointer, 2)),
-            VT_BSTR => copy_bstr(pointer),
+            VT_LPSTR => copy_bytes(pointer(), string_bytes(pointer(), 1)),
+            VT_LPWSTR => copy_bytes(pointer(), string_bytes(pointer(), 2)),
+            VT_BSTR => copy_bstr(pointer()),
             VT_BLOB => {
                 let len = from.cast::<u32>().read_unaligned() as usize;
                 let data = from.add(8).cast::<u64>().read_unaligned();
