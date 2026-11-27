@@ -921,6 +921,9 @@ fn create_window(args: Create) -> HWND {
     let Some(class_name) = args.class.clone() else {
         return fail(ERROR_CANNOT_FIND_WND_CLASS, 0);
     };
+    // The window's thread has a queue from now until it ends, when the
+    // window goes with it.
+    drop(own_queue());
     let (class, wndproc, wnd_extra, unicode) = {
         let classes = classes();
         let Some(i) = find_class(&classes, &class_name, args.instance) else {
@@ -3175,12 +3178,31 @@ impl Queue {
 static QUEUES: LazyLock<Mutex<HashMap<u32, Arc<Queue>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Removes the thread's queue when it ends, as Windows does.
+/// Removes the thread's queue when it ends, as Windows does, and with it
+/// what only that thread could serve: messages sent to it are answered 0,
+/// its windows are gone (no `WM_DESTROY`: the thread that would run their
+/// procedures is ending) and its timers stop.
 struct QueueOwner(u32);
 
 impl Drop for QueueOwner {
     fn drop(&mut self) {
-        lock(&QUEUES).remove(&self.0);
+        if let Some(queue) = lock(&QUEUES).remove(&self.0) {
+            let sent: Vec<SentMessage> = lock(&queue.state).sent.drain(..).collect();
+            for s in sent {
+                *lock(&s.result.0) = Some(0);
+                s.result.1.notify_all();
+            }
+        }
+        for w in windows().iter_mut().skip(1) {
+            if w.thread == self.0 {
+                w.destroyed = true;
+            }
+        }
+        let mut timers = lock(&TIMERS);
+        if timers.iter().any(|t| t.thread == self.0) {
+            timers.retain(|t| t.thread != self.0);
+            TIMERS_CHANGED.notify_all();
+        }
     }
 }
 
@@ -3234,7 +3256,11 @@ fn send(
     if thread == thread_id() || hwnd == DESKTOP {
         return Ok(call(proc, hwnd, msg, wparam, lparam));
     }
-    let target = queue_of(thread);
+    // The window's thread has a queue while it lives (`create_window`);
+    // none means it has ended.
+    let Some(target) = lock(&QUEUES).get(&thread).cloned() else {
+        return Err(ERROR_INVALID_WINDOW_HANDLE);
+    };
     let result = Arc::new((Mutex::new(None), Condvar::new()));
     {
         let mut state = lock(&target.state);
@@ -3246,14 +3272,24 @@ fn send(
         target.wake.notify_all();
     }
     let own = own_queue();
-    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut deadline = timeout.map(|t| Instant::now() + t);
     loop {
         if let Some(answer) = *lock(&result.0) {
             return Ok(answer);
         }
         run_sent(&own);
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            return Err(ERROR_TIMEOUT);
+            // The message is taken back, so the receiver never reads what
+            // the sender's `lparam` points at after the sender has gone
+            // on; one the receiver is running already is answered soon.
+            let mut state = lock(&target.state);
+            let before = state.sent.len();
+            state.sent.retain(|s| !Arc::ptr_eq(&s.result, &result));
+            if state.sent.len() != before {
+                return Err(ERROR_TIMEOUT);
+            }
+            drop(state);
+            deadline = None;
         }
         let guard = lock(&result.0);
         if guard.is_none() {
@@ -3334,12 +3370,14 @@ pub extern "win64" fn PostQuitMessage(code: i32) {
     queue.wake.notify_all();
 }
 
+/// The procedure's answer; 0 and `ERROR_INVALID_WINDOW_HANDLE` for a window
+/// that is not there.
 pub extern "win64" fn SendMessageW(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
-    send(hwnd, msg, wparam, lparam, None).unwrap_or(0)
+    send_wait(hwnd, msg, wparam, lparam)
 }
 
 pub extern "win64" fn SendMessageA(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> LRESULT {
-    send(hwnd, msg, wparam, lparam, None).unwrap_or(0)
+    send_wait(hwnd, msg, wparam, lparam)
 }
 
 /// [`SendMessageW`] waiting `timeout` ms at most; 0 and `ERROR_TIMEOUT`
@@ -3645,21 +3683,26 @@ pub extern "win64" fn MsgWaitForMultipleObjectsEx(
             return WAIT_OBJECT_0 + count;
         }
         let elapsed = start.elapsed().as_millis() as u64;
-        if timeout != INFINITE && elapsed >= u64::from(timeout) {
-            return WAIT_TIMEOUT;
-        }
         let left = if timeout == INFINITE {
             5
         } else {
-            (u64::from(timeout) - elapsed).min(5)
+            u64::from(timeout).saturating_sub(elapsed).min(5)
         };
-        if count == 0 {
+        // The handles are looked at even with no time left (a poll with a
+        // timeout of 0 sees a signalled one).
+        if count != 0 {
+            let result = WaitForMultipleObjects(count, handles, wait_all, left as u32);
+            if result != WAIT_TIMEOUT {
+                return result;
+            }
+        } else if left != 0 {
             wait_change(&queue, generation, Some(Duration::from_millis(left)));
-            continue;
         }
-        let result = WaitForMultipleObjects(count, handles, wait_all, left as u32);
-        if result != WAIT_TIMEOUT {
-            return result;
+        if timeout != INFINITE && start.elapsed().as_millis() as u64 >= u64::from(timeout) {
+            if queue_bits(&queue) & wake_mask != 0 {
+                return WAIT_OBJECT_0 + count;
+            }
+            return WAIT_TIMEOUT;
         }
     }
 }
@@ -4270,6 +4313,72 @@ mod tests {
         assert_eq!(
             super::super::win32::handles::last_error(),
             ERROR_CANNOT_FIND_WND_CLASS
+        );
+    }
+
+    /// A window of a thread that has ended is gone with it: a send answers
+    /// at once instead of waiting for a thread that will never run it.
+    #[test]
+    fn windows_of_an_ended_thread_are_gone() {
+        attach();
+        let class = class("victory.test.ended");
+        let name = class.clone();
+        let hwnd = std::thread::spawn(move || {
+            attach();
+            window(&name, "Ended", 0)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(IsWindow(hwnd), FALSE);
+        assert_eq!(SendMessageW(hwnd, WM_USER + 7, 0, 0), 0);
+        assert_eq!(
+            super::super::win32::handles::last_error(),
+            ERROR_INVALID_WINDOW_HANDLE
+        );
+    }
+
+    /// A poll (timeout 0) of `MsgWaitForMultipleObjects` sees a signalled
+    /// handle, and a timed-out send is taken back from the queue.
+    #[test]
+    fn msg_waits_poll_handles_and_timed_out_sends_are_withdrawn() {
+        use super::super::win32::sync::{CreateEventW, SetEvent};
+        attach();
+        let event = CreateEventW(std::ptr::null_mut(), TRUE, FALSE, std::ptr::null());
+        let handles = [event];
+        assert_eq!(
+            MsgWaitForMultipleObjects(1, handles.as_ptr(), FALSE, 0, 0x4FF),
+            WAIT_TIMEOUT
+        );
+        assert_ne!(SetEvent(event), 0);
+        assert_eq!(
+            MsgWaitForMultipleObjects(1, handles.as_ptr(), FALSE, 0, 0x4FF),
+            WAIT_OBJECT_0
+        );
+        // A window of another thread that never runs its messages: the
+        // send times out and leaves nothing queued behind it.
+        let class = class("victory.test.timeout");
+        let name = class.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            attach();
+            let hwnd = window(&name, "Busy", 0);
+            tx.send(hwnd).unwrap();
+            done_rx.recv().unwrap();
+            lock(&queue_of(thread_id()).state).sent.len()
+        });
+        let hwnd = rx.recv().unwrap();
+        let mut answer = 0usize;
+        assert_eq!(
+            SendMessageTimeoutW(hwnd, WM_USER + 7, 0, 0, 0, 20, &mut answer),
+            0
+        );
+        assert_eq!(super::super::win32::handles::last_error(), ERROR_TIMEOUT);
+        done_tx.send(()).unwrap();
+        assert_eq!(
+            holder.join().unwrap(),
+            0,
+            "the timed-out message was withdrawn"
         );
     }
 

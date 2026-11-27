@@ -295,14 +295,15 @@ impl MtxInner {
         count
     }
 
-    /// Takes it again with `count`, once no other thread holds it.
+    /// Takes it again, `count` more deep (held at least once), once no
+    /// other thread holds it.
     fn retake(&self, count: u32) {
         let me = me();
         let mut st = lock(&self.state);
         while st.1 > 0 && st.0 != 0 && st.0 != me {
             st = self.free.wait(st).unwrap_or_else(PoisonError::into_inner);
         }
-        *st = (me, st.1 + count.max(1));
+        *st = (me, (st.1 + count).max(1));
     }
 }
 
@@ -410,24 +411,20 @@ pub extern "win64" fn _Mtx_getconcrtcs(m: *mut c_void) -> *mut c_void {
     unsafe { m.byte_add(MTX_STATE) }
 }
 
-/// `mutex.cpp`'s: the owner set to nobody and the count down by one (a
-/// count of 0 frees the mutex).
+/// `mutex.cpp`'s: the owner set to nobody while the mutex stays held (the
+/// STL's SRW lock is let go of by the condition variable's wait, not here),
+/// so no other thread takes it between this and [`_Mtx_reset_owner`].
 pub extern "win64" fn _Mtx_clear_owner(m: *mut c_void) {
     if let Some(m) = mtx(m) {
-        let mut st = lock(&m.state);
-        st.0 = 0;
-        st.1 = st.1.saturating_sub(1);
-        if st.1 == 0 {
-            m.free.notify_one();
-        }
+        lock(&m.state).0 = 0;
     }
 }
 
-/// `mutex.cpp`'s: the calling thread the owner and the count up by one
-/// (waiting, here, while another thread holds it).
+/// `mutex.cpp`'s: the calling thread the owner again, its count kept
+/// (waiting, here, while another thread holds it; a free mutex is taken).
 pub extern "win64" fn _Mtx_reset_owner(m: *mut c_void) {
     if let Some(m) = mtx(m) {
-        m.retake(1);
+        m.retake(0);
     }
 }
 
@@ -544,8 +541,13 @@ pub extern "win64" fn _Cnd_signal(c: *mut c_void) -> i32 {
     let Some(c) = cnd(c) else {
         return THRD_ERROR;
     };
-    *lock(&c.seq) += 1;
+    // Under the lock the waiters read the count with: a waiter between its
+    // read and its wait cannot miss this, and a waiter that has seen it
+    // cannot have destroyed the state before the notify.
+    let mut seq = lock(&c.seq);
+    *seq += 1;
     c.cv.notify_one();
+    drop(seq);
     THRD_SUCCESS
 }
 
@@ -554,8 +556,11 @@ pub extern "win64" fn _Cnd_broadcast(c: *mut c_void) -> i32 {
     let Some(c) = cnd(c) else {
         return THRD_ERROR;
     };
-    *lock(&c.seq) += 1;
+    // As `_Cnd_signal`: under the lock.
+    let mut seq = lock(&c.seq);
+    *seq += 1;
     c.cv.notify_all();
+    drop(seq);
     THRD_SUCCESS
 }
 

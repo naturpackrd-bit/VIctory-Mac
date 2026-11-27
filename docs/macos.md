@@ -300,7 +300,9 @@ the milestone that replaces it.
   nothing paints (`BeginPaint` gives a fake device context); hooks are
   stored and never called; `MessageBox` logs and answers `IDOK`;
   `MsgWaitForMultipleObjects` waits in 5 ms slices, checking the queue
-  between them; `SendMessage` converts no strings between the A and W forms;
+  between them; a thread's end takes its windows with it without
+  `WM_DESTROY` (Windows sends it) and answers 0 to what was sent to them;
+  `SendMessage` converts no strings between the A and W forms;
   `SendNotifyMessage` to another thread posts; `InSendMessage` is 0 inside a
   sent message; `AttachThreadInput` and `IsGUIThread` succeed doing
   nothing; the `Message`, `STATIC` and `BUTTON` system classes exist with
