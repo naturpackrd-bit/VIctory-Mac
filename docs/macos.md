@@ -98,9 +98,13 @@ the milestone that replaces it.
   never called. M2b/M2c.
 - `victory-loader`, `teb`: the PEB a title reads through `gs:[0x60]` is a
   zeroed block (`BeingDebugged` 0, no image base, no process parameters).
-  `gs` accesses in any form but a `mov` (`cmp`, `movzx`, ...) make the
-  mapping fail, naming them; `victory inspect --teb` lists an image's
-  before it is run. A thread's TLS blocks for an image mapped after the
+  `gs` accesses of the absolute form (`gs:[disp32]`) in any instruction
+  but a `mov` (`cmp`, `movzx`, ...) make the mapping fail, naming them;
+  accesses through a register (`gs:[rcx]`, `__readgsqword` of a variable
+  offset, an indexed slot) are neither patched nor reported and read the
+  host thread's segment (MSVC emits the absolute form for the TEB fields
+  it knows); `victory inspect --teb` lists an image's absolute ones before
+  it is run. A thread's TLS blocks for an image mapped after the
   thread attached appear when it attaches again. M2a/M2b.
 - `victory-loader`, `faults`: a fault in title code that is not a Zen 2
   instruction to emulate is handed to `seh` on the thread's own stack; a
