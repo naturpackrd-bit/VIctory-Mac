@@ -1,7 +1,8 @@
-//! Events, semaphores, mutexes and the waits on them, with one dispatcher
-//! lock and condition variable for all of them (every signal wakes every
-//! waiter, who checks again: simple and right, to be made finer when it
-//! costs); critical sections, SRW locks, condition variables,
+//! Events, semaphores, mutexes, waitable timers (signaled by a timer thread
+//! of ours) and the waits on them, with one dispatcher lock and condition
+//! variable for all of them (every signal wakes every waiter, who checks
+//! again: simple and right, to be made finer when it costs); critical
+//! sections, SRW locks, condition variables,
 //! `WaitOnAddress`, `InitOnce` and `SList` on the title's own words, with
 //! waiters parked by address; `Sleep`.
 //!
@@ -16,8 +17,8 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Once, PoisonError, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
 use victory_platform::{Host, Thread};
 
@@ -25,6 +26,7 @@ use super::handles::{
     self, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE,
     ERROR_INVALID_PARAMETER, ERROR_SUCCESS, ERROR_TIMEOUT, Object, set_last_error,
 };
+use super::time::file_time_of;
 use crate::{HleExport, hle_export};
 
 /// A wait without a time limit.
@@ -521,6 +523,313 @@ pub extern "win64" fn ReleaseMutex(handle: *mut c_void) -> i32 {
     })
 }
 
+// Waitable timers.
+
+const CREATE_WAITABLE_TIMER_MANUAL_RESET: u32 = 1;
+
+/// A timer's completion routine: (argument, the due time as a `FILETIME`'s
+/// low and high parts).
+type TimerRoutine = extern "win64" fn(*mut c_void, u32, u32);
+
+/// A waitable timer: signaled at its due time, and every period after for
+/// a periodic one; a wait resets a synchronization timer (not
+/// manual-reset), as it does an auto-reset event.
+struct WaitableTimer {
+    manual_reset: bool,
+    signaled: AtomicBool,
+    schedule: Mutex<Schedule>,
+}
+
+/// When a timer is next due and what it does then.
+struct Schedule {
+    /// None while the timer is not armed.
+    due: Option<Instant>,
+    /// The due time as a file time (100 ns since 1601), for the routine.
+    due_time: u64,
+    /// 0 for a timer that is due once.
+    period: Duration,
+    /// The completion routine, 0 for none.
+    routine: usize,
+    argument: usize,
+}
+
+impl Object for WaitableTimer {
+    fn kind(&self) -> &'static str {
+        "timer"
+    }
+    fn waitable(&self) -> Option<&dyn Waitable> {
+        Some(self)
+    }
+}
+
+impl Waitable for WaitableTimer {
+    fn is_signaled(&self, _thread: u32) -> bool {
+        self.signaled.load(Ordering::Relaxed)
+    }
+    fn take(&self, _thread: u32) {
+        if !self.manual_reset {
+            self.signaled.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The timers ever set, for the timer thread. A timer whose last handle
+/// was closed is gone from here, and so disarmed (a named one lives on in
+/// `NAMED`, armed). Taken before a timer's schedule, which is taken before
+/// the dispatcher lock.
+static TIMERS: Mutex<Vec<Weak<dyn Object>>> = Mutex::new(Vec::new());
+
+/// Notified when a timer is set, for the timer thread to look again.
+static TIMERS_CHANGED: Condvar = Condvar::new();
+
+/// The file time (100 ns since 1601) of a host time.
+fn file_time_value(time: SystemTime) -> u64 {
+    let time = file_time_of(time);
+    u64::from(time.high) << 32 | u64::from(time.low)
+}
+
+/// The timer thread: signals each armed timer at its due time, arms a
+/// periodic one again, and calls the completion routines (with no lock
+/// held, so that a routine may set timers); then sleeps until the next due.
+fn timer_thread() {
+    // Completion routines are title code, which may want its thread's TEB.
+    victory_loader::teb::attach_current_thread();
+    let mut timers = lock(&TIMERS);
+    loop {
+        timers.retain(|timer| timer.strong_count() > 0);
+        let now = Instant::now();
+        let mut calls = Vec::new();
+        let mut next: Option<Instant> = None;
+        for weak in timers.iter() {
+            let Some(object) = weak.upgrade() else {
+                continue;
+            };
+            let Some(timer) = downcast::<WaitableTimer>(&object) else {
+                continue;
+            };
+            let mut schedule = lock(&timer.schedule);
+            let Some(due) = schedule.due else {
+                continue;
+            };
+            if due <= now {
+                signal(|| timer.signaled.store(true, Ordering::Relaxed));
+                if schedule.routine != 0 {
+                    calls.push((schedule.routine, schedule.argument, schedule.due_time));
+                }
+                if schedule.period.is_zero() {
+                    schedule.due = None;
+                } else {
+                    // Periods missed while this thread was late are not
+                    // made up: the timer is signaled once for them.
+                    let mut again = due + schedule.period;
+                    if again <= now {
+                        again = now + schedule.period;
+                    }
+                    let ticks = (again - due).as_nanos() / 100;
+                    schedule.due_time = schedule.due_time.wrapping_add(ticks as u64);
+                    schedule.due = Some(again);
+                }
+            }
+            if let Some(due) = schedule.due {
+                next = Some(next.map_or(due, |next| next.min(due)));
+            }
+        }
+        if !calls.is_empty() {
+            drop(timers);
+            for (routine, argument, due_time) in calls {
+                // SAFETY: a completion routine the title gave
+                // `SetWaitableTimer`, of the type Windows calls it as.
+                let routine: TimerRoutine = unsafe { std::mem::transmute(routine) };
+                routine(
+                    argument as *mut c_void,
+                    due_time as u32,
+                    (due_time >> 32) as u32,
+                );
+            }
+            timers = lock(&TIMERS);
+            continue;
+        }
+        timers = match next {
+            Some(due) => {
+                let wait = due.saturating_duration_since(Instant::now());
+                TIMERS_CHANGED
+                    .wait_timeout(timers, wait)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
+            None => TIMERS_CHANGED
+                .wait(timers)
+                .unwrap_or_else(PoisonError::into_inner),
+        };
+    }
+}
+
+/// Starts the timer thread, the first time a timer is set.
+fn start_timer_thread() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        let started = std::thread::Builder::new()
+            .name("victory-waitable-timers".into())
+            .spawn(timer_thread);
+        if let Err(e) = started {
+            tracing::error!(%e, "win32: no waitable-timer thread");
+        }
+    });
+}
+
+fn new_timer(name: Option<String>, manual_reset: bool) -> *mut c_void {
+    create(name, "timer", || {
+        Arc::new(WaitableTimer {
+            manual_reset,
+            signaled: AtomicBool::new(false),
+            schedule: Mutex::new(Schedule {
+                due: None,
+                due_time: 0,
+                period: Duration::ZERO,
+                routine: 0,
+                argument: 0,
+            }),
+        })
+    })
+}
+
+/// A new waitable timer, not armed and not signaled, or the existing one of
+/// that name.
+pub extern "win64" fn CreateWaitableTimerW(
+    _attributes: *const c_void,
+    manual_reset: i32,
+    name: *const u16,
+) -> *mut c_void {
+    new_timer(wide_name(name), manual_reset != 0)
+}
+
+/// See [`CreateWaitableTimerW`].
+pub extern "win64" fn CreateWaitableTimerA(
+    _attributes: *const c_void,
+    manual_reset: i32,
+    name: *const u8,
+) -> *mut c_void {
+    new_timer(narrow_name(name), manual_reset != 0)
+}
+
+/// See [`CreateWaitableTimerW`]; the kind is in `flags`
+/// (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` changes nothing here).
+pub extern "win64" fn CreateWaitableTimerExW(
+    _attributes: *const c_void,
+    name: *const u16,
+    flags: u32,
+    _access: u32,
+) -> *mut c_void {
+    new_timer(
+        wide_name(name),
+        flags & CREATE_WAITABLE_TIMER_MANUAL_RESET != 0,
+    )
+}
+
+/// See [`CreateWaitableTimerExW`].
+pub extern "win64" fn CreateWaitableTimerExA(
+    _attributes: *const c_void,
+    name: *const u8,
+    flags: u32,
+    _access: u32,
+) -> *mut c_void {
+    new_timer(
+        narrow_name(name),
+        flags & CREATE_WAITABLE_TIMER_MANUAL_RESET != 0,
+    )
+}
+
+/// A new handle to the waitable timer of that name.
+pub extern "win64" fn OpenWaitableTimerW(
+    _access: u32,
+    _inherit: i32,
+    name: *const u16,
+) -> *mut c_void {
+    open(wide_name(name), "timer")
+}
+
+/// Arms the timer, dropping what it was set to before and clearing its
+/// signal: due at `*due` (negative: that many 100 ns from now; positive: an
+/// absolute file time; 0: now), then every `period` ms if that is not 0.
+/// The completion routine, when given, is called on our timer thread each
+/// time the timer is signaled (Windows queues it as an APC to the thread
+/// that set the timer, run when that thread waits alertably: there are no
+/// APCs here). `resume` is ignored (nothing sleeps).
+pub extern "win64" fn SetWaitableTimer(
+    timer: *mut c_void,
+    due: *const i64,
+    period: i32,
+    routine: usize,
+    argument: *mut c_void,
+    _resume: i32,
+) -> i32 {
+    if due.is_null() || period < 0 {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(object) = object::<WaitableTimer>(timer) else {
+        set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    let Some(typed) = downcast::<WaitableTimer>(&object) else {
+        set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    // SAFETY: checked non-null; the title's LARGE_INTEGER.
+    let due = unsafe { due.read_unaligned() };
+    let now = file_time_value(SystemTime::now());
+    let (ticks, due_time) = match due {
+        ..0 => (due.unsigned_abs(), now.saturating_add(due.unsigned_abs())),
+        0 => (0, now),
+        _ => ((due as u64).saturating_sub(now), due as u64),
+    };
+    let delay = Duration::from_nanos(ticks.saturating_mul(100));
+    let mut timers = lock(&TIMERS);
+    let weak = Arc::downgrade(&object);
+    if !timers.iter().any(|t| Weak::ptr_eq(t, &weak)) {
+        timers.push(weak);
+    }
+    {
+        let mut schedule = lock(&typed.schedule);
+        *schedule = Schedule {
+            // A time too far to count is never reached.
+            due: Instant::now().checked_add(delay),
+            due_time,
+            period: Duration::from_millis(period as u64),
+            routine,
+            argument: argument as usize,
+        };
+        let _guard = lock(&DISPATCHER.0);
+        typed.signaled.store(false, Ordering::Relaxed);
+    }
+    drop(timers);
+    start_timer_thread();
+    TIMERS_CHANGED.notify_all();
+    1
+}
+
+/// See [`SetWaitableTimer`]; the wake context and the tolerable delay are
+/// ignored.
+pub extern "win64" fn SetWaitableTimerEx(
+    timer: *mut c_void,
+    due: *const i64,
+    period: i32,
+    routine: usize,
+    argument: *mut c_void,
+    _wake_context: *const c_void,
+    _tolerable_delay: u32,
+) -> i32 {
+    SetWaitableTimer(timer, due, period, routine, argument, 0)
+}
+
+/// Disarms the timer; its signaled state is left as it is, as on Windows.
+pub extern "win64" fn CancelWaitableTimer(timer: *mut c_void) -> i32 {
+    with::<WaitableTimer>(timer, |timer| {
+        lock(&timer.schedule).due = None;
+        1
+    })
+}
+
 /// Waits for one of the objects `handles` name (or all of them, with
 /// `wait_all`) for up to `ms` milliseconds: `WAIT_OBJECT_0 + n` for the
 /// object that ended it (0 for all), `WAIT_TIMEOUT`, or `WAIT_FAILED` with
@@ -872,11 +1181,20 @@ pub extern "win64" fn SetCriticalSectionSpinCount(cs: *mut RtlCriticalSection, s
     }
 }
 
-/// Where threads park on one address: its waiter count, and their
+/// Where threads park on one address: its waiters and wakes, and their
 /// condition variable.
 struct Slot {
-    lock: Mutex<usize>,
+    lock: Mutex<Parked>,
     cv: Condvar,
+}
+
+/// What a slot's lock guards.
+struct Parked {
+    /// The threads parked here.
+    waiters: usize,
+    /// Bumped by every `wake`, once for each thread it wakes: a waiter that
+    /// sees it move was woken, whatever its own condition says.
+    wakes: u64,
 }
 
 /// The slots of the addresses threads are parked on.
@@ -886,28 +1204,35 @@ static PARKING: LazyLock<Mutex<HashMap<usize, Arc<Slot>>>> =
 /// The slot for `address`, made on demand, with this thread counted as one
 /// of its waiters (under the parking table's lock, so a waker that changed
 /// the word before finds the slot, and one that comes after finds this
-/// thread in it).
-fn slot(address: usize) -> Arc<Slot> {
+/// thread in it), and the slot's wake count then.
+fn slot(address: usize) -> (Arc<Slot>, u64) {
     let mut parking = lock(&PARKING);
     let slot = parking
         .entry(address)
         .or_insert_with(|| {
             Arc::new(Slot {
-                lock: Mutex::new(0),
+                lock: Mutex::new(Parked {
+                    waiters: 0,
+                    wakes: 0,
+                }),
                 cv: Condvar::new(),
             })
         })
         .clone();
-    *lock(&slot.lock) += 1;
-    slot
+    let wakes = {
+        let mut parked = lock(&slot.lock);
+        parked.waiters += 1;
+        parked.wakes
+    };
+    (slot, wakes)
 }
 
 /// Uncounts this thread from the slot; a slot without waiters is removed.
 fn leave_slot(address: usize, slot: &Arc<Slot>) {
     let mut parking = lock(&PARKING);
-    let mut waiters = lock(&slot.lock);
-    *waiters -= 1;
-    if *waiters == 0 {
+    let mut parked = lock(&slot.lock);
+    parked.waiters -= 1;
+    if parked.waiters == 0 {
         parking.remove(&address);
     }
 }
@@ -915,10 +1240,20 @@ fn leave_slot(address: usize, slot: &Arc<Slot>) {
 /// Parks the thread on `address` until `ready()` (checked under the slot's
 /// lock, which wakers take) or the deadline; whether it became ready.
 fn park(address: usize, deadline: Option<Instant>, mut ready: impl FnMut() -> bool) -> bool {
-    let slot = slot(address);
+    park_counted(address, deadline, |_| ready())
+}
+
+/// [`park`], with `ready` told whether a `wake` on the address came since
+/// the thread parked.
+fn park_counted(
+    address: usize,
+    deadline: Option<Instant>,
+    mut ready: impl FnMut(bool) -> bool,
+) -> bool {
+    let (slot, parked_at) = slot(address);
     let mut guard = lock(&slot.lock);
     let became_ready = loop {
-        if ready() {
+        if ready(guard.wakes != parked_at) {
             break true;
         }
         guard = match deadline {
@@ -947,7 +1282,9 @@ fn wake(address: usize, all: bool) {
     let Some(slot) = lock(&PARKING).get(&address).cloned() else {
         return;
     };
-    let _guard = lock(&slot.lock);
+    let mut parked = lock(&slot.lock);
+    let woken = if all { parked.waiters as u64 } else { 1 };
+    parked.wakes = parked.wakes.wrapping_add(woken);
     if all {
         slot.cv.notify_all();
     } else {
@@ -1121,11 +1458,15 @@ pub extern "win64" fn SleepConditionVariableSRW(
     }
 }
 
-/// Wakes one thread sleeping on the condition variable.
+/// Wakes one thread sleeping on the condition variable, by waking them all
+/// (every sleeper checks the generation again; the API allows spurious
+/// wake-ups). A single `notify_one` can wake a waiter that registered after
+/// the generation was bumped, on hosts whose condition variables are not
+/// FIFO (macOS): that one sleeps again, and the older one is left asleep.
 pub extern "win64" fn WakeConditionVariable(cv: *mut c_void) {
     if !cv.is_null() {
         word(cv).fetch_add(1, Ordering::Release);
-        wake(cv as usize, false);
+        wake(cv as usize, true);
     }
 }
 
@@ -1154,8 +1495,10 @@ fn read_sized(address: *const c_void, size: usize) -> Option<u64> {
 }
 
 /// Waits while the `size` bytes at `address` equal those at `compare`, for
-/// up to `ms` milliseconds: TRUE when they differ, FALSE with
-/// `ERROR_TIMEOUT` when the time ran out.
+/// up to `ms` milliseconds: TRUE when they differ or a `WakeByAddress*` came
+/// (whether the value changed or not: Windows leaves the check again to the
+/// caller; a single wake may release every waiter here, which the API allows
+/// as spurious wake-ups), FALSE with `ERROR_TIMEOUT` when the time ran out.
 pub extern "win64" fn WaitOnAddress(
     address: *mut c_void,
     compare: *const c_void,
@@ -1170,8 +1513,8 @@ pub extern "win64" fn WaitOnAddress(
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
     };
-    let changed = park(address as usize, deadline(ms), || {
-        read_sized(address, size) != Some(undesired)
+    let changed = park_counted(address as usize, deadline(ms), |woken| {
+        woken || read_sized(address, size) != Some(undesired)
     });
     if changed {
         1
@@ -1345,27 +1688,55 @@ pub extern "win64" fn InitOnceComplete(once: *mut c_void, flags: u32, context: *
 /// Every SList operation, on every list: one at a time.
 static SLIST: Mutex<()> = Mutex::new(());
 
-/// An SList's top entry and depth, in the title's 16-byte `SLIST_HEADER`:
-/// the top entry's address in the first 8 bytes, the depth in the next 2.
+/// An SList's top entry and depth, in the title's 16-byte `SLIST_HEADER`
+/// as Windows x64 lays it out: the first qword holds `Depth` (bits 0-15)
+/// and `Sequence` (bits 16-63), the second `HeaderType` (bit 0) and `Init`
+/// (bit 1), both set once an entry was pushed, two reserved bits, and
+/// `NextEntry` (bits 4-63), the top entry's address shifted right by 4.
 struct SListHead(*mut c_void);
 
+/// `HeaderType` and `Init`, set in the second qword with the top entry.
+const SLIST_HEADER_BITS: u64 = 0b11;
+/// One in `Sequence`, the first qword's bits 16-63.
+const SLIST_SEQUENCE_ONE: u64 = 1 << 16;
+
 impl SListHead {
-    fn top(&self) -> *mut c_void {
+    /// One of the header's two qwords.
+    fn qword(&self, index: usize) -> *mut u64 {
         // SAFETY: the caller checked the header non-null; the title's
-        // 16-byte aligned header, touched under `SLIST` only.
-        unsafe { *self.0.cast::<*mut c_void>() }
+        // 16-byte aligned header of two qwords, touched under `SLIST` only.
+        unsafe { self.0.cast::<u64>().add(index) }
+    }
+    fn top(&self) -> *mut c_void {
+        // SAFETY: as in `qword`.
+        let next_entry = unsafe { *self.qword(1) } >> 4;
+        (next_entry << 4) as usize as *mut c_void
     }
     fn set_top(&self, entry: *mut c_void) {
-        // SAFETY: as in `top`.
-        unsafe { *self.0.cast::<*mut c_void>() = entry };
+        let next_entry = (entry as usize as u64) >> 4;
+        // SAFETY: as in `qword`.
+        unsafe { *self.qword(1) = next_entry << 4 | SLIST_HEADER_BITS };
     }
     fn depth(&self) -> u16 {
-        // SAFETY: as in `top`; bytes 8 and 9 of the header.
-        unsafe { *self.0.cast::<u8>().add(8).cast::<u16>() }
+        // SAFETY: as in `qword`.
+        unsafe { *self.qword(0) as u16 }
     }
+    /// Sets the depth, keeping the sequence.
     fn set_depth(&self, depth: u16) {
-        // SAFETY: as in `depth`.
-        unsafe { *self.0.cast::<u8>().add(8).cast::<u16>() = depth };
+        // SAFETY: as in `qword`.
+        unsafe {
+            let first = self.qword(0);
+            *first = *first & !0xFFFF | u64::from(depth);
+        }
+    }
+    /// Counts one more change of the list in its sequence, as Windows does
+    /// on each push and pop.
+    fn bump_sequence(&self) {
+        // SAFETY: as in `qword`.
+        unsafe {
+            let first = self.qword(0);
+            *first = first.read().wrapping_add(SLIST_SEQUENCE_ONE);
+        }
     }
 }
 
@@ -1410,8 +1781,18 @@ pub extern "win64" fn InterlockedPopEntrySList(head: *mut c_void) -> *mut c_void
     if !top.is_null() {
         head.set_top(next(top));
         head.set_depth(head.depth().wrapping_sub(1));
+        head.bump_sequence();
     }
     top
+}
+
+/// The top entry, which stays on the list; null when the list is empty.
+pub extern "win64" fn RtlFirstEntrySList(head: *const c_void) -> *mut c_void {
+    if head.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock(&SLIST);
+    SListHead(head.cast_mut()).top()
 }
 
 /// Empties the list; returns its old top entry (the rest linked from it).
@@ -1453,6 +1834,7 @@ pub extern "win64" fn InterlockedPushListSListEx(
     set_next(last, top);
     head.set_top(first);
     head.set_depth(head.depth().wrapping_add(count as u16));
+    head.bump_sequence();
     top
 }
 
@@ -1483,6 +1865,14 @@ pub(crate) fn exports() -> Vec<HleExport> {
         hle_export!(OpenMutexW),
         hle_export!(OpenMutexA),
         hle_export!(ReleaseMutex),
+        hle_export!(CreateWaitableTimerW),
+        hle_export!(CreateWaitableTimerA),
+        hle_export!(CreateWaitableTimerExW),
+        hle_export!(CreateWaitableTimerExA),
+        hle_export!(OpenWaitableTimerW),
+        hle_export!(SetWaitableTimer),
+        hle_export!(SetWaitableTimerEx),
+        hle_export!(CancelWaitableTimer),
         hle_export!(WaitForSingleObject),
         hle_export!(WaitForSingleObjectEx),
         hle_export!(WaitForMultipleObjects),
@@ -1524,6 +1914,8 @@ pub(crate) fn exports() -> Vec<HleExport> {
         hle_export!(InterlockedFlushSList),
         hle_export!(QueryDepthSList),
         hle_export!(InterlockedPushListSListEx),
+        // ntdll's alone.
+        hle_export!(RtlFirstEntrySList),
         alias(
             "RtlInitializeSListHead",
             InitializeSListHead as *const () as usize,
@@ -1958,6 +2350,137 @@ mod tests {
         assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
     }
 
+    #[test]
+    fn a_wake_releases_a_waiter_on_an_unchanged_value() {
+        let word = Arc::new(AtomicU32::new(3));
+        let address = word.as_ptr() as usize;
+        let waiter = thread::spawn(move || {
+            let undesired = 3u32;
+            let compare = (&raw const undesired).cast::<c_void>();
+            WaitOnAddress(h(address), compare, 4, 5000)
+        });
+        // Wake until the waiter is gone: it may not be parked yet.
+        let start = Instant::now();
+        while !waiter.is_finished() {
+            WakeByAddressSingle(h(address));
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(waiter.join().unwrap(), 1);
+        assert!(start.elapsed() < Duration::from_millis(4000));
+        assert_eq!(word.load(Ordering::Relaxed), 3);
+    }
+
+    fn timer(manual_reset: bool) -> *mut c_void {
+        let timer = CreateWaitableTimerW(null(), i32::from(manual_reset), std::ptr::null());
+        assert!(!timer.is_null());
+        timer
+    }
+
+    /// Arms `timer` due in `ms` from now, then every `period` ms.
+    fn set(timer: *mut c_void, ms: i64, period: i32) -> i32 {
+        let due = -ms * 10_000;
+        SetWaitableTimer(timer, &due, period, 0, std::ptr::null_mut(), 0)
+    }
+
+    #[test]
+    fn a_timer_is_signaled_at_its_due_time() {
+        let timer = timer(false);
+        assert_eq!(WaitForSingleObject(timer, 0), WAIT_TIMEOUT);
+        let start = Instant::now();
+        assert_eq!(set(timer, 30, 0), 1);
+        assert_eq!(WaitForSingleObject(timer, 500), WAIT_OBJECT_0);
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(20), "{took:?}");
+        // A synchronization timer: the wait took the signal; due once.
+        assert_eq!(WaitForSingleObject(timer, 100), WAIT_TIMEOUT);
+        assert_eq!(CloseHandle(timer), 1);
+    }
+
+    #[test]
+    fn a_periodic_timer_signals_again() {
+        let timer = timer(false);
+        assert_eq!(set(timer, 10, 20), 1);
+        assert_eq!(WaitForSingleObject(timer, 1000), WAIT_OBJECT_0);
+        assert_eq!(WaitForSingleObject(timer, 1000), WAIT_OBJECT_0);
+        assert_eq!(CancelWaitableTimer(timer), 1);
+        assert_eq!(CloseHandle(timer), 1);
+    }
+
+    #[test]
+    fn a_cancelled_timer_is_not_signaled() {
+        let timer = timer(true);
+        assert_eq!(set(timer, 50, 0), 1);
+        assert_eq!(CancelWaitableTimer(timer), 1);
+        assert_eq!(WaitForSingleObject(timer, 200), WAIT_TIMEOUT);
+        let event = auto_event();
+        assert_eq!(CancelWaitableTimer(h(event)), 0);
+        assert_eq!(CloseHandle(h(event)), 1);
+        assert_eq!(CloseHandle(timer), 1);
+    }
+
+    #[test]
+    fn a_manual_reset_timer_stays_signaled() {
+        let manual = timer(true);
+        let synchronization = timer(false);
+        assert_eq!(set(manual, 0, 0), 1);
+        assert_eq!(set(synchronization, 0, 0), 1);
+        assert_eq!(WaitForSingleObject(manual, 500), WAIT_OBJECT_0);
+        assert_eq!(WaitForSingleObject(manual, 0), WAIT_OBJECT_0);
+        assert_eq!(WaitForSingleObject(synchronization, 500), WAIT_OBJECT_0);
+        assert_eq!(WaitForSingleObject(synchronization, 0), WAIT_TIMEOUT);
+        // Setting it again clears the signal until the new due time.
+        assert_eq!(set(manual, 5000, 0), 1);
+        assert_eq!(WaitForSingleObject(manual, 0), WAIT_TIMEOUT);
+        assert_eq!(CloseHandle(manual), 1);
+        assert_eq!(CloseHandle(synchronization), 1);
+    }
+
+    static ROUTINE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static ROUTINE_ARGUMENT: AtomicUsize = AtomicUsize::new(0);
+    static ROUTINE_DUE: AtomicUsize = AtomicUsize::new(0);
+
+    // No assertion here: a panic may not leave a `win64` function.
+    extern "win64" fn completion(argument: *mut c_void, low: u32, high: u32) {
+        ROUTINE_ARGUMENT.store(argument as usize, Ordering::SeqCst);
+        let due = (u64::from(high) << 32 | u64::from(low)) as usize;
+        ROUTINE_DUE.store(due, Ordering::SeqCst);
+        ROUTINE_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_timer_calls_its_completion_routine_and_opens_by_name() {
+        victory_loader::teb::attach_current_thread();
+        let name: Vec<u16> = "victory-test-named-timer\0".encode_utf16().collect();
+        let timer =
+            CreateWaitableTimerExW(null(), name.as_ptr(), CREATE_WAITABLE_TIMER_MANUAL_RESET, 0);
+        assert!(!timer.is_null());
+        let opened = OpenWaitableTimerW(0, 0, name.as_ptr());
+        assert!(!opened.is_null());
+        let unknown: Vec<u16> = "victory-test-no-such-timer\0".encode_utf16().collect();
+        assert!(OpenWaitableTimerW(0, 0, unknown.as_ptr()).is_null());
+        assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
+        let due = 0i64;
+        let routine = completion as *const () as usize;
+        let argument = 0x1234 as *mut c_void;
+        assert_eq!(SetWaitableTimer(opened, &due, 0, routine, argument, 0), 1);
+        assert_eq!(WaitForSingleObject(timer, 500), WAIT_OBJECT_0);
+        let start = Instant::now();
+        while ROUTINE_CALLS.load(Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(ROUTINE_ARGUMENT.load(Ordering::SeqCst), 0x1234);
+        // The due time, as a file time: well after 1601.
+        assert!(ROUTINE_DUE.load(Ordering::SeqCst) > 1 << 56);
+        assert_eq!(
+            SetWaitableTimer(opened, null().cast(), 0, 0, argument, 0),
+            0
+        );
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(CloseHandle(opened), 1);
+        assert_eq!(CloseHandle(timer), 1);
+    }
+
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
     extern "win64" fn initialize(
@@ -2020,8 +2543,11 @@ mod tests {
         struct Header([u64; 2]);
         let mut header = Header([u64::MAX; 2]);
         let head: *mut c_void = (&raw mut header).cast();
-        let mut entries = [[0usize; 2]; 3];
-        let base: *mut [usize; 2] = entries.as_mut_ptr();
+        // Entries are 16-byte aligned, as Windows x64 requires.
+        #[repr(C, align(16))]
+        struct Entry([usize; 2]);
+        let mut entries = [Entry([0; 2]), Entry([0; 2]), Entry([0; 2])];
+        let base: *mut Entry = entries.as_mut_ptr();
         // SAFETY: indices within the array.
         let [e0, e1, e2] = [0, 1, 2].map(|i| unsafe { base.add(i) }.cast::<c_void>());
         InitializeSListHead(head);
@@ -2031,8 +2557,16 @@ mod tests {
         assert_eq!(InterlockedPushEntrySList(head, e1), e0);
         assert_eq!(InterlockedPushEntrySList(head, e2), e1);
         assert_eq!(QueryDepthSList(head), 3);
+        // Windows x64's layout: depth and sequence (one per push), then the
+        // top entry >> 4 above the header type and init bits.
+        assert_eq!(header.0[0], 3 << 16 | 3);
+        assert_eq!(header.0[1], (e2 as u64 >> 4) << 4 | 0b11);
+        assert_eq!(RtlFirstEntrySList(head), e2);
+        assert_eq!(QueryDepthSList(head), 3);
         assert_eq!(InterlockedPopEntrySList(head), e2);
         assert_eq!(QueryDepthSList(head), 2);
+        assert_eq!(header.0[0], 4 << 16 | 2);
+        assert_eq!(RtlFirstEntrySList(head), e1);
         let rest = InterlockedFlushSList(head);
         assert_eq!(rest, e1);
         assert_eq!(next(rest), e0);
@@ -2071,7 +2605,7 @@ mod tests {
 
     #[test]
     fn every_export_is_listed() {
-        // 61 functions, 5 of them also under their ntdll names.
-        assert_eq!(exports().len(), 61 + 5);
+        // 70 functions, 5 of them also under their ntdll names.
+        assert_eq!(exports().len(), 70 + 5);
     }
 }

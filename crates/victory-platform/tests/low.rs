@@ -5,7 +5,9 @@
 //! is free.
 #![cfg(all(unix, target_arch = "x86_64"))]
 
-use victory_platform::low::{LOW_FLOOR, LOW_LIMIT, carve, free_ranges, reserve};
+use victory_platform::low::{
+    LOW_FLOOR, LOW_LIMIT, carve, carve_at, free_ranges, give_back, reserve,
+};
 use victory_platform::{Host, Memory};
 
 #[test]
@@ -58,4 +60,16 @@ fn reserving_takes_what_is_free_and_carving_hands_it_out() {
     assert_ne!(a, b);
     assert!(!(a..a + 2 * page).contains(&b), "{a:#x} {b:#x}");
     assert_eq!(carve(usize::MAX / 2, page), None);
+
+    // At an address of the caller's: once, and back with `give_back`.
+    assert!(give_back(b, page));
+    assert!(carve_at(b, page));
+    assert!(!carve_at(b, page), "carved already");
+    // SAFETY: ours, read-write.
+    unsafe {
+        (b as *mut u8).write(7);
+        assert_eq!((b as *const u8).read(), 7);
+    }
+    assert!(give_back(b, page));
+    assert!(!carve_at(a, page), "carved by `carve`");
 }

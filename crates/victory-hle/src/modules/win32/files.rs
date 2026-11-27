@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::handles::{self, ERROR_INVALID_HANDLE, INVALID_HANDLE_VALUE, Object, set_last_error};
-use super::sync::SetEvent;
+use super::sync::{SetEvent, Waitable};
 use super::time::{FILETIME, file_time_of};
 use crate::{HleExport, hle_export};
 
@@ -257,6 +257,9 @@ fn drive_root(letter: char) -> Option<PathBuf> {
 struct WinPath {
     drive: char,
     parts: Vec<String>,
+    /// The path the title gave ended in a separator (and is not a root):
+    /// its Windows form keeps it. Host paths ignore it.
+    trailing_separator: bool,
 }
 
 /// The drive letter (upper-case) and the rest of a path that starts `X:`.
@@ -276,7 +279,11 @@ fn join(drive: char, mut parts: Vec<String>, tail: &str) -> WinPath {
             _ => parts.push(part.to_owned()),
         }
     }
-    WinPath { drive, parts }
+    WinPath {
+        drive,
+        parts,
+        trailing_separator: false,
+    }
 }
 
 /// The title's current directory, parsed.
@@ -287,6 +294,7 @@ fn current_dir() -> WinPath {
         None => WinPath {
             drive: 'C',
             parts: Vec::new(),
+            trailing_separator: false,
         },
     }
 }
@@ -309,7 +317,16 @@ fn default_dir() -> String {
 /// dropped), and a relative path (`a\b`, `.\a`, `..\a`) or a root-relative
 /// one (`\a\b`) against the current directory. `None` for a UNC path
 /// (`\\server\share`), a device path (`\\.\x`), or a name with a NUL inside.
+/// A separator at the end of a path that is not a root is kept
+/// (`trailing_separator`).
 fn parse(path: &str) -> Option<WinPath> {
+    let mut parsed = parse_parts(path)?;
+    parsed.trailing_separator = path.ends_with(['\\', '/']) && !parsed.parts.is_empty();
+    Some(parsed)
+}
+
+/// [`parse`], without the trailing separator.
+fn parse_parts(path: &str) -> Option<WinPath> {
     if path.contains('\0') {
         return None;
     }
@@ -390,7 +407,8 @@ fn resolve(path: &WinPath) -> Result<PathBuf, u32> {
     Ok(host)
 }
 
-/// The Windows form `X:\a\b` of a parsed path (`X:\` for a root).
+/// The Windows form `X:\a\b` of a parsed path (`X:\` for a root; `X:\a\b\`
+/// when the title's path ended in a separator).
 fn windows_form(path: &WinPath) -> String {
     let mut out = format!("{}:", path.drive);
     if path.parts.is_empty() {
@@ -399,6 +417,9 @@ fn windows_form(path: &WinPath) -> String {
     for part in &path.parts {
         out.push('\\');
         out.push_str(part);
+    }
+    if path.trailing_separator && !path.parts.is_empty() {
+        out.push('\\');
     }
     out
 }
@@ -692,6 +713,18 @@ impl Object for FileObject {
     fn kind(&self) -> &'static str {
         "file"
     }
+    fn waitable(&self) -> Option<&dyn Waitable> {
+        Some(self)
+    }
+}
+
+/// A file handle is signaled when an I/O on it completes; ours complete
+/// before they return, so a wait on one succeeds at once and takes nothing.
+impl Waitable for FileObject {
+    fn is_signaled(&self, _thread: u32) -> bool {
+        true
+    }
+    fn take(&self, _thread: u32) {}
 }
 
 /// One entry a find handle lists.
@@ -777,7 +810,9 @@ fn open_object(
     if let Some(kind) = device(&name) {
         return Ok((FileObject::new(kind, name), false));
     }
-    let (path, host) = locate(Some(name))?;
+    let (mut path, host) = locate(Some(name))?;
+    // The handle's path names the object, without a trailing separator.
+    path.trailing_separator = false;
     let windows_path = windows_form(&path);
     let can_read = access & (GENERIC_READ | FILE_READ_DATA | GENERIC_ALL) != 0;
     let can_write = access & (GENERIC_WRITE | FILE_WRITE_DATA | GENERIC_ALL) != 0;
@@ -987,11 +1022,19 @@ fn transfer(
             (*overlapped).internal_high = bytes as usize;
             (*overlapped).event
         };
-        if !event.is_null() {
-            SetEvent(event);
-        }
+        signal_completion(event);
     }
     Ok(Done { bytes, end })
+}
+
+/// Signals an `OVERLAPPED`'s event, if it has one. Bit 0 of the handle set
+/// keeps the completion off a completion port on Windows; the event is
+/// still signaled, so the bit is dropped here.
+fn signal_completion(event: HANDLE) {
+    let event = (event as usize & !1) as HANDLE;
+    if !event.is_null() {
+        SetEvent(event);
+    }
 }
 
 /// `ReadFile` and `WriteFile`'s body.
@@ -1167,8 +1210,11 @@ pub extern "win64" fn SetFilePointer(
                 // SAFETY: checked non-null.
                 unsafe { *distance_high = (position >> 32) as i32 };
             }
-            // A low part of 0xFFFFFFFF is told from a failure by this.
-            set_last_error(0);
+            // A low part of 0xFFFFFFFF is told from a failure by a cleared
+            // last error; any other leaves it, as on Windows.
+            if position as u32 == INVALID_SET_FILE_POINTER {
+                set_last_error(0);
+            }
             position as u32
         }
         Err(code) => fail(code, INVALID_SET_FILE_POINTER),
@@ -1198,7 +1244,11 @@ pub extern "win64" fn GetFileSize(handle: HANDLE, high: *mut DWORD) -> DWORD {
                 // SAFETY: checked non-null; the title's output.
                 unsafe { *high = (size >> 32) as u32 };
             }
-            set_last_error(0);
+            // As in `SetFilePointer`: cleared only where it tells success
+            // from failure.
+            if size as u32 == INVALID_FILE_SIZE {
+                set_last_error(0);
+            }
             size as u32
         }
         Err(code) => fail(code, INVALID_FILE_SIZE),
@@ -1775,7 +1825,8 @@ pub extern "win64" fn CopyFileW(from: *const u16, to: *const u16, fail_if_exists
 
 /// The full Windows form of a path, against the current directory; nothing
 /// is looked up on disk. `file_part` (if given) points at the last
-/// component in the buffer, or is null for a root.
+/// component in the buffer, or is null for a path that ends in `\` (a root,
+/// or a path the title gave with a trailing separator, which is kept).
 pub extern "win64" fn GetFullPathNameW(
     name: *const u16,
     len: DWORD,
@@ -1792,7 +1843,8 @@ pub extern "win64" fn GetFullPathNameW(
     let written = copy_out(&text, buffer, len);
     let length = text.encode_utf16().count() as u32;
     if written == length && !file_part.is_null() {
-        let part = path.parts.last().map_or(std::ptr::null_mut(), |last| {
+        let last = path.parts.last().filter(|_| !text.ends_with('\\'));
+        let part = last.map_or(std::ptr::null_mut(), |last| {
             let start = length as usize - last.encode_utf16().count();
             // SAFETY: within the buffer just written.
             unsafe { buffer.add(start) }
@@ -1814,6 +1866,10 @@ fn set_current_directory(name: Option<String>) -> BOOL {
         if !host.is_dir() {
             return Err(ERROR_PATH_NOT_FOUND);
         }
+        let path = WinPath {
+            trailing_separator: false,
+            ..path
+        };
         *lock(&CURRENT_DIR) = Some(windows_form(&path));
         Ok(())
     }))
@@ -2450,26 +2506,44 @@ pub extern "win64" fn UnlockFile(
     TRUE
 }
 
-/// See [`LockFile`].
+/// A lock's `OVERLAPPED`, if given, completed with success: nothing was
+/// locked, but the title may wait for its event or read its status.
+fn complete_lock(overlapped: *mut OVERLAPPED) {
+    if overlapped.is_null() {
+        return;
+    }
+    // SAFETY: checked non-null; the title's OVERLAPPED.
+    let event = unsafe {
+        (*overlapped).internal = STATUS_SUCCESS;
+        (*overlapped).internal_high = 0;
+        (*overlapped).event
+    };
+    signal_completion(event);
+}
+
+/// See [`LockFile`]; the `OVERLAPPED` (the range's offset) is completed at
+/// once, its event signaled.
 pub extern "win64" fn LockFileEx(
     _handle: HANDLE,
     _flags: DWORD,
     _reserved: DWORD,
     _bytes_low: DWORD,
     _bytes_high: DWORD,
-    _overlapped: *mut OVERLAPPED,
+    overlapped: *mut OVERLAPPED,
 ) -> BOOL {
+    complete_lock(overlapped);
     TRUE
 }
 
-/// See [`LockFile`].
+/// See [`LockFileEx`].
 pub extern "win64" fn UnlockFileEx(
     _handle: HANDLE,
     _reserved: DWORD,
     _bytes_low: DWORD,
     _bytes_high: DWORD,
-    _overlapped: *mut OVERLAPPED,
+    overlapped: *mut OVERLAPPED,
 ) -> BOOL {
+    complete_lock(overlapped);
     TRUE
 }
 
@@ -2797,6 +2871,89 @@ mod tests {
         );
         assert_eq!(GetLastError(), ERROR_FILE_NOT_FOUND);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn completions_signal_events_and_file_handles_are_waitable() {
+        victory_loader::teb::attach_current_thread();
+        let (dir, x) = folder("signal");
+        fs::write(dir.join("f.bin"), b"abcdef").unwrap();
+        let file = format!(r"{x}:\f.bin");
+        let handle = open(&file, GENERIC_READ, OPEN_EXISTING, FILE_FLAG_OVERLAPPED);
+        assert_ne!(handle, invalid());
+        // A file handle is signaled: every wait succeeds at once.
+        assert_eq!(WaitForSingleObject(handle, 0), WAIT_OBJECT_0);
+        assert_eq!(WaitForSingleObject(handle, 0), WAIT_OBJECT_0);
+
+        // Bit 0 of the event set (no completion port): still signaled.
+        let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+        let mut overlapped = OVERLAPPED {
+            internal: 1,
+            internal_high: 1,
+            offset: 2,
+            offset_high: 0,
+            event: (event as usize | 1) as HANDLE,
+        };
+        let mut buffer = [0u8; 2];
+        let mut moved = 0;
+        let read = ReadFile(
+            handle,
+            buffer.as_mut_ptr().cast(),
+            2,
+            &mut moved,
+            &mut overlapped,
+        );
+        assert_eq!((read, &buffer), (TRUE, b"cd"));
+        assert_eq!(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+
+        // A lock completes its OVERLAPPED at once.
+        let null = std::ptr::null_mut();
+        assert_eq!(super::super::sync::ResetEvent(event), TRUE);
+        overlapped.internal = 1;
+        overlapped.internal_high = 1;
+        assert_eq!(LockFileEx(handle, 0, 0, 1, 0, &mut overlapped), TRUE);
+        assert_eq!((overlapped.internal, overlapped.internal_high), (0, 0));
+        assert_eq!(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+        assert_eq!(super::super::sync::ResetEvent(event), TRUE);
+        assert_eq!(UnlockFileEx(handle, 0, 1, 0, &mut overlapped), TRUE);
+        assert_eq!(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+        assert_eq!(LockFileEx(handle, 0, 0, 1, 0, null), TRUE);
+
+        // The last error is left by a position that is not 0xFFFFFFFF.
+        set_last_error(ERROR_GEN_FAILURE);
+        assert_eq!(SetFilePointer(handle, 3, null.cast(), FILE_BEGIN), 3);
+        assert_eq!(GetLastError(), ERROR_GEN_FAILURE);
+        assert_eq!(GetFileSize(handle, null.cast()), 6);
+        assert_eq!(GetLastError(), ERROR_GEN_FAILURE);
+        assert_eq!(CloseHandle(handle), TRUE);
+        assert_eq!(CloseHandle(event), TRUE);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_paths_keep_a_trailing_separator() {
+        victory_loader::teb::attach_current_thread();
+        let mut buffer = [0u16; 64];
+        let mut part = std::ptr::null_mut();
+        let name = w("G:\\data\\");
+        let len = GetFullPathNameW(name.as_ptr(), 64, buffer.as_mut_ptr(), &mut part);
+        assert_eq!(
+            String::from_utf16_lossy(&buffer[..len as usize]),
+            r"G:\data\"
+        );
+        assert!(part.is_null());
+        let name = w(r"G:\data");
+        let len = GetFullPathNameW(name.as_ptr(), 64, buffer.as_mut_ptr(), &mut part);
+        assert_eq!(
+            String::from_utf16_lossy(&buffer[..len as usize]),
+            r"G:\data"
+        );
+        // SAFETY: `part` points into `buffer`.
+        assert_eq!(unsafe { part.offset_from(buffer.as_ptr()) }, 3);
+        let name = w("G:/");
+        let len = GetFullPathNameW(name.as_ptr(), 64, buffer.as_mut_ptr(), &mut part);
+        assert_eq!(String::from_utf16_lossy(&buffer[..len as usize]), r"G:\");
+        assert!(part.is_null());
     }
 
     #[test]

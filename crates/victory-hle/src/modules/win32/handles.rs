@@ -161,7 +161,9 @@ pub extern "win64" fn CloseHandle(handle: *mut c_void) -> i32 {
 /// A new handle to the object `source` names, within this process (the only
 /// process there is: both process handles must be `GetCurrentProcess()`).
 /// The thread pseudo-handle gives a real handle to the calling thread's
-/// object (`threads.rs`).
+/// object (`threads.rs`). The process pseudo-handle gives itself (Windows
+/// gives a real handle; the pseudo-handle works wherever ours take a
+/// process handle).
 pub extern "win64" fn DuplicateHandle(
     source_process: *mut c_void,
     source: *mut c_void,
@@ -180,6 +182,12 @@ pub extern "win64" fn DuplicateHandle(
     if target.is_null() {
         set_last_error(ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    // `INVALID_HANDLE_VALUE` is `GetCurrentProcess()`'s pseudo-handle.
+    if source as usize == INVALID_HANDLE_VALUE {
+        // SAFETY: checked non-null; the title passes a place for one handle.
+        unsafe { *target = source };
+        return 1;
     }
     let object = if source as usize == CURRENT_THREAD {
         Some(super::threads::current() as Arc<dyn Object>)
@@ -299,6 +307,14 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(CloseHandle(duplicate), 1);
         assert_eq!(CloseHandle(source), 1);
+
+        // The process pseudo-handle duplicates to itself.
+        let mut copy: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            DuplicateHandle(process, process, process, &mut copy, 0, 0, 0),
+            1
+        );
+        assert_eq!(copy, process);
         assert!(get(second).is_none() || !Arc::ptr_eq(&get(second).unwrap(), &a));
     }
 

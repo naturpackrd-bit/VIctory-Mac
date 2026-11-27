@@ -37,6 +37,10 @@ pub(crate) const MEM_DECOMMIT: u32 = 0x4000;
 pub(crate) const MEM_RELEASE: u32 = 0x8000;
 pub(crate) const MEM_FREE: u32 = 0x10000;
 pub(crate) const MEM_PRIVATE: u32 = 0x20000;
+/// The pages' contents may be dropped (advice: nothing is done here).
+const MEM_RESET: u32 = 0x8_0000;
+/// The pages' contents are wanted again after a `MEM_RESET` (they were kept).
+const MEM_RESET_UNDO: u32 = 0x100_0000;
 pub(crate) const MEM_TOP_DOWN: u32 = 0x100000;
 pub(crate) const MEM_LARGE_PAGES: u32 = 0x20000000;
 
@@ -189,14 +193,14 @@ fn reserve(
     protect: u32,
 ) -> Result<usize, u32> {
     let page = page();
-    let (base, len, host_start, host_len) = if address == 0 {
+    let (base, len, host_start, host_len, low) = if address == 0 {
         let len = round_up(size, page).ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
         let host_len = len
             .checked_add(GRANULARITY)
             .ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
         let host_start = Host::allocate(host_len, None).ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
         let base = round_up(host_start, GRANULARITY).ok_or(ERROR_NOT_ENOUGH_MEMORY)?;
-        (base, len, host_start, host_len)
+        (base, len, host_start, host_len, false)
     } else {
         let base = address & !(GRANULARITY - 1);
         let end = address
@@ -204,10 +208,16 @@ fn reserve(
             .and_then(|end| round_up(end, page))
             .ok_or(ERROR_INVALID_ADDRESS)?;
         let len = end - base;
-        if Host::allocate(len, Some(base)) != Some(base) {
+        // Below 4 GiB the runner reserved what was free at start: the range
+        // is taken out of that reservation (and given back to it on
+        // release). Where nothing was reserved (no runner: tests), the host
+        // is asked for it as above 4 GiB.
+        let low =
+            base < victory_platform::low::LOW_LIMIT && victory_platform::low::carve_at(base, len);
+        if !low && Host::allocate(len, Some(base)) != Some(base) {
             return Err(ERROR_INVALID_ADDRESS);
         }
-        (base, len, base, len)
+        (base, len, base, len, low)
     };
     // Every page starts reserved: no access until committed. A refusal
     // leaves them read-write, which no title relies on; the region stays.
@@ -228,7 +238,7 @@ fn reserve(
             pages,
             host_start,
             host_len,
-            low: false,
+            low,
         },
     );
     Ok(base)
@@ -317,8 +327,9 @@ fn reserve_within_in(
 }
 
 /// Commits the pages of `[address, address + size)`, which must lie in one
-/// region, with `protect`: fresh pages are zeroed, committed ones are left
-/// as they are (as on Windows). The first page's address.
+/// region, with `protect`: fresh pages are zeroed, committed ones keep
+/// their contents, and the whole range gets `protect` (as on Windows). The
+/// first page's address.
 fn commit(
     map: &mut BTreeMap<usize, Region>,
     address: usize,
@@ -340,29 +351,54 @@ fn commit(
             let at = base + start * page;
             let len = count * page;
             // SAFETY: pages of our reservation that nothing refers into
-            // (uncommitted): made writable, zeroed (a decommitted page still
-            // holds what it had), then given what was asked.
+            // (uncommitted): made writable and zeroed (a decommitted page
+            // still holds what it had).
             unsafe {
                 refused |= !Host::protect(at, len, Protection::ReadWrite);
                 if !refused {
                     (at as *mut u8).write_bytes(0, len);
-                    refused |= !Host::protect(at, len, host);
                 }
             }
         },
     );
-    if refused {
+    // The whole range, fresh pages and committed ones, gets what was asked.
+    // SAFETY: pages of our reservation, which the title commits with this
+    // protection.
+    if refused || !unsafe { Host::protect(base + first * page, (last - first) * page, host) } {
         return Err(ERROR_NOT_ENOUGH_MEMORY);
     }
-    for p in &mut region.pages[first..last] {
-        if !p.committed {
-            *p = Page {
-                committed: true,
-                protect,
-            };
-        }
-    }
+    region.pages[first..last].fill(Page {
+        committed: true,
+        protect,
+    });
     Ok(base + first * page)
+}
+
+/// `MEM_RESET` and `MEM_RESET_UNDO`, which Windows takes with no other
+/// flag: none when `kind` asks for neither. The range must be committed
+/// pages of one region; its page-aligned start is returned and nothing is
+/// done to the pages (the reset is advice: their contents are kept).
+fn reset(
+    map: &mut BTreeMap<usize, Region>,
+    address: usize,
+    size: usize,
+    kind: u32,
+) -> Option<Result<usize, u32>> {
+    if kind & (MEM_RESET | MEM_RESET_UNDO) == 0 {
+        return None;
+    }
+    if kind & (MEM_RESERVE | MEM_COMMIT) != 0 {
+        return Some(Err(ERROR_INVALID_PARAMETER));
+    }
+    let committed = region_at(map, address).and_then(|(base, region)| {
+        let (first, last) = page_range(base, region.pages.len(), address, size)?;
+        let pages = &region.pages[first..last];
+        pages
+            .iter()
+            .all(|p| p.committed)
+            .then_some(base + first * page())
+    });
+    Some(committed.ok_or(ERROR_INVALID_ADDRESS))
 }
 
 fn virtual_alloc(address: usize, size: usize, kind: u32, protect: u32) -> Result<usize, u32> {
@@ -373,9 +409,13 @@ fn virtual_alloc(address: usize, size: usize, kind: u32, protect: u32) -> Result
     }
     let host = protection(protect).ok_or(ERROR_INVALID_PARAMETER)?;
     let mut map = regions();
+    if let Some(reset) = reset(&mut map, address, size, kind) {
+        return reset;
+    }
     match (kind & MEM_RESERVE != 0, kind & MEM_COMMIT != 0) {
-        (true, commit_too) => {
-            let base = reserve(&mut map, address, size, protect)?;
+        // A null address with `MEM_COMMIT` alone reserves too, as on Windows.
+        (reserve, commit_too) if reserve || address == 0 => {
+            let base = self::reserve(&mut map, address, size, protect)?;
             if commit_too {
                 let len = map.get(&base).map_or(0, |r| r.size);
                 if let Err(code) = commit(&mut map, base, len, protect, host) {
@@ -408,12 +448,16 @@ pub(crate) fn virtual_alloc_within(
     }
     let host = protection(protect).ok_or(ERROR_INVALID_PARAMETER)?;
     let mut map = regions();
+    if let Some(reset) = reset(&mut map, address, size, kind) {
+        return reset;
+    }
     match (kind & MEM_RESERVE != 0, kind & MEM_COMMIT != 0) {
-        (true, commit_too) => {
+        // A null address with `MEM_COMMIT` alone reserves too, as on Windows.
+        (reserve, commit_too) if reserve || address == 0 => {
             let base = if address == 0 {
                 reserve_within_in(&mut map, low, high, size, align, protect)?
             } else {
-                reserve(&mut map, address, size, protect)?
+                self::reserve(&mut map, address, size, protect)?
             };
             if commit_too {
                 let len = map.get(&base).map_or(0, |r| r.size);
@@ -589,7 +633,10 @@ fn virtual_protect(address: usize, size: usize, new_protect: u32) -> Result<u32,
     let host = protection(new_protect).ok_or(ERROR_INVALID_PARAMETER)?;
     let page = page();
     let mut map = regions();
-    let (base, region) = region_at(&mut map, address).ok_or(ERROR_INVALID_ADDRESS)?;
+    let Some((base, region)) = region_at(&mut map, address) else {
+        drop(map);
+        return protect_image(address, size, host);
+    };
     // A size of 0 still names the page `address` is in.
     let (first, last) =
         page_range(base, region.pages.len(), address, size.max(1)).ok_or(ERROR_INVALID_ADDRESS)?;
@@ -608,6 +655,30 @@ fn virtual_protect(address: usize, size: usize, new_protect: u32) -> Result<u32,
         p.protect = new_protect;
     }
     Ok(old)
+}
+
+/// `VirtualProtect` of pages outside our regions: within a mapped image of
+/// the title's (its sections, which the loader mapped), the host's
+/// protection is changed; anywhere else is `ERROR_INVALID_ADDRESS`. The old
+/// protection is not known (the loader keeps no record of its sections'),
+/// so `PAGE_EXECUTE_READWRITE` stands for it.
+fn protect_image(address: usize, size: usize, host: Protection) -> Result<u32, u32> {
+    let page = page();
+    let start = address & !(page - 1);
+    let end = address
+        .checked_add(size.max(1))
+        .and_then(|end| round_up(end, page))
+        .ok_or(ERROR_INVALID_ADDRESS)?;
+    let image = victory_loader::images::find(address).ok_or(ERROR_INVALID_ADDRESS)?;
+    if start < image.base || end > image.base + image.size {
+        return Err(ERROR_INVALID_ADDRESS);
+    }
+    // SAFETY: pages of a mapped image whose protection the title asks to
+    // change, as Windows lets it.
+    if !unsafe { Host::protect(start, end - start, host) } {
+        return Err(ERROR_INVALID_ADDRESS);
+    }
+    Ok(PAGE_EXECUTE_READWRITE)
 }
 
 /// Changes the protection of committed pages; `*old` gets the first's.
@@ -1352,8 +1423,12 @@ mod tests {
 
         assert!(VirtualAlloc(std::ptr::null_mut(), 0, MEM_RESERVE, PAGE_READWRITE).is_null());
         assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
-        assert!(VirtualAlloc(std::ptr::null_mut(), page, MEM_COMMIT, PAGE_READWRITE).is_null());
-        assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+        // `MEM_COMMIT` alone at no address reserves and commits.
+        let p = VirtualAlloc(std::ptr::null_mut(), page, MEM_COMMIT, PAGE_READWRITE);
+        assert!(!p.is_null());
+        let info = query(p as usize);
+        assert_eq!((info.state, info.protect), (MEM_COMMIT, PAGE_READWRITE));
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), TRUE);
         assert!(VirtualAlloc(std::ptr::null_mut(), page, MEM_RESERVE, 0x3).is_null());
         assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
     }
@@ -1378,6 +1453,76 @@ mod tests {
         // SAFETY: committed read-write.
         unsafe { *(again as *mut u8).add(size - 1) = 1 };
         assert_eq!(VirtualFree(again, 0, MEM_RELEASE), TRUE);
+    }
+
+    #[test]
+    fn reset_keeps_committed_pages() {
+        victory_loader::teb::attach_current_thread();
+        let page = page();
+        let base =
+            VirtualAlloc(std::ptr::null_mut(), 4 * page, MEM_RESERVE, PAGE_READWRITE) as usize;
+        assert_ne!(base, 0);
+        let committed = VirtualAlloc(base as LPVOID, 2 * page, MEM_COMMIT, PAGE_READWRITE);
+        assert_eq!(committed as usize, base);
+        // SAFETY: committed read-write.
+        unsafe { *(base as *mut u8).add(page + 3) = 9 };
+        let reset = VirtualAlloc((base + 5) as LPVOID, 2 * page - 5, MEM_RESET, PAGE_NOACCESS);
+        assert_eq!(reset as usize, base);
+        // SAFETY: still committed read-write: a reset is advice.
+        assert_eq!(unsafe { *(base as *const u8).add(page + 3) }, 9);
+        let undo = VirtualAlloc(base as LPVOID, page, MEM_RESET_UNDO, PAGE_READWRITE);
+        assert_eq!(undo as usize, base);
+        assert_eq!(query(base).state, MEM_COMMIT);
+        // Reserved pages in the range: refused.
+        let reset = VirtualAlloc(base as LPVOID, 3 * page, MEM_RESET, PAGE_READWRITE);
+        assert!(reset.is_null());
+        assert_eq!(last_error(), ERROR_INVALID_ADDRESS);
+        let mixed = VirtualAlloc(base as LPVOID, page, MEM_RESET | MEM_COMMIT, PAGE_READWRITE);
+        assert!(mixed.is_null());
+        assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+        assert_eq!(VirtualFree(base as LPVOID, 0, MEM_RELEASE), TRUE);
+    }
+
+    #[test]
+    fn committing_again_sets_the_protection() {
+        victory_loader::teb::attach_current_thread();
+        let page = page();
+        let p = VirtualAlloc(
+            std::ptr::null_mut(),
+            2 * page,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        // SAFETY: committed read-write.
+        unsafe { *(p as *mut u8) = 5 };
+        let mut old = 0;
+        assert_eq!(VirtualProtect(p, 2 * page, PAGE_READONLY, &mut old), TRUE);
+        assert_eq!(query(p as usize).protect, PAGE_READONLY);
+        assert_eq!(VirtualAlloc(p, 2 * page, MEM_COMMIT, PAGE_READWRITE), p);
+        assert_eq!(query(p as usize).protect, PAGE_READWRITE);
+        // SAFETY: read-write again; the contents were kept.
+        unsafe {
+            assert_eq!(*(p as *const u8), 5);
+            *(p as *mut u8).add(page) = 6;
+        }
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), TRUE);
+    }
+
+    #[test]
+    fn protect_outside_regions() {
+        victory_loader::teb::attach_current_thread();
+        let page = page();
+        let p = VirtualAlloc(std::ptr::null_mut(), page, MEM_COMMIT, PAGE_READWRITE);
+        assert!(!p.is_null());
+        let mut old = 0;
+        assert_eq!(VirtualProtect(p, page, PAGE_READONLY, &mut old), TRUE);
+        assert_eq!(old, PAGE_READWRITE);
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), TRUE);
+        // No region and no image there (below every host's lowest mapping).
+        let wild = 0x2000 as LPVOID;
+        assert_eq!(VirtualProtect(wild, page, PAGE_READONLY, &mut old), FALSE);
+        assert_eq!(last_error(), ERROR_INVALID_ADDRESS);
     }
 
     #[test]

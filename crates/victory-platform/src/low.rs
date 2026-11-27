@@ -115,6 +115,54 @@ pub fn carve(len: usize, align: usize) -> Option<usize> {
     Some(at)
 }
 
+/// Takes `[base, base + len)` (`base` a multiple of the page size, `len`
+/// rounded up to pages) out of the reserved piece it lies in, splitting the
+/// piece, and makes it read-write, as [`carve`] does: for a title that asks
+/// for memory at an address of its own. False, taking nothing, when the
+/// range does not lie wholly within one piece still held (not reserved, or
+/// carved already). What it takes goes back with [`give_back`].
+pub fn carve_at(base: usize, len: usize) -> bool {
+    let page = Host::page_size();
+    if len == 0 || !base.is_multiple_of(page) {
+        return false;
+    }
+    let Some(len) = len.checked_next_multiple_of(page) else {
+        return false;
+    };
+    let Some(end) = base.checked_add(len) else {
+        return false;
+    };
+    let mut pieces = reserved();
+    let Some(index) = pieces
+        .iter()
+        .position(|piece| piece.start <= base && end <= piece.start + piece.len)
+    else {
+        return false;
+    };
+    // SAFETY: a range inside a reserved piece: memory from `allocate`, with
+    // no access until now, which nothing refers into.
+    if !unsafe { Host::protect(base, len, Protection::ReadWrite) } {
+        return false;
+    }
+    let piece = pieces[index];
+    let before = Range {
+        start: piece.start,
+        len: base - piece.start,
+    };
+    let after = Range {
+        start: end,
+        len: piece.start + piece.len - end,
+    };
+    let rest: Vec<Range> = [before, after].into_iter().filter(|r| r.len > 0).collect();
+    pieces.splice(index..=index, rest);
+    // Taken after RESERVED where both are.
+    CARVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Range { start: base, len });
+    true
+}
+
 /// Returns a range [`carve`] handed out (`start` as carved, `len` as asked
 /// or as rounded) to the reserved pieces, with no access again and nothing
 /// backing it; false if it is not one `carve` handed out (or was given back
@@ -386,5 +434,18 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn carve_at_takes_only_what_is_reserved() {
+        let page = Host::page_size();
+        // Below the floor nothing is ever reserved; nor above the low range.
+        assert!(!carve_at(0, page));
+        assert!(!carve_at(LOW_FLOOR - page, page));
+        assert!(!carve_at(LOW_LIMIT, page));
+        // Not a whole page, or nothing at all.
+        assert!(!carve_at(LOW_FLOOR + 1, page));
+        assert!(!carve_at(LOW_FLOOR, 0));
+        assert!(!carve_at(usize::MAX - page + 1, page));
     }
 }
