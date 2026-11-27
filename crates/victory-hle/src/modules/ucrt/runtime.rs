@@ -952,7 +952,7 @@ const MESSAGES: [&str; 43] = [
 ];
 
 /// The message of an `errno` value.
-fn message(code: i32) -> &'static str {
+pub(crate) fn message(code: i32) -> &'static str {
     usize::try_from(code)
         .ok()
         .and_then(|i| MESSAGES.get(i))
@@ -1540,8 +1540,8 @@ pub extern "win64" fn __std_type_info_hash(data: *const TypeInfo) -> usize {
 /// `std::exception`'s data: its message, and whether the exception owns it.
 #[repr(C)]
 pub struct ExceptionData {
-    what: *const c_char,
-    do_free: u8,
+    pub(crate) what: *const c_char,
+    pub(crate) do_free: u8,
 }
 
 const _: () = assert!(std::mem::size_of::<ExceptionData>() == 16);

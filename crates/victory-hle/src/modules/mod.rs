@@ -20,6 +20,8 @@ pub mod gameinput;
 pub mod kernel;
 pub mod lifecycle;
 pub mod media;
+#[cfg(not(windows))]
+pub mod msvcp;
 pub mod net;
 pub mod rpcrt4;
 pub mod speech;
@@ -67,6 +69,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(rpcrt4::module());
     all.push(xmem::module());
     all.push(xsystem::module());
+    #[cfg(not(windows))]
+    all.push(msvcp::module());
     #[cfg(not(windows))]
     all.push(ucrt::module());
     #[cfg(not(windows))]

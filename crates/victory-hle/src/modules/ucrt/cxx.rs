@@ -137,6 +137,53 @@ pub struct TypeDescriptor {
     pub name: [u8; 0],
 }
 
+/// Ours, in `ThrowInfo::attributes`: the throw info is a [`ThrowInfoAbs`],
+/// whose tables are addresses (our own exceptions', which live in Rust
+/// statics, nowhere near an image base); the record's image base is 0.
+pub(crate) const TI_VICTORY_ABSOLUTE: u32 = 0x4000_0000;
+
+/// [`ThrowInfo`] with addresses in place of RVAs.
+#[repr(C)]
+pub(crate) struct ThrowInfoAbs {
+    /// `TI_*` and [`TI_VICTORY_ABSOLUTE`].
+    pub attributes: u32,
+    pub pad: u32,
+    /// An `extern "win64" fn(*mut c_void)`, 0 for none.
+    pub destructor: usize,
+    /// 0.
+    pub forward_compat: usize,
+    pub catchable_types: *const CatchableTypeArrayAbs,
+}
+
+/// The catchable types of a [`ThrowInfoAbs`], the most derived first.
+#[repr(C)]
+pub(crate) struct CatchableTypeArrayAbs {
+    pub count: usize,
+    /// The first `count` are used.
+    pub types: [*const CatchableTypeAbs; 4],
+}
+
+/// [`CatchableType`] with addresses in place of RVAs.
+#[repr(C)]
+pub(crate) struct CatchableTypeAbs {
+    pub properties: u32,
+    pub pad: u32,
+    pub type_descriptor: *const TypeDescriptor,
+    pub this_displacement: Pmd,
+    pub size_or_offset: i32,
+    /// An `extern "win64" fn(this, from)` (with `r8` 1 for a class with
+    /// virtual bases), 0 for none.
+    pub copy_function: usize,
+}
+
+// SAFETY: read-only tables, which point at other read-only tables and at
+// functions.
+unsafe impl Sync for ThrowInfoAbs {}
+// SAFETY: as above.
+unsafe impl Sync for CatchableTypeArrayAbs {}
+// SAFETY: as above.
+unsafe impl Sync for CatchableTypeAbs {}
+
 /// The FH3 `FuncInfo` (x64).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -194,6 +241,10 @@ const _: () = {
     assert!(size_of::<FuncInfo3>() == 40);
     assert!(size_of::<TryBlockMapEntry3>() == 20);
     assert!(size_of::<HandlerType3>() == 20);
+    assert!(size_of::<ThrowInfoAbs>() == 32);
+    assert!(size_of::<CatchableTypeArrayAbs>() == 40);
+    assert!(size_of::<CatchableTypeAbs>() == 40);
+    assert!(offset_of!(CatchableTypeAbs, copy_function) == 32);
 };
 
 // ---------------------------------------------------------------------------
@@ -704,12 +755,25 @@ unsafe fn read_handler4(s: &mut Stream, function_start: u32) -> Handler {
 // Thrown objects and their types.
 
 /// What a C++ record carries: the object, its `ThrowInfo`, and the base
-/// the `ThrowInfo`'s RVAs are from.
+/// the `ThrowInfo`'s RVAs are from (0 for a [`ThrowInfoAbs`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Thrown {
-    object: u64,
-    info: u64,
-    base: u64,
+pub(crate) struct Thrown {
+    pub(crate) object: u64,
+    pub(crate) info: u64,
+    pub(crate) base: u64,
+}
+
+/// A catchable type of a thrown object, either form, its tables resolved to
+/// addresses.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Catchable {
+    pub(crate) properties: u32,
+    /// The `TypeDescriptor`'s address.
+    pub(crate) type_descriptor: u64,
+    pub(crate) this_displacement: Pmd,
+    pub(crate) size_or_offset: i32,
+    /// The copy constructor's address, 0 for none.
+    pub(crate) copy_function: u64,
 }
 
 /// Whether `r` is a C++ exception's record (rethrow records included).
@@ -720,7 +784,7 @@ fn is_cxx(r: &ExceptionRecord) -> bool {
 }
 
 /// The thrown object of the C++ record `r`, as its parameters name it.
-fn thrown_in(r: &ExceptionRecord) -> Option<Thrown> {
+pub(crate) fn thrown_in(r: &ExceptionRecord) -> Option<Thrown> {
     (is_cxx(r) && r.information[2] != 0).then(|| Thrown {
         object: r.information[1],
         info: r.information[2],
@@ -742,46 +806,186 @@ fn thrown_of(r: &ExceptionRecord) -> Option<Thrown> {
 }
 
 impl Thrown {
+    /// Whether the throw info is a [`ThrowInfoAbs`].
+    ///
     /// # Safety
     /// The record's `ThrowInfo` and its tables are mapped.
-    unsafe fn throw_info(&self) -> ThrowInfo {
+    unsafe fn absolute(&self) -> bool {
+        // SAFETY: the caller's: both forms start with their attributes.
+        unsafe { read::<u32>(self.info) & TI_VICTORY_ABSOLUTE != 0 }
+    }
+
+    /// The throw's `TI_*` attributes.
+    ///
+    /// # Safety
+    /// As [`Thrown::absolute`].
+    unsafe fn attributes(&self) -> u32 {
         // SAFETY: the caller's.
-        unsafe { read(self.info) }
+        unsafe { read::<u32>(self.info) & !TI_VICTORY_ABSOLUTE }
+    }
+
+    /// The object's destructor's address, 0 for none.
+    ///
+    /// # Safety
+    /// As [`Thrown::absolute`].
+    unsafe fn destructor(&self) -> u64 {
+        // SAFETY: the caller's, either form.
+        unsafe {
+            if self.absolute() {
+                read::<u64>(self.info + offset_of!(ThrowInfoAbs, destructor) as u64)
+            } else {
+                match read::<ThrowInfo>(self.info).pmfn_unwind {
+                    0 => 0,
+                    unwind => rva(self.base, unwind),
+                }
+            }
+        }
     }
 
     /// The catchable types, in their array's order.
     ///
     /// # Safety
-    /// As [`Thrown::throw_info`].
-    unsafe fn catchables(&self) -> Vec<CatchableType> {
+    /// As [`Thrown::absolute`].
+    pub(crate) unsafe fn catchables(&self) -> Vec<Catchable> {
         // SAFETY: the caller's, here and below.
-        let array = rva(
-            self.base,
-            unsafe { self.throw_info() }.p_catchable_type_array,
-        );
+        if unsafe { self.absolute() } {
+            // SAFETY: as above.
+            let info: &ThrowInfoAbs = unsafe { &*(self.info as *const ThrowInfoAbs) };
+            // SAFETY: as above.
+            let Some(array) = (unsafe { info.catchable_types.as_ref() }) else {
+                return Vec::new();
+            };
+            return array.types[..array.count.min(4)]
+                .iter()
+                .map(|&ct| {
+                    // SAFETY: as above.
+                    let ct = unsafe { &*ct };
+                    Catchable {
+                        properties: ct.properties,
+                        type_descriptor: ct.type_descriptor as u64,
+                        this_displacement: ct.this_displacement,
+                        size_or_offset: ct.size_or_offset,
+                        copy_function: ct.copy_function as u64,
+                    }
+                })
+                .collect();
+        }
+        // SAFETY: as above.
+        let array = rva(self.base, unsafe {
+            read::<ThrowInfo>(self.info).p_catchable_type_array
+        });
         // SAFETY: as above.
         let n: i32 = unsafe { read(array) };
         (0..n.max(0) as u64)
-            // SAFETY: as above.
-            .map(|i| unsafe { read(rva(self.base, read(array + 4 + 4 * i))) })
+            .map(|i| {
+                // SAFETY: as above.
+                let ct: CatchableType = unsafe { read(rva(self.base, read(array + 4 + 4 * i))) };
+                Catchable {
+                    properties: ct.properties,
+                    type_descriptor: rva(self.base, ct.p_type),
+                    this_displacement: ct.this_displacement,
+                    size_or_offset: ct.size_or_offset,
+                    copy_function: match ct.copy_function {
+                        0 => 0,
+                        f => rva(self.base, f),
+                    },
+                }
+            })
             .collect()
+    }
+
+    /// The first catchable type a handler of `adjectives` and type `name`
+    /// (None: none) takes (None: none); `Some(None)` for `catch(...)`.
+    ///
+    /// # Safety
+    /// As [`Thrown::absolute`].
+    pub(crate) unsafe fn catchable_as(
+        &self,
+        adjectives: u32,
+        name: Option<&[u8]>,
+    ) -> Option<Option<Catchable>> {
+        if is_ellipsis(adjectives, name) {
+            return Some(None);
+        }
+        // SAFETY: the caller's, here and below.
+        let attributes = unsafe { self.attributes() };
+        // SAFETY: as above.
+        unsafe { self.catchables() }
+            .into_iter()
+            .find(|ct| {
+                // SAFETY: as above.
+                let ct_name = unsafe { type_name(ct.type_descriptor) };
+                type_matches(adjectives, name, ct.properties, ct_name, attributes)
+            })
+            .map(Some)
+    }
+
+    /// The size of the object (its most derived catchable type's), 0 when
+    /// it has no catchable types.
+    ///
+    /// # Safety
+    /// As [`Thrown::absolute`].
+    pub(crate) unsafe fn size(&self) -> usize {
+        // SAFETY: the caller's.
+        unsafe { self.catchables() }
+            .first()
+            .map_or(0, |ct| ct.size_or_offset.max(0) as usize)
+    }
+
+    /// Copies the object into `to`, [`Thrown::size`] bytes, as its most
+    /// derived type: through its copy constructor, or its bytes.
+    ///
+    /// # Safety
+    /// As [`Thrown::absolute`]; the object is alive, `to` writable.
+    pub(crate) unsafe fn copy_to(&self, to: u64) {
+        // SAFETY: the caller's.
+        if let Some(ct) = unsafe { self.catchables() }.first() {
+            // SAFETY: as above.
+            unsafe { build_catch_object_at(to, 0, self, ct) };
+        }
     }
 
     /// Runs the object's destructor, if it has one.
     ///
     /// # Safety
-    /// As [`Thrown::throw_info`]; the object is alive.
-    unsafe fn destroy(&self) {
+    /// As [`Thrown::absolute`]; the object is alive.
+    pub(crate) unsafe fn destroy(&self) {
         // SAFETY: the caller's.
-        let unwind = unsafe { self.throw_info() }.pmfn_unwind;
-        if unwind != 0 && self.object != 0 {
-            // SAFETY: the title's destructor, given its object.
-            unsafe {
-                let dtor = std::mem::transmute::<u64, Destructor>(rva(self.base, unwind));
-                dtor(self.object);
-            }
+        let dtor = unsafe { self.destructor() };
+        if dtor != 0 && self.object != 0 {
+            // SAFETY: the title's destructor (or ours), given its object.
+            unsafe { std::mem::transmute::<u64, Destructor>(dtor)(self.object) };
         }
     }
+}
+
+/// The thrown object `object` of the throw info `info`, either form: the
+/// base of the image-relative form is the image holding `info`.
+pub(crate) fn thrown_from(object: *mut c_void, info: *const c_void) -> Thrown {
+    // SAFETY: the title's throw info, whose attributes say its form.
+    let absolute = unsafe { read::<u32>(info as u64) } & TI_VICTORY_ABSOLUTE != 0;
+    let base = if absolute {
+        0
+    } else {
+        // SAFETY: an address, looked up.
+        unsafe { seh::RtlPcToFileHeader(info.cast_mut(), ptr::null_mut()) as u64 }
+    };
+    Thrown {
+        object: object as u64,
+        info: info as u64,
+        base,
+    }
+}
+
+/// The C++ exception being handled on this thread (the top of the
+/// handling stack): its record and object; None when there is none or it
+/// is not a C++ exception.
+pub(crate) fn current_cxx() -> Option<(ExceptionRecord, Thrown)> {
+    HANDLING.with(|h| {
+        h.borrow()
+            .last()
+            .and_then(|x| thrown_in(&x.record).map(|t| (x.record, t)))
+    })
 }
 
 /// The decorated name of the `TypeDescriptor` at `at`, without its NUL.
@@ -856,24 +1060,12 @@ pub(crate) unsafe fn adjust_pointer(object: u64, pmd: Pmd) -> u64 {
 /// none); `Some(None)` for `catch(...)`.
 ///
 /// # Safety
-/// As [`Thrown::throw_info`]; `h`'s type is in the image at `base`.
-unsafe fn handler_takes(h: &Handler, base: u64, t: &Thrown) -> Option<Option<CatchableType>> {
+/// As [`Thrown::absolute`]; `h`'s type is in the image at `base`.
+unsafe fn handler_takes(h: &Handler, base: u64, t: &Thrown) -> Option<Option<Catchable>> {
     // SAFETY: the caller's descriptors, here and below.
     let name = (h.type_rva != 0).then(|| unsafe { type_name(base + u64::from(h.type_rva)) });
-    if is_ellipsis(h.adjectives, name) {
-        return Some(None);
-    }
     // SAFETY: as above.
-    let attributes = unsafe { t.throw_info() }.attributes;
-    // SAFETY: as above.
-    unsafe { t.catchables() }
-        .into_iter()
-        .find(|ct| {
-            // SAFETY: as above.
-            let ct_name = unsafe { type_name(rva(t.base, ct.p_type)) };
-            type_matches(h.adjectives, name, ct.properties, ct_name, attributes)
-        })
-        .map(Some)
+    unsafe { t.catchable_as(h.adjectives, name) }
 }
 
 /// vcruntime's `BuildCatchObjectHelper`: the catch object of `h` in the
@@ -883,15 +1075,25 @@ unsafe fn handler_takes(h: &Handler, base: u64, t: &Thrown) -> Option<Option<Cat
 ///
 /// # Safety
 /// The frame and the object are alive; the tables are mapped.
-unsafe fn build_catch_object(establisher: u64, h: &Handler, t: &Thrown, ct: &CatchableType) {
+unsafe fn build_catch_object(establisher: u64, h: &Handler, t: &Thrown, ct: &Catchable) {
     if h.catch_obj == 0 {
         return;
     }
     let slot = establisher.wrapping_add_signed(i64::from(h.catch_obj));
+    // SAFETY: the caller's.
+    unsafe { build_catch_object_at(slot, h.adjectives, t, ct) }
+}
+
+/// [`build_catch_object`]'s work: the catch object of a handler of
+/// `adjectives` at `slot`.
+///
+/// # Safety
+/// The slot is writable, the object alive; the tables are mapped.
+pub(crate) unsafe fn build_catch_object_at(slot: u64, adjectives: u32, t: &Thrown, ct: &Catchable) {
     let size = ct.size_or_offset.max(0) as usize;
-    // SAFETY: the caller's frame and object, the title's copy constructor.
+    // SAFETY: the caller's slot and object, the title's copy constructor.
     unsafe {
-        if h.adjectives & HT_IS_REFERENCE != 0 {
+        if adjectives & HT_IS_REFERENCE != 0 {
             write(slot, adjust_pointer(t.object, ct.this_displacement));
         } else if ct.properties & CT_IS_SIMPLE_TYPE != 0 {
             ptr::copy(t.object as *const u8, slot as *mut u8, size);
@@ -903,7 +1105,7 @@ unsafe fn build_catch_object(establisher: u64, h: &Handler, t: &Thrown, ct: &Cat
             ptr::copy(from as *const u8, slot as *mut u8, size);
         } else {
             let from = adjust_pointer(t.object, ct.this_displacement);
-            let copy = rva(t.base, ct.copy_function);
+            let copy = ct.copy_function;
             if ct.properties & CT_HAS_VIRTUAL_BASE != 0 {
                 std::mem::transmute::<u64, CopyVirtual>(copy)(slot, from, 1);
             } else {
@@ -1040,7 +1242,7 @@ fn bad_tables(what: &str) {
 /// The frame of the caller-context shim, as `seh.rs`'s: the four register
 /// arguments below the saved rbp, a [`Context`] at `rsp + 32`, the shadow
 /// space below it; a multiple of 16.
-const SHIM_FRAME: usize = 0x510;
+pub(crate) const SHIM_FRAME: usize = 0x510;
 const _: () =
     assert!(32 + size_of::<Context>() + 32 <= SHIM_FRAME && SHIM_FRAME.is_multiple_of(16));
 
@@ -1112,17 +1314,54 @@ unsafe extern "sysv64" fn cxx_throw(
             None => terminate_because("`throw;` with no exception being handled"),
         }
     } else {
-        // SAFETY: an address, looked up.
-        let base = unsafe { seh::RtlPcToFileHeader(throw_info.cast_mut(), ptr::null_mut()) };
+        let t = thrown_from(object, throw_info);
         record.information[..4].copy_from_slice(&[
             u64::from(EH_MAGIC_NUMBER1),
-            object as u64,
-            throw_info as u64,
-            base as u64,
+            t.object,
+            t.info,
+            t.base,
         ]);
     }
     PROCESSING_THROW.with(|p| p.set(p.get() + 1));
     raise_from(&mut record, ctx)
+}
+
+/// Throws `t` (its object, throw info of either form and base) from `ctx`,
+/// as [`cxx_throw`] throws an object.
+///
+/// # Safety
+/// `ctx` is a caller-context shim's captured context, in a frame that never
+/// returns; the object lives until the catch ends.
+pub(crate) unsafe fn throw_with(t: Thrown, ctx: &mut Context) -> ! {
+    let mut record = ExceptionRecord::new(EH_EXCEPTION_NUMBER, EXCEPTION_NONCONTINUABLE, ctx.rip);
+    record.number_parameters = 4;
+    record.information[..4].copy_from_slice(&[
+        u64::from(EH_MAGIC_NUMBER1),
+        t.object,
+        t.info,
+        t.base,
+    ]);
+    PROCESSING_THROW.with(|p| p.set(p.get() + 1));
+    raise_from(&mut record, ctx)
+}
+
+/// Throws `object`, described by our absolute-form `info`, from `ctx` (see
+/// [`throw_with`]).
+///
+/// # Safety
+/// As [`throw_with`]; `info` names `object`'s type.
+pub(crate) unsafe fn throw_absolute(
+    object: *mut c_void,
+    info: *const ThrowInfoAbs,
+    ctx: &mut Context,
+) -> ! {
+    let t = Thrown {
+        object: object as u64,
+        info: info as u64,
+        base: 0,
+    };
+    // SAFETY: the caller's.
+    unsafe { throw_with(t, ctx) }
 }
 
 /// Raises `record` in `ctx`; inside a catch funclet, the search alone, and
@@ -1501,7 +1740,7 @@ pub extern "win64" fn _is_exception_typeof(
         i32::from(
             t.catchables()
                 .iter()
-                .any(|ct| type_name(rva(t.base, ct.p_type)) == name),
+                .any(|ct| type_name(ct.type_descriptor) == name),
         )
     }
 }
@@ -2101,6 +2340,123 @@ mod tests {
         assert_eq!(__CxxQueryExceptionSize(), 152);
         assert_eq!(__uncaught_exceptions(), 0);
         assert_eq!(_IsExceptionObjectToBeDestroyed(ptr::null_mut()), 1);
+    }
+
+    /// A `TypeDescriptor` with room for a short name.
+    #[repr(C)]
+    struct Named {
+        vftable: *const c_void,
+        spare: *const c_void,
+        name: [u8; 24],
+    }
+
+    // SAFETY: read-only.
+    unsafe impl Sync for Named {}
+
+    static EXCEPTION_TD: Named = Named {
+        vftable: ptr::null(),
+        spare: ptr::null(),
+        name: *b".?AVexception@std@@\0\0\0\0\0",
+    };
+    static DERIVED_TD: Named = Named {
+        vftable: ptr::null(),
+        spare: ptr::null(),
+        name: *b".?AVderived@@\0\0\0\0\0\0\0\0\0\0\0",
+    };
+
+    static ABS_COPIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static ABS_DESTROYED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// The copy constructor of a 16-byte class.
+    unsafe extern "win64" fn abs_copy(this: *mut c_void, from: *const c_void) -> *mut c_void {
+        // SAFETY: two 16-byte objects of the test's.
+        unsafe { ptr::copy_nonoverlapping(from.cast::<u8>(), this.cast::<u8>(), 16) };
+        ABS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        this
+    }
+
+    unsafe extern "win64" fn abs_destroy(_this: *mut c_void) {
+        ABS_DESTROYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A 16-byte class's catchable type, named by `descriptor`.
+    fn abs_catchable(descriptor: &Named) -> CatchableTypeAbs {
+        CatchableTypeAbs {
+            properties: 0,
+            pad: 0,
+            type_descriptor: ptr::from_ref(descriptor).cast(),
+            this_displacement: Pmd {
+                mdisp: 0,
+                pdisp: -1,
+                vdisp: 0,
+            },
+            size_or_offset: 16,
+            copy_function: abs_copy as *const () as usize,
+        }
+    }
+
+    #[test]
+    fn absolute_throw_infos_are_read() {
+        let derived = abs_catchable(&DERIVED_TD);
+        let base = abs_catchable(&EXCEPTION_TD);
+        let types = CatchableTypeArrayAbs {
+            count: 2,
+            types: [&derived, &base, ptr::null(), ptr::null()],
+        };
+        let info = ThrowInfoAbs {
+            attributes: TI_VICTORY_ABSOLUTE,
+            pad: 0,
+            destructor: abs_destroy as *const () as usize,
+            forward_compat: 0,
+            catchable_types: &types,
+        };
+        let object = [0x11u64, 0x22];
+        let mut r = ExceptionRecord::new(EH_EXCEPTION_NUMBER, EXCEPTION_NONCONTINUABLE, 0);
+        r.number_parameters = 4;
+        r.information[..4].copy_from_slice(&[
+            u64::from(EH_MAGIC_NUMBER1),
+            object.as_ptr() as u64,
+            &raw const info as u64,
+            0,
+        ]);
+        let t = thrown_in(&r).unwrap();
+        // SAFETY: the statics above and `object`, alive here.
+        unsafe {
+            assert!(t.absolute());
+            assert_eq!(t.attributes(), 0);
+            assert_eq!(t.size(), 16);
+            let reference = HT_IS_REFERENCE | HT_IS_CONST;
+            let ct = t
+                .catchable_as(reference, Some(b".?AVexception@std@@"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(ct.type_descriptor, &raw const EXCEPTION_TD as u64);
+            assert!(t.catchable_as(reference, Some(b".?AVderived@@")).is_some());
+            assert!(
+                t.catchable_as(reference, Some(b".?AVruntime_error@std@@"))
+                    .is_none()
+            );
+            assert!(matches!(t.catchable_as(0, None), Some(None)));
+            // By value: through the copy constructor.
+            let mut slot = [0u64; 2];
+            build_catch_object_at(slot.as_mut_ptr() as u64, 0, &t, &ct);
+            assert_eq!(slot, object);
+            assert_eq!(ABS_COPIES.load(std::sync::atomic::Ordering::Relaxed), 1);
+            // By reference: the object itself.
+            let mut at = 0u64;
+            build_catch_object_at(&raw mut at as u64, reference, &t, &ct);
+            assert_eq!(at, object.as_ptr() as u64);
+            t.destroy();
+            assert_eq!(ABS_DESTROYED.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let pointers = ExceptionPointers {
+                record: &raw mut r,
+                context: ptr::null_mut(),
+            };
+            let td = (&raw const EXCEPTION_TD).cast::<TypeDescriptor>();
+            assert_eq!(_is_exception_typeof(td, &pointers), 1);
+            let object = object.as_ptr().cast_mut().cast();
+            assert_eq!(thrown_from(object, (&raw const info).cast()), t);
+        }
     }
 
     #[test]
