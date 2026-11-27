@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::Context;
 use anyhow::Result;
 
+use crate::title::title_dll;
 use crate::{Console, Unimplemented};
 
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
@@ -377,11 +378,6 @@ fn poke(base: usize, size: usize) {
     });
 }
 
-/// DLLs the host or our runtime provide are never taken from the title.
-fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
-    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
-}
-
 /// The DLLs among `imported` (the main image's static imports) that must
 /// come from the title's folder (`wanted`) but were not mapped from it:
 /// none of their imports can be bound. Each named once, case ignored.
@@ -653,6 +649,9 @@ pub fn run(
         check_cpu_features()?;
     }
     let cfg = victory_core::Config::load()?;
+    // The executable's own range is kept for it before its bytes and the
+    // title DLLs' are read and mapped wherever the host puts them.
+    let reserved = reserve_preferred_range(exe);
     let bytes = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let info = victory_pe::ImageInfo::parse(&bytes)?;
     let hash = blake3::hash(&bytes).to_hex();
@@ -747,8 +746,10 @@ pub fn run(
         .to_string_lossy()
         .into_owned();
     let resolver = TitleResolver::new(&hle, &dlls);
-    let image = MappedImage::map_with(&bytes, &exe_name, &resolver, policy)
-        .with_context(|| format!("mapping {}", exe.display()))?;
+    // SAFETY: our own allocation from `Host::allocate`, which nothing uses.
+    let image =
+        unsafe { MappedImage::map_with_reserved(&bytes, &exe_name, &resolver, policy, reserved) }
+            .with_context(|| format!("mapping {}", exe.display()))?;
     resolver.show(&exe_name);
     drop(bytes);
     // Never unmapped: title code may run until the process ends.
@@ -879,6 +880,36 @@ static IMAGES: std::sync::OnceLock<std::sync::Mutex<Images>> = std::sync::OnceLo
 #[cfg(not(windows))]
 fn images() -> Option<std::sync::MutexGuard<'static, Images>> {
     Some(IMAGES.get()?.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Reserves the range the executable `exe` asks for, `SizeOfImage` in whole
+/// pages at its `ImageBase` (read from its headers alone), for
+/// `MappedImage::map_with_reserved`: `(at, len)`, or `None` if the headers
+/// cannot be read or something is there already (said in the log; the
+/// image is then moved, as without the reservation). Left unused, it stays
+/// reserved until the process ends.
+#[cfg(not(windows))]
+fn reserve_preferred_range(exe: &Path) -> Option<(usize, usize)> {
+    use std::io::Read;
+    use victory_pe::layout::{self, OPT_IMAGE_BASE, OPT_SIZE_OF_IMAGE};
+    use victory_platform::{Host, Memory};
+    let mut headers = Vec::new();
+    let file = std::fs::File::open(exe).ok()?;
+    file.take(0x1000).read_to_end(&mut headers).ok()?;
+    let optional = layout::optional_header_offset(&headers)?;
+    let base = layout::read_u64(&headers, optional + OPT_IMAGE_BASE)?;
+    let size = layout::read_u32(&headers, optional + OPT_SIZE_OF_IMAGE)? as usize;
+    let page = Host::page_size();
+    let (base, size) = (usize::try_from(base).ok()?, size.next_multiple_of(page));
+    let end = base.checked_add(size)?;
+    if base % page != 0 || size == 0 {
+        return None;
+    }
+    let reserved = Host::allocate(size, Some(base));
+    if reserved.is_none() {
+        println!("reserved       none: [{base:#x}, {end:#x}) is taken; the executable is moved");
+    }
+    Some((reserved?, size))
 }
 
 /// The path the title sees for its file `name`: in the package, `G:`. Off
@@ -1041,27 +1072,81 @@ impl<'a> TitleResolver<'a> {
         }
     }
 
-    /// `dll!symbol` from a title DLL mapped already.
-    fn title(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
-        use victory_loader::{Provenance, Resolution};
-        let Some((_, image)) = self
+    /// The title DLL `dll` mapped already, if it is.
+    fn mapped(&self, dll: &str) -> Option<&'static MappedImage> {
+        let (_, image) = self
             .dlls
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(dll))
-        else {
+            .find(|(name, _)| name.eq_ignore_ascii_case(dll))?;
+        Some(*image)
+    }
+
+    /// `dll!symbol` from a title DLL mapped already. A forwarder there is
+    /// followed one level: our runtime first, then the title DLLs mapped.
+    fn title(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_loader::{Export, Provenance, Resolution};
+        let Some(image) = self.mapped(dll) else {
             return Resolution::Missing;
         };
         match symbol {
-            victory_pe::ImportSymbol::Name { name, .. } => match image.export(name) {
-                Some(address) => Resolution::Found {
+            victory_pe::ImportSymbol::Name { name, .. } => match image.export_or_forward(name) {
+                Some(Export::Address(address)) => Resolution::Found {
                     address,
                     provenance: Provenance::Title,
                 },
+                Some(Export::Forward(to)) => self.forwarded(&format!("{dll}!{name}"), &to),
                 None => Resolution::Missing,
             },
             // `MappedImage::export` finds exports by name only.
             victory_pe::ImportSymbol::Ordinal(ordinal) => {
                 tracing::warn!(dll, ordinal, "a title DLL's export by ordinal: not bound");
+                Resolution::Missing
+            }
+        }
+    }
+
+    /// What the forwarder `from` (`dll!name`) stands for, `to` (`dll.func`
+    /// or `dll.#n`): our runtime's, else that of a title DLL mapped already
+    /// whose export is no forwarder itself. Anything else is missing (a
+    /// stub), with a warning naming it.
+    fn forwarded(&self, from: &str, to: &str) -> victory_loader::Resolution {
+        use victory_loader::{Export, ImportResolver, Provenance, Resolution};
+        use victory_pe::ImportSymbol;
+        let Some((module, function)) = to.rsplit_once('.') else {
+            tracing::warn!(from, to, "a title DLL's forwarder names no function");
+            return Resolution::Missing;
+        };
+        let dll = format!("{module}.dll");
+        let symbol = match function.strip_prefix('#').and_then(|n| n.parse().ok()) {
+            Some(ordinal) => ImportSymbol::Ordinal(ordinal),
+            None => ImportSymbol::Name {
+                hint: 0,
+                name: function.to_owned(),
+            },
+        };
+        let found = self.hle.resolve(&dll, &symbol);
+        if !matches!(found, Resolution::Missing) {
+            return found;
+        }
+        let Some(image) = self.mapped(&dll) else {
+            tracing::warn!(from, to, "a title DLL forwards to a DLL not mapped yet");
+            return Resolution::Missing;
+        };
+        let export = match &symbol {
+            ImportSymbol::Name { name, .. } => image.export_or_forward(name),
+            ImportSymbol::Ordinal(_) => None,
+        };
+        match export {
+            Some(Export::Address(address)) => Resolution::Found {
+                address,
+                provenance: Provenance::Title,
+            },
+            Some(Export::Forward(again)) => {
+                tracing::warn!(from, to, again, "a title DLL's forwarder forwards again");
+                Resolution::Missing
+            }
+            None => {
+                tracing::warn!(from, to, "a title DLL forwards to a function nobody has");
                 Resolution::Missing
             }
         }
@@ -1157,4 +1242,134 @@ fn late_load(
             .find(|(name, _)| name.eq_ignore_ascii_case(file))
             .map(|(_, dll)| dll.base()))
     })
+}
+
+#[cfg(all(test, not(windows)))]
+mod forward_tests {
+    use super::{MappedImage, TitleResolver};
+    use victory_hle::{HleResolver, HostPolicy};
+    use victory_loader::{ImportResolver, Provenance, Resolution};
+    use victory_pe::ImportSymbol;
+
+    /// The function every export of [`forwarding_dll`] that is no forwarder
+    /// points at.
+    const DIRECT: u32 = 0x1180;
+
+    /// A DLL `fwd.dll` of one read-only section (RVA 0x1000) that holds its
+    /// export directory (0x100 bytes) and `DIRECT`; `exports` are its names
+    /// and what each is: an RVA or a forwarder's text.
+    fn forwarding_dll(exports: &[(&str, Result<u32, &str>)]) -> Vec<u8> {
+        fn put(d: &mut [u8], at: usize, bytes: &[u8]) {
+            d[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        /// Writes `s` and a NUL at `*next` in the section; its RVA.
+        fn string(d: &mut [u8], next: &mut usize, s: &str) -> u32 {
+            put(d, 0x200 + *next, s.as_bytes());
+            let rva = 0x1000 + *next as u32;
+            *next += s.len() + 1;
+            rva
+        }
+        let mut d = vec![0u8; 0x400];
+        put(&mut d, 0, b"MZ");
+        put(&mut d, 0x3C, &0x40u32.to_le_bytes());
+        put(&mut d, 0x40, b"PE\0\0");
+        put(&mut d, 0x44, &victory_pe::MACHINE_AMD64.to_le_bytes());
+        put(&mut d, 0x46, &1u16.to_le_bytes()); // sections
+        put(&mut d, 0x54, &240u16.to_le_bytes()); // optional header size
+        put(&mut d, 0x56, &0x2022u16.to_le_bytes()); // DLL, large address aware
+        let opt = 0x58;
+        put(&mut d, opt, &0x20Bu16.to_le_bytes());
+        // An unusual base: the image has no relocations to move it by.
+        put(&mut d, opt + 24, &0x6A5_0000_0000u64.to_le_bytes());
+        put(&mut d, opt + 32, &0x1000u32.to_le_bytes()); // section alignment
+        put(&mut d, opt + 36, &0x200u32.to_le_bytes()); // file alignment
+        put(&mut d, opt + 56, &0x2000u32.to_le_bytes()); // size of image
+        put(&mut d, opt + 60, &0x200u32.to_le_bytes()); // size of headers
+        put(&mut d, opt + 108, &16u32.to_le_bytes());
+        put(&mut d, opt + 112, &0x1000u32.to_le_bytes()); // export directory
+        put(&mut d, opt + 116, &0x100u32.to_le_bytes());
+        let sec = opt + 240;
+        put(&mut d, sec, b".edata");
+        put(&mut d, sec + 8, &0x200u32.to_le_bytes()); // virtual size
+        put(&mut d, sec + 12, &0x1000u32.to_le_bytes());
+        put(&mut d, sec + 16, &0x200u32.to_le_bytes()); // raw size
+        put(&mut d, sec + 20, &0x200u32.to_le_bytes()); // raw offset
+        put(&mut d, sec + 36, &0x4000_0040u32.to_le_bytes()); // read, data
+        // The directory, then its three tables, then the strings.
+        let count = exports.len();
+        let (functions, names, ordinals) = (0x28, 0x28 + 4 * count, 0x28 + 8 * count);
+        let mut next = ordinals + 2 * count;
+        let name = string(&mut d, &mut next, "fwd.dll");
+        put(&mut d, 0x200 + 12, &name.to_le_bytes());
+        put(&mut d, 0x200 + 16, &1u32.to_le_bytes()); // ordinal base
+        put(&mut d, 0x200 + 20, &(count as u32).to_le_bytes());
+        put(&mut d, 0x200 + 24, &(count as u32).to_le_bytes());
+        for (table, at) in [
+            (0x200 + 28, functions),
+            (0x200 + 32, names),
+            (0x200 + 36, ordinals),
+        ] {
+            put(&mut d, table, &(0x1000 + at as u32).to_le_bytes());
+        }
+        for (i, (export, target)) in exports.iter().enumerate() {
+            let rva = match target {
+                Ok(rva) => *rva,
+                Err(forward) => string(&mut d, &mut next, forward),
+            };
+            put(&mut d, 0x200 + functions + 4 * i, &rva.to_le_bytes());
+            let name = string(&mut d, &mut next, export);
+            put(&mut d, 0x200 + names + 4 * i, &name.to_le_bytes());
+            put(&mut d, 0x200 + ordinals + 2 * i, &(i as u16).to_le_bytes());
+        }
+        assert!(next <= 0x100, "the strings overrun the export directory");
+        d
+    }
+
+    fn name(name: &str) -> ImportSymbol {
+        ImportSymbol::Name {
+            hint: 0,
+            name: name.into(),
+        }
+    }
+
+    /// A forwarder is followed one level: to our runtime, or to a title DLL
+    /// mapped already; a second forward or a DLL not mapped is missing.
+    #[test]
+    fn title_dll_forwarders_are_followed_one_level() {
+        let bytes = forwarding_dll(&[
+            ("Direct", Ok(DIRECT)),
+            ("ToHle", Err("XGameRuntime.XGameRuntimeInitialize")),
+            ("ToSelf", Err("fwd.Direct")),
+            ("Twice", Err("fwd.ToSelf")),
+            ("Away", Err("absent.Func")),
+        ]);
+        let hle = HleResolver::new(HostPolicy::none());
+        let image = MappedImage::map(&bytes, "fwd.dll", &hle).expect("mapping the DLL");
+        let image: &'static MappedImage = Box::leak(Box::new(image));
+        let dlls = [("fwd.dll".to_owned(), image)];
+        let resolver = TitleResolver::new(&hle, &dlls);
+        let found = |symbol: &str| match resolver.resolve("FWD.dll", &name(symbol)) {
+            Resolution::Found {
+                address,
+                provenance,
+            } => Some((address, provenance)),
+            Resolution::Missing => None,
+        };
+        let direct = Some((image.base() + DIRECT as usize, Provenance::Title));
+        assert_eq!(found("Direct"), direct);
+        assert_eq!(found("ToSelf"), direct);
+        let ours = match hle.resolve("XGameRuntime.dll", &name("XGameRuntimeInitialize")) {
+            Resolution::Found { address, .. } => address,
+            Resolution::Missing => panic!("our runtime has XGameRuntimeInitialize"),
+        };
+        assert_eq!(found("ToHle"), Some((ours, Provenance::Hle)));
+        assert_eq!(found("Twice"), None);
+        assert_eq!(found("Away"), None);
+        assert_eq!(resolver.title_count.get(), 2);
+        assert_eq!(resolver.hle_count.get(), 1);
+        assert_eq!(
+            *resolver.missing.borrow(),
+            ["FWD.dll!Twice", "FWD.dll!Away"]
+        );
+    }
 }

@@ -11,6 +11,8 @@ mod replay;
 #[cfg(target_arch = "x86_64")]
 mod run;
 mod shader;
+#[cfg(target_arch = "x86_64")]
+mod title;
 mod translate;
 #[cfg(windows)]
 mod warm;

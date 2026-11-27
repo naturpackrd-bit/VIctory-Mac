@@ -14,6 +14,17 @@ pub struct HostPolicy {
     pub allow: Vec<String>,
 }
 
+/// Off Windows no host DLL serves anything, so none is allowed: a DLL the
+/// host would serve on Windows is looked for in the title's folder, and
+/// named missing when it is not there.
+#[cfg(not(windows))]
+impl Default for HostPolicy {
+    fn default() -> Self {
+        HostPolicy::none()
+    }
+}
+
+#[cfg(windows)]
 impl Default for HostPolicy {
     fn default() -> Self {
         let allow = [

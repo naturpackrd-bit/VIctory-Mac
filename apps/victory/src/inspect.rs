@@ -114,10 +114,7 @@ fn teb_accesses(data: &[u8], info: &ImageInfo) {
         .iter()
         .filter(|s| s.characteristics & EXECUTE != 0)
     {
-        let from = s.file_offset as usize;
-        let len = (s.file_size.min(s.virtual_size.max(s.file_size)) as usize)
-            .min(data.len().saturating_sub(from));
-        for site in victory_pe::gs_sites(&data[from..from + len]) {
+        for site in victory_pe::gs_sites(section_code(data, s)) {
             *counts.entry((site.access, site.disp)).or_default() += 1;
             if let GsAccess::Other(_) = site.access {
                 others.push(format!("{:#x}", s.rva as usize + site.offset));
@@ -147,6 +144,18 @@ fn teb_accesses(data: &[u8], info: &ImageInfo) {
             if others.len() > shown { ", ..." } else { "" }
         );
     }
+}
+
+/// The bytes of the section `s` in the file, within its virtual size (a
+/// `VirtualSize` of 0 means its raw size) and the file's end: none for a
+/// section whose raw data starts past the end.
+fn section_code<'a>(data: &'a [u8], s: &victory_pe::SectionInfo) -> &'a [u8] {
+    let len = match s.virtual_size {
+        0 => s.file_size,
+        virtual_size => s.file_size.min(virtual_size),
+    } as usize;
+    let code = data.get(s.file_offset as usize..).unwrap_or(&[]);
+    &code[..len.min(code.len())]
 }
 
 /// The TEB field at `disp`, for the ones title code is known to read.
@@ -219,5 +228,36 @@ fn dll_flags(v: u16) -> String {
         String::new()
     } else {
         format!("  ({})", set.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::section_code;
+    use victory_pe::SectionInfo;
+
+    fn section(file_offset: u32, file_size: u32, virtual_size: u32) -> SectionInfo {
+        SectionInfo {
+            name: ".text".into(),
+            rva: 0x1000,
+            virtual_size,
+            file_offset,
+            file_size,
+            characteristics: 0x6000_0020,
+        }
+    }
+
+    #[test]
+    fn section_code_stays_within_the_file_and_the_virtual_size() {
+        let data = [0xCCu8; 0x100];
+        // No raw data, its pointer past the file's end: used to panic.
+        assert!(section_code(&data, &section(0x400, 0, 0x80)).is_empty());
+        assert!(section_code(&data, &section(0x400, 0x20, 0x80)).is_empty());
+        // Raw data padded past the virtual size: only the virtual size.
+        assert_eq!(section_code(&data, &section(0x10, 0x80, 0x30)).len(), 0x30);
+        // A virtual size of 0 means the raw size.
+        assert_eq!(section_code(&data, &section(0x10, 0x40, 0)).len(), 0x40);
+        // Raw data cut short by the file's end.
+        assert_eq!(section_code(&data, &section(0xF0, 0x80, 0x80)).len(), 0x10);
     }
 }

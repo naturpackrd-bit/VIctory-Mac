@@ -18,6 +18,8 @@ pub const FILE_HEADER_CHARACTERISTICS: usize = 18;
 pub const OPT_ADDRESS_OF_ENTRY_POINT: usize = 16;
 /// `IMAGE_OPTIONAL_HEADER64::ImageBase` (u64).
 pub const OPT_IMAGE_BASE: usize = 24;
+/// `IMAGE_OPTIONAL_HEADER64::SizeOfImage` (u32).
+pub const OPT_SIZE_OF_IMAGE: usize = 56;
 /// `IMAGE_OPTIONAL_HEADER64::SizeOfHeaders` (u32).
 pub const OPT_SIZE_OF_HEADERS: usize = 60;
 /// `IMAGE_OPTIONAL_HEADER64::CheckSum` (u32).

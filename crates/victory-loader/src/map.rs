@@ -82,6 +82,15 @@ pub struct MappedImage {
     stubs: Option<Stubs>,
 }
 
+/// An export of a mapped image ([`MappedImage::export_or_forward`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Export {
+    /// The function's address.
+    Address(usize),
+    /// A forwarder: `dll.func` or `dll.#n`, the DLL without its extension.
+    Forward(String),
+}
+
 /// A TLS callback, and DllMain but for its result: `(base, reason, null)`.
 type TlsCallback = extern "win64" fn(*mut c_void, u32, *mut c_void);
 type DllMain = extern "win64" fn(*mut c_void, u32, *mut c_void) -> i32;
@@ -109,13 +118,53 @@ impl MappedImage {
         resolver: &dyn ImportResolver,
         policy: UnimplementedPolicy,
     ) -> Result<MappedImage, MapError> {
-        let info = ImageInfo::parse(file)?;
+        // SAFETY: no reserved memory.
+        unsafe { MappedImage::map_with_reserved(file, name, resolver, policy, None) }
+    }
+
+    /// As [`MappedImage::map_with`], into `reserved` (`(at, len)`) when it
+    /// is the image's preferred range, `SizeOfImage` in whole pages at its
+    /// `ImageBase`: memory its owner kept free for it before anything else
+    /// was mapped. The image takes the reservation over; one that is not its
+    /// range, or a mapping that fails, gives it back.
+    ///
+    /// # Safety
+    /// `reserved` is one whole allocation of `Host::allocate` that nothing
+    /// else uses or frees.
+    pub unsafe fn map_with_reserved(
+        file: &[u8],
+        name: &str,
+        resolver: &dyn ImportResolver,
+        policy: UnimplementedPolicy,
+        reserved: Option<(usize, usize)>,
+    ) -> Result<MappedImage, MapError> {
+        let release = |reserved: Option<(usize, usize)>| {
+            if let Some((at, len)) = reserved {
+                // SAFETY: the caller's allocation, which nothing else uses.
+                unsafe { Host::free(at, len) };
+            }
+        };
+        let info = match ImageInfo::parse(file) {
+            Ok(info) => info,
+            Err(error) => {
+                release(reserved);
+                return Err(error.into());
+            }
+        };
         let page = Host::page_size();
         let size = (info.size_of_image as usize).next_multiple_of(page);
         let preferred = usize::try_from(info.image_base)
             .ok()
             .filter(|b| b % page == 0);
-        let base = match preferred.and_then(|at| Host::allocate(size, Some(at))) {
+        let reserved = match reserved {
+            Some((at, len)) if Some(at) == preferred && len == size => Some(at),
+            other => {
+                release(other);
+                None
+            }
+        };
+        let base = reserved.or_else(|| preferred.and_then(|at| Host::allocate(size, Some(at))));
+        let base = match base {
             Some(base) => base,
             None if !info.has_relocations => return Err(MapError::NotMovable(info.image_base)),
             None => Host::allocate(size, None).ok_or(MapError::NoMemory(size))?,
@@ -143,6 +192,10 @@ impl MappedImage {
             image.thunks = image.patch_gs()?;
         }
         image.protect(page, headers)?;
+        // The fault handler reads the table where it says it is.
+        if let Some((rva, len)) = image.info.exception_table {
+            image.at(rva as usize, len as usize)?;
+        }
         crate::images::register(crate::images::Image {
             name: image.name.clone(),
             base: image.base,
@@ -193,6 +246,22 @@ impl MappedImage {
             return None;
         }
         Some(self.base + export.rva? as usize)
+    }
+
+    /// The export `name`: where it is, or, for a forwarder, the text naming
+    /// the function it stands for (`dll.func` or `dll.#n`); `None` for one
+    /// the image lacks.
+    pub fn export_or_forward(&self, name: &str) -> Option<Export> {
+        let export = self
+            .info
+            .exports
+            .iter()
+            .find(|e| e.name.as_deref() == Some(name))?;
+        match (&export.forward, export.rva) {
+            (Some(forward), _) => Some(Export::Forward(forward.clone())),
+            (None, Some(rva)) => Some(Export::Address(self.base + rva as usize)),
+            (None, None) => None,
+        }
     }
 
     /// The entry point's address (`_DllMainCRTStartup` for a DLL,
@@ -384,12 +453,18 @@ impl MappedImage {
                 .filter(|o| *o <= self.size)
                 .ok_or_else(|| MapError::Malformed(format!("TLS {what} {va:#x} outside the image")))
         };
-        let (start, end) = (offset(start, "start")?, offset(end, "end")?);
-        let len = end
-            .checked_sub(start)
-            .ok_or_else(|| MapError::Malformed("TLS data ends before it starts".to_owned()))?;
-        // SAFETY: `len` bytes of our image, checked by `at`.
-        let init = unsafe { std::slice::from_raw_parts(self.at(start, len)?, len) };
+        // No raw data at all (lld's, for an image with TLS callbacks and no
+        // `.tls` template): an empty template.
+        let init: &[u8] = if start == 0 && end == 0 {
+            &[]
+        } else {
+            let (start, end) = (offset(start, "start")?, offset(end, "end")?);
+            let len = end
+                .checked_sub(start)
+                .ok_or_else(|| MapError::Malformed("TLS data ends before it starts".to_owned()))?;
+            // SAFETY: `len` bytes of our image, checked by `at`.
+            unsafe { std::slice::from_raw_parts(self.at(start, len)?, len) }
+        };
         let index = crate::teb::register_tls(init, zero_fill).ok_or(MapError::TlsImages)?;
         let index_at = self.at(offset(index_va, "index")?, 4)?.cast::<u32>();
         // SAFETY: four bytes of our writable image, checked above.

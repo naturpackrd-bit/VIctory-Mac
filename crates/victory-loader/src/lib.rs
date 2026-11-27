@@ -73,7 +73,7 @@ pub use crash::{
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
-pub use map::{MapError, MappedImage};
+pub use map::{Export, MapError, MappedImage};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

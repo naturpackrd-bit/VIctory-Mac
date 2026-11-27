@@ -88,14 +88,39 @@ the milestone that replaces it.
   follows delay imports too); the storage drive (`storage::folder`) is not
   mounted yet; `check_cpu_features` needs AVX2 (Rosetta 2 shows it only
   with `ROSETTA_ADVERTISE_AVX=1`, which `victory` sets by re-running
-  itself). M2c.
+  itself). The executable's preferred range (`SizeOfImage` at its
+  `ImageBase`, read from its headers) is reserved before its bytes and the
+  title DLLs are read and mapped, and handed to
+  `MappedImage::map_with_reserved`; when something is there already the run
+  log says so and the executable is moved, as before. A title DLL's
+  forwarder (`dll.func`, `dll.#n`) is followed one level, to our runtime
+  first and then to the title DLLs mapped already; a second forward or one
+  to a DLL not mapped yet gets a stub and a warning naming it. Off Windows
+  `HostPolicy::default()` is empty (no host DLL serves anything there), so a
+  DLL the host would serve on Windows (`dbghelp.dll`, `xaudio2_9.dll`, ...)
+  is looked for in the title's folder and named among the missing DLLs when
+  it is not there; `--strict` changes nothing off Windows. `census` agrees
+  with `run` (`apps/victory/src/title.rs` says which DLLs come from the
+  folder): an import our runtime or the host does not serve counts as
+  `title` when a DLL of the folder exports its name, else as missing, marked
+  `(title dll)` (the DLL lacks the name, or the import is by ordinal) or
+  `(dll absent)` in `--missing` (grouped by DLL); an import both could serve
+  counts as `hle`, as `run` binds it; and the census fails when an image
+  could not be read, naming it. M2c.
 - `victory-loader`, `map` (our own loader): an import nobody resolves gets,
   by `UnimplementedPolicy`, a refusal of the mapping (`Refuse`), a stub that
   traps (`Trap`) or one that logs its first call and returns 0 (`Zero`);
   `Zero` is what the tests use and what M2c runs the title with, so a title
   that needs the result of such a call goes wrong later rather than at the
   call. Delay imports are bound ahead of time, so `__delayLoadHelper2` is
-  never called. M2b/M2c.
+  never called. An exception directory reaching past `SizeOfImage` fails
+  the mapping; a TLS directory with no raw data (`StartAddressOfRawData`
+  and `EndAddressOfRawData` 0, as lld links an image with TLS callbacks and
+  no `.tls`) is an empty template. `victory-pe` leaves out a CodeView record
+  it cannot read (an odd debug directory no longer fails the parse), and
+  names the directory in its other errors (`import directory: ...`, `delay
+  import directory: ...`, `export directory: ...`, `TLS directory: ...`).
+  M2b/M2c.
 - `victory-loader`, `teb`: the PEB a title reads through `gs:[0x60]` is a
   zeroed block (`BeingDebugged` 0, no image base, no process parameters).
   `gs` accesses of the absolute form (`gs:[disp32]`) in any instruction

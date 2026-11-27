@@ -1,9 +1,7 @@
 use object::LittleEndian as LE;
 use object::Object;
 use object::pe::{self, ImageNtHeaders64};
-use object::read::pe::{
-    ImageNtHeaders, ImageOptionalHeader, Import, ImportTable, ImportThunkList, PeFile64,
-};
+use object::read::pe::{ImageNtHeaders, ImageOptionalHeader, Import, ImportThunkList, PeFile64};
 
 use crate::layout::{self, dir};
 use crate::{MACHINE_AMD64, PeError};
@@ -219,14 +217,17 @@ impl ImageInfo {
                 .is_some_and(|d| d.virtual_address.get(LE) != 0 && d.size.get(LE) != 0)
         };
 
-        let imports = match file.import_table()? {
-            Some(table) => parse_imports(&table, opt.size_of_image())?,
-            None => Vec::new(),
-        };
-        let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
-        let exports = parse_exports(&file, opt.image_base())?;
-        let tls = parse_tls(&file, data, opt.image_base())?;
-        let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
+        let imports =
+            parse_imports(&file, opt.size_of_image()).map_err(in_directory("import directory"))?;
+        let delay_imports = parse_delay_imports(&file, opt.size_of_image())
+            .map_err(in_directory("delay import directory"))?;
+        let exports =
+            parse_exports(&file, opt.image_base()).map_err(in_directory("export directory"))?;
+        let tls =
+            parse_tls(&file, data, opt.image_base()).map_err(in_directory("TLS directory"))?;
+        // It only names the build: an odd debug directory leaves it out
+        // rather than failing the parse.
+        let codeview = file.pdb_info().ok().flatten().map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
             age: cv.age(),
@@ -316,10 +317,18 @@ fn convert_import(import: Import<'_>) -> ImportSymbol {
     }
 }
 
-fn parse_imports(
-    table: &ImportTable<'_>,
-    size_of_image: u32,
-) -> Result<Vec<ImportModule>, PeError> {
+/// An error of the data directory `what`, named after it.
+fn in_directory(what: &'static str) -> impl Fn(PeError) -> PeError {
+    move |error| match error {
+        PeError::Unsupported(e) => PeError::Unsupported(format!("{what}: {e}")),
+        PeError::Malformed(e) => PeError::Malformed(format!("{what}: {e}")),
+    }
+}
+
+fn parse_imports(file: &PeFile64<'_>, size_of_image: u32) -> Result<Vec<ImportModule>, PeError> {
+    let Some(table) = file.import_table()? else {
+        return Ok(Vec::new());
+    };
     let mut modules = Vec::new();
     let mut descriptors = table.descriptors()?;
     while let Some(desc) = descriptors.next()? {
@@ -393,10 +402,9 @@ fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>
     // The PE-specific table keeps one name per address-table slot, so two
     // names sharing an ordinal lose all but the last one. The generic
     // iterator yields every name, then the ordinal-only entries.
-    file.exports()
-        .map_err(|e| PeError::Malformed(format!("export table: {e}")))?
+    file.exports()?
         .map(|e| {
-            let e = e.map_err(|e| PeError::Malformed(format!("export: {e}")))?;
+            let e = e?;
             let ordinal = match e.flags() {
                 ExportFlags::Pe { ordinal } => ordinal.0,
                 _ => 0,
@@ -444,16 +452,16 @@ fn parse_tls(
     let sections = file.section_table();
     let tls = sections
         .pe_data_at(data, directory_rva)
-        .ok_or_else(|| PeError::Malformed("TLS directory outside of sections".into()))?;
+        .ok_or_else(|| PeError::Malformed("outside of sections".into()))?;
     let callbacks_va = layout::read_u64(tls, layout::TLS64_ADDRESS_OF_CALLBACKS)
-        .ok_or_else(|| PeError::Malformed("truncated TLS directory".into()))?;
+        .ok_or_else(|| PeError::Malformed("truncated".into()))?;
 
     let mut callback_rvas = Vec::new();
     if callbacks_va != 0 {
         let array_rva = va_to_rva(callbacks_va, image_base)?;
         let array = sections
             .pe_data_at(data, array_rva)
-            .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
+            .ok_or_else(|| PeError::Malformed("callback array outside of sections".into()))?;
         for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
             let va = u64::from_le_bytes(*slot);
             if va == 0 {
@@ -653,6 +661,34 @@ mod tests {
             info.is_ok(),
             "section with zero raw size should be accepted"
         );
+    }
+
+    /// The synthetic image without its export directory, with data
+    /// directory `index` at `rva` of `size` bytes.
+    fn with_directory(index: usize, rva: u32, size: u32) -> Vec<u8> {
+        let mut data = synthetic_image(&[0u8; 0x200]);
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0);
+        let at = opt + 112 + index * 8;
+        data[at..at + 4].copy_from_slice(&rva.to_le_bytes());
+        data[at + 4..at + 8].copy_from_slice(&size.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn an_odd_debug_directory_leaves_the_codeview_record_out() {
+        // 29 bytes: no whole number of 28-byte debug directory entries.
+        let data = with_directory(pe::IMAGE_DIRECTORY_ENTRY_DEBUG, 0x1000, 29);
+        let info = ImageInfo::parse(&data).expect("the debug directory is optional");
+        assert!(info.codeview.is_none());
+    }
+
+    #[test]
+    fn a_bad_delay_import_directory_is_named() {
+        // An RVA no section holds.
+        let data = with_directory(pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x8000, 0x40);
+        let error = ImageInfo::parse(&data).unwrap_err().to_string();
+        assert!(error.contains("delay import directory"), "{error}");
     }
 
     #[test]

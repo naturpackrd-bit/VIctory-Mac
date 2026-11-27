@@ -145,3 +145,21 @@ fn unresolved_imports_are_named_and_refused() {
         other => panic!("expected the unresolved imports, got {other:?}"),
     }
 }
+
+/// An exception directory reaching past `SizeOfImage` fails the mapping,
+/// rather than the fault handler reading memory nobody mapped.
+#[test]
+fn an_exception_directory_past_the_image_is_refused() {
+    use victory_loader::stubs::UnimplementedPolicy;
+    use victory_pe::layout::{self, dir};
+    let mut data = probe().to_vec();
+    let at = layout::data_directory_offset(&data, dir::EXCEPTION).unwrap();
+    assert_ne!(layout::read_u32(&data, at), Some(0), "the probe has .pdata");
+    data[at + 4..at + 8].copy_from_slice(&0x7FFF_0000u32.to_le_bytes());
+    match MappedImage::map_with(&data, PROBE, &Probe, UnimplementedPolicy::Zero) {
+        Err(MapError::Malformed(message)) => {
+            assert!(message.contains("past the image's end"), "{message}")
+        }
+        other => panic!("expected a malformed image, got {other:?}"),
+    }
+}
