@@ -416,6 +416,9 @@ impl Hub {
         let hub = Hub::new(source, one_pad());
         hub.poll();
         std::thread::spawn(move || {
+            // The device callbacks are title code: a TEB for them.
+            #[cfg(not(windows))]
+            victory_loader::teb::attach_current_thread();
             loop {
                 std::thread::sleep(POLL);
                 hub.poll();

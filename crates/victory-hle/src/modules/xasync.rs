@@ -38,6 +38,13 @@ const COMPLETION: u32 = 1;
 const INFINITE: u32 = u32::MAX;
 
 type Callback = extern "win64" fn(*mut c_void, bool);
+
+/// A TEB for a thread of ours before it runs title code: the title's `gs:`
+/// accesses go through it (none on Windows, where the host's TEB is there).
+fn attach() {
+    #[cfg(not(windows))]
+    victory_loader::teb::attach_current_thread();
+}
 type MonitorCallback = extern "win64" fn(*mut c_void, *const Queue, u32);
 type TerminatedCallback = extern "win64" fn(*mut c_void);
 type CompletionRoutine = extern "win64" fn(*mut AsyncBlock);
@@ -65,10 +72,20 @@ impl Mode {
 }
 
 /// A title callback and its context (addresses, so tasks can cross threads).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Task {
     context: usize,
     callback: usize,
+    /// The queue that delivered it (none for a task run outside a queue):
+    /// counted in flight there until it has run, and canceled if the queue
+    /// was terminated meanwhile (a pool task cannot be drained).
+    queue: Option<Arc<Queue>>,
+}
+
+thread_local! {
+    /// The queue whose task this thread is running, if any (so that a
+    /// terminate from inside one of its callbacks does not wait for itself).
+    static RUNNING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Task {
@@ -76,13 +93,25 @@ impl Task {
         Task {
             context: context as usize,
             callback: callback as usize,
+            queue: None,
         }
     }
 
     fn run(self, canceled: bool) {
+        let canceled = canceled
+            || self
+                .queue
+                .as_ref()
+                .is_some_and(|q| q.terminated.load(Ordering::Acquire));
+        let outer =
+            RUNNING.with(|r| r.replace(self.queue.as_ref().map_or(0, |q| Arc::as_ptr(q) as usize)));
         // SAFETY: built from a `Callback` in `new`.
         let callback: Callback = unsafe { std::mem::transmute(self.callback) };
         callback(self.context as *mut c_void, canceled);
+        RUNNING.with(|r| r.set(outer));
+        if let Some(queue) = self.queue {
+            queue.finished_one();
+        }
     }
 }
 
@@ -104,6 +133,7 @@ impl Port {
             // using the port is closed) and nothing is left to run.
             let worker = port.clone();
             std::thread::spawn(move || {
+                attach();
                 loop {
                     match worker.take(1000, || false) {
                         Some(task) => task.run(false),
@@ -173,6 +203,7 @@ impl Pool {
     }
 
     fn work(&self) {
+        attach();
         let mut state = lock(&self.state);
         loop {
             while state.0.is_empty() {
@@ -199,6 +230,11 @@ pub struct Queue {
     /// Delayed callbacks still waiting out their delay, in submission
     /// order: terminating the queue cancels them with the queued ones.
     delayed: Mutex<BTreeMap<u64, Task>>,
+    /// Tasks delivered and not yet run to the end, and the termination
+    /// callback (context, routine) the last of them calls when the
+    /// terminate did not wait.
+    in_flight: Mutex<(usize, Option<(usize, usize)>)>,
+    drained: Condvar,
 }
 
 impl Queue {
@@ -208,7 +244,29 @@ impl Queue {
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
             delayed: Mutex::default(),
+            in_flight: Mutex::new((0, None)),
+            drained: Condvar::new(),
         })
+    }
+
+    /// One task fewer in flight; at none, the termination callback left for
+    /// the last task runs, and a waiting terminate is woken.
+    fn finished_one(&self) {
+        let termination = {
+            let mut state = lock(&self.in_flight);
+            state.0 -= 1;
+            if state.0 == 0 {
+                self.drained.notify_all();
+                state.1.take()
+            } else {
+                None
+            }
+        };
+        if let Some((context, callback)) = termination {
+            // SAFETY: stored from a `TerminatedCallback` in `XTaskQueueTerminate`.
+            let callback: TerminatedCallback = unsafe { std::mem::transmute(callback) };
+            callback(context as *mut c_void);
+        }
     }
 
     fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
@@ -235,6 +293,7 @@ impl Queue {
         }
         let queue = self.clone();
         std::thread::spawn(move || {
+            attach();
             std::thread::sleep(Duration::from_millis(delay_ms.into()));
             // Gone if the queue was terminated meanwhile, which canceled it.
             let task = lock(&queue.delayed).remove(&id);
@@ -245,7 +304,9 @@ impl Queue {
         S_OK
     }
 
-    fn deliver(self: &Arc<Self>, port: u32, task: Task) {
+    fn deliver(self: &Arc<Self>, port: u32, mut task: Task) {
+        lock(&self.in_flight).0 += 1;
+        task.queue = Some(self.clone());
         self.ports[port as usize].submit(task);
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
@@ -389,10 +450,14 @@ pub fn XTaskQueueSubmitDelayedCallback(
 }
 
 /// Cancels what is still queued or waiting out a delay (callbacks see
-/// `canceled`), refuses new work, then calls `callback`.
+/// `canceled`; a task already handed to the thread pool sees it when it
+/// runs), refuses new work, then calls `callback`: with `wait`, once every
+/// task delivered has run to its end (unless called from one of this
+/// queue's own callbacks, which would wait for itself); without, from the
+/// last task to finish, or at once when none is in flight.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
-    _wait: bool,
+    wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
@@ -414,9 +479,23 @@ pub fn XTaskQueueTerminate(
     for task in delayed.into_values() {
         task.run(true);
     }
-    if let Some(callback) = callback {
-        callback(context);
+    let inside = RUNNING.with(|r| r.get()) == Arc::as_ptr(&queue) as usize;
+    let mut state = lock(&queue.in_flight);
+    if wait && !inside {
+        while state.0 > 0 {
+            state = queue.drained.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
     }
+    let Some(callback) = callback else {
+        return S_OK;
+    };
+    if state.0 > 0 {
+        // The last task to finish calls it.
+        state.1 = Some((context as usize, callback as usize));
+        return S_OK;
+    }
+    drop(state);
+    callback(context);
     S_OK
 }
 
@@ -501,6 +580,9 @@ struct Call {
     /// The status is published.
     done: Mutex<bool>,
     finished: Condvar,
+    /// The block's queue, referenced for the life of the call (the title
+    /// may close its handle meanwhile); None: the process queue is gone.
+    queue: Option<Arc<Queue>>,
 }
 
 impl Call {
@@ -593,10 +675,13 @@ pub fn XAsyncBegin(
     let (status, size) = words(block);
     status.store(E_PENDING as u32 as usize, Ordering::Release);
     size.store(0, Ordering::Release);
+    // SAFETY: checked non-null; the title's block.
+    let call_queue = queue(unsafe { (*block).queue });
     let call = Arc::new(Call {
         provider,
         context: context as usize,
         identity: identity as usize,
+        queue: call_queue,
         claimed: AtomicBool::new(false),
         done: Mutex::new(false),
         finished: Condvar::new(),
@@ -637,9 +722,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     let Some(call) = call(block) else {
         return E_INVALIDARG;
     };
-    // SAFETY: a block in flight is valid.
-    let handle = unsafe { (*block).queue };
-    let Some(queue) = queue(handle) else {
+    let Some(queue) = call.queue.clone() else {
         return E_INVALIDARG;
     };
     let context = Box::into_raw(Box::new(Work { call, block }));
@@ -679,9 +762,9 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
         return;
     }
     // Read before publishing: once the status is set, the title may free
-    // the block.
+    // the block. The queue is the call's own reference, taken at its begin.
     // SAFETY: a block in flight is valid.
-    let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
+    let routine = unsafe { (*block).callback };
     let (status, size) = words(block);
     if result < 0 || required_size == 0 {
         release(block);
@@ -700,9 +783,12 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     call.finished.notify_all();
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
-        match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
-            _ => task.run(true),
+        let refused = match &call.queue {
+            Some(queue) => queue.submit(COMPLETION, 0, task.clone()) != S_OK,
+            None => true,
+        };
+        if refused {
+            task.run(true);
         }
     }
 }
@@ -711,9 +797,17 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+    if wait {
+        if let Some(call) = call(block) {
+            let done = lock(&call.done);
+            drop(call.finished.wait_while(done, |d| !*d));
+        } else {
+            // The call may be between its release (its cleanup running) and
+            // the publishing of its status: wait that out.
+            while status(block) == E_PENDING {
+                std::thread::yield_now();
+            }
+        }
     }
     status(block)
 }
@@ -867,6 +961,7 @@ pub fn pending_with(
                 let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
                 let (block, state) = (data.block as usize, state as usize);
                 std::thread::spawn(move || {
+                    attach();
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
                         Ok(bytes) => (S_OK, bytes.len()),
@@ -1147,6 +1242,64 @@ mod tests {
         assert!(slot::<Dispatch>(0x80)(this, q, COMPLETION, 0));
         assert_eq!(RAN.load(Ordering::SeqCst), 5);
         assert!(!slot::<Dispatch>(0x80)(this, q, COMPLETION, 0));
+        slot::<Close>(0x88)(this, q);
+    }
+
+    static SLOW_RAN: AtomicU32 = AtomicU32::new(0);
+    static TERMINATED: AtomicU32 = AtomicU32::new(0);
+    extern "win64" fn slow(context: *mut c_void, canceled: bool) {
+        std::thread::sleep(Duration::from_millis(60));
+        SLOW_RAN.fetch_add(
+            if canceled { 100 } else { context as u32 },
+            Ordering::SeqCst,
+        );
+    }
+    extern "win64" fn terminated(context: *mut c_void) {
+        // After every task of the queue has run to its end.
+        TERMINATED.store(
+            SLOW_RAN.load(Ordering::SeqCst) + context as u32,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// A terminate that waits returns once the pool tasks delivered before
+    /// it have run to their end, and its callback runs after them; a pool
+    /// task delivered before the terminate but run after it sees `canceled`.
+    #[test]
+    fn terminating_waits_for_pool_tasks() {
+        type Create = extern "win64" fn(This, u32, u32, *mut *const Queue) -> HRESULT;
+        type Submit = extern "win64" fn(This, *const Queue, u32, *mut c_void, Callback) -> HRESULT;
+        type Terminate = extern "win64" fn(
+            This,
+            *const Queue,
+            i32,
+            *mut c_void,
+            Option<TerminatedCallback>,
+        ) -> HRESULT;
+        type Close = extern "win64" fn(This, *const Queue);
+        let this: This = &OBJECT;
+        let mut q = std::ptr::null();
+        // Both ports on the thread pool (mode 1).
+        assert_eq!(slot::<Create>(0x60)(this, 1, 1, &mut q), S_OK);
+        assert_eq!(
+            slot::<Submit>(0x90)(this, q, WORK, 3 as *mut c_void, slow),
+            S_OK
+        );
+        let start = std::time::Instant::now();
+        assert_eq!(
+            slot::<Terminate>(0xB0)(this, q, 1, 1000 as *mut c_void, Some(terminated)),
+            S_OK
+        );
+        // The terminate waited for the 60 ms task (or it was canceled, 100).
+        let ran = SLOW_RAN.load(Ordering::SeqCst);
+        assert!(ran == 3 || ran == 100, "{ran}");
+        assert_eq!(TERMINATED.load(Ordering::SeqCst), 1000 + ran);
+        assert!(start.elapsed() >= Duration::from_millis(50) || ran == 100);
+        assert_eq!(
+            slot::<Submit>(0x90)(this, q, WORK, 7 as *mut c_void, slow),
+            E_ABORT,
+            "a terminated queue refuses work"
+        );
         slot::<Close>(0x88)(this, q);
     }
 

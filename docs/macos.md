@@ -369,6 +369,18 @@ the milestone that replaces it.
   otherwise, and the reservation is the executable's or the commit rounded
   up to 1 MiB; the commit itself is not tracked (the whole stack is host
   memory). M2c.
+- `victory-hle/src/modules/xasync.rs` (the GDK's task queues and async
+  blocks, every host): the thread-pool, serialised, delayed-callback and
+  pending-work threads of ours attach a TEB before running title callbacks
+  off Windows (as the `gameinput` poll thread does); a terminate with
+  `wait` waits for every task delivered to run to its end, unless called
+  from one of the queue's own callbacks (then the callback runs from the
+  last task to finish, as without `wait`); a task already handed to the
+  thread pool when the queue is terminated runs with `canceled`; an async
+  call keeps its own reference to its queue, so closing the handle while
+  the call is in flight is safe; `XAsyncGetStatus(wait)` spins (yielding)
+  through the moment between a call's cleanup and its status being
+  published. M2c.
 - `victory-hle/src/modules/lifecycle.rs` off Windows: the window API set
   is `window.rs`'s (below), and `end_title` posts `WM_CLOSE` to the title's
   windows after the suspend routines;
