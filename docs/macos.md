@@ -626,6 +626,32 @@ four tests), `victory-hle` `kernel` (two, title paths above) and `storage`
   older games need. Decision 1 may not outlive macOS 27; to check against
   Apple's current word before M5.
 
+## Reviews before the first title run (2026-11-27)
+
+Nothing of the macOS runtime has run under a real title yet, only under
+our stand-in executables and unit tests, so before the first run nine
+independent reviews read the code against what MSVC-built code and the
+Windows API do, each by a reviewer that had not written it. Every round
+found real defects, all fixed and tested (the commits of 2026-11-27 name
+them): the window message queues and the STL's condition variables
+(lost wake-ups, a send to an ended thread hanging); the locale, COM and
+bcrypt modules (two out-of-bounds reads); the SEH dispatcher and C++
+handlers (chained unwind info losing a function's handler, a stale state
+slot, `__finally` skipped in recursion); the runner and loader (thread
+stacks sized from the commit, thread attach racing `DllMain`, five
+start-up imports missing, the loader lock); the C runtime (`std::fstream`
+reading null buffer pointers, `getenv` lifetime, the flush order, missing
+exports); the Win32 synchronisation, memory and files (`VirtualAlloc` with
+commit alone, `WaitOnAddress` wakes, the `SLIST_HEADER` layout, waitable
+timers); the console-side modules (task-queue threads without a TEB, the
+async protocol's lifetimes); the fault path (a fault fatal while another
+thread held the image lock, the Zen 2 patcher's race, fail-fast, prefixed
+`gs` forms, AVX state on resume); and the PE parser, the census and the
+mapper (the census not knowing the title's own DLLs). What the reviewers
+could not verify from Linux is the same for all: nothing has run on macOS
+but the CI's stand-in, and no real title has called any of it. The stubs
+list above names every limit they left.
+
 ## Other forks looked at
 
 - Belobug/VIctory-Belobug-AMD (2026-11-26): our `main` (c9c932c) plus three
