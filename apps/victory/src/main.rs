@@ -3,12 +3,16 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(target_arch = "x86_64")]
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
+#[cfg(target_arch = "x86_64")]
 mod run;
 mod shader;
+#[cfg(target_arch = "x86_64")]
+mod title;
 mod translate;
 #[cfg(windows)]
 mod warm;
@@ -41,6 +45,10 @@ enum Command {
         /// List every exported function.
         #[arg(long)]
         exports: bool,
+        /// List the TEB accesses (`gs:[...]`) in the code, by kind and
+        /// offset: what the macOS loader patches, and the forms it cannot.
+        #[arg(long)]
+        teb: bool,
     },
     /// Aggregate the imports of every PE image under the given paths and
     /// show which ones our runtime covers. Defaults to the configured
@@ -180,6 +188,8 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    relaunch_with_avx();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -192,12 +202,16 @@ fn main() -> Result<()> {
             file,
             imports,
             exports,
-        } => inspect::run(&file, imports, exports),
+            teb,
+        } => inspect::run(&file, imports, exports, teb),
+        #[cfg(target_arch = "x86_64")]
         Command::Census {
             paths,
             strict,
             missing,
         } => census::run(paths, strict, missing),
+        #[cfg(not(target_arch = "x86_64"))]
+        Command::Census { .. } => runtime_only(),
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
         Command::ShaderInfo {
             paths,
@@ -222,13 +236,23 @@ fn main() -> Result<()> {
                 |message| eprintln!("{message}"),
             );
             if let Some(file) = warm {
+                #[cfg(target_arch = "x86_64")]
                 return translate::warm(paths, &file, jobs, wave);
+                #[cfg(not(target_arch = "x86_64"))]
+                return {
+                    let _ = file;
+                    runtime_only()
+                };
             }
             translate::run(paths, validate, pipelines, list, jobs, wave)
         }
+        #[cfg(target_arch = "x86_64")]
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        #[cfg(not(target_arch = "x86_64"))]
+        Command::Shaders { .. } => runtime_only(),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(target_arch = "x86_64")]
         Command::Run {
             exe,
             unimplemented,
@@ -240,10 +264,44 @@ fn main() -> Result<()> {
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        Command::Run { .. } => runtime_only(),
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
+}
+
+/// Rosetta 2 runs AVX2 but reports it (CPUID) only with this variable in the
+/// environment (docs/macos.md), and the title and our own AVX2 paths look
+/// there: this program is re-run with it set when it is not.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn relaunch_with_avx() {
+    use std::os::unix::process::CommandExt;
+    const VAR: &str = "ROSETTA_ADVERTISE_AVX";
+    if std::env::var_os(VAR).is_some_and(|v| v == "1") {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let error = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(VAR, "1")
+        .exec();
+    eprintln!("victory: could not re-run with {VAR}=1 ({error}); AVX2 may be hidden");
+}
+
+/// What the commands of the runtime (the loader, the HLE and the GPU side,
+/// which run the title's x86-64 code) say in a build for another processor:
+/// on Apple silicon the tools are native and the runtime is the x86-64 build,
+/// which runs under Rosetta 2 (docs/macos.md).
+#[cfg(not(target_arch = "x86_64"))]
+fn runtime_only() -> Result<()> {
+    anyhow::bail!(
+        "this command is part of the runtime, which is built for x86-64: use the \
+         x86_64-apple-darwin build (it runs under Rosetta 2; docs/macos.md)"
+    )
 }
 
 fn show_config() -> Result<()> {
@@ -262,6 +320,49 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "cpu         : avx2 {}",
+        if std::arch::is_x86_feature_detected!("avx2") {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    println!("cpu         : {} (the tools build)", std::env::consts::ARCH);
+    #[cfg(all(unix, target_arch = "x86_64"))]
+    {
+        let free = victory_platform::low::free_ranges();
+        match free.first() {
+            None => println!("low memory  : none free below 4 GiB"),
+            Some(lowest) => {
+                let total: usize = free.iter().map(|r| r.len).sum();
+                println!(
+                    "low memory  : {:.2} GiB free below 4 GiB in {} ranges, lowest {:#x}",
+                    total as f64 / (1u64 << 30) as f64,
+                    free.len(),
+                    lowest.start
+                );
+            }
+        }
+    }
+    #[cfg(not(all(unix, target_arch = "x86_64")))]
+    println!("low memory  : n/a");
+    #[cfg(unix)]
+    {
+        use victory_platform::system::System;
+        let (total, available) = victory_platform::Host::physical_memory();
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        println!(
+            "memory      : {:.1} GiB, {:.1} GiB available, {} processors",
+            gib(total),
+            gib(available),
+            victory_platform::Host::logical_processors()
+        );
+    }
+    #[cfg(not(unix))]
+    println!("memory      : n/a");
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

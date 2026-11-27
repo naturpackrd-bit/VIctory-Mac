@@ -66,12 +66,12 @@ pub(crate) struct Table<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Table<N> {}
 
-pub(crate) extern "system" fn add_ref(this: This) -> u32 {
+pub(crate) extern "win64" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-pub(crate) extern "system" fn release(this: This) -> u32 {
+pub(crate) extern "win64" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
     let _ = refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
@@ -162,7 +162,7 @@ fn private_data() -> std::sync::MutexGuard<'static, BTreeMap<(usize, Iid), Vec<u
     PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-extern "system" fn get_private_data(
+extern "win64" fn get_private_data(
     this: This,
     id: *const Iid,
     size: *mut u32,
@@ -191,7 +191,7 @@ extern "system" fn get_private_data(
 }
 
 /// Null data removes the entry.
-extern "system" fn set_private_data(
+extern "win64" fn set_private_data(
     this: This,
     id: *const Iid,
     size: u32,
@@ -222,7 +222,7 @@ pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*con
 }
 
 /// The object methods' name setter: names only reach our log.
-pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
+pub(crate) extern "win64" fn set_name(this: This, name: *const u16) -> HRESULT {
     let name = if name.is_null() {
         String::new()
     } else {
@@ -237,7 +237,7 @@ pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT 
 
 /// The device-child method: the device that made the object, as any of
 /// the interfaces the device itself answers to.
-pub(crate) extern "system" fn parent_device(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+pub(crate) extern "win64" fn parent_device(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let device = crate::device::device();
     answer(
         DEVICE,
@@ -291,7 +291,7 @@ static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
 /// Logged once per slot, with the caller's offset in its module (the title
 /// image for title calls). Wrong for a slot that returns a value instead of
 /// an `HRESULT`.
-extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
+extern "win64" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
     if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
         tracing::warn!(
             object = KINDS[KIND],
@@ -337,7 +337,7 @@ fn caller() -> String {
 }
 
 /// Accepts and ignores (debug-only settings).
-pub(crate) extern "system" fn ignore() -> HRESULT {
+pub(crate) extern "win64" fn ignore() -> HRESULT {
     S_OK
 }
 
@@ -385,7 +385,7 @@ mod tests {
     const TAG: Iid = [1; 16];
     const OTHER_TAG: Iid = [2; 16];
 
-    extern "system" fn release_test_object(this: This) -> u32 {
+    extern "win64" fn release_test_object(this: This) -> u32 {
         release_boxed::<Object>(this)
     }
 
@@ -414,10 +414,10 @@ mod tests {
         let first = new_test_object();
         let second = new_test_object();
         let set =
-            slot::<extern "system" fn(This, *const Iid, u32, *const u8) -> HRESULT>(first, 0x20);
+            slot::<extern "win64" fn(This, *const Iid, u32, *const u8) -> HRESULT>(first, 0x20);
         let get =
-            slot::<extern "system" fn(This, *const Iid, *mut u32, *mut u8) -> HRESULT>(first, 0x18);
-        let release = slot::<extern "system" fn(This) -> u32>(first, 0x10);
+            slot::<extern "win64" fn(This, *const Iid, *mut u32, *mut u8) -> HRESULT>(first, 0x18);
+        let release = slot::<extern "win64" fn(This) -> u32>(first, 0x10);
 
         assert_eq!(set(first, &TAG, 1, b"a".as_ptr()), S_OK);
         assert_eq!(set(first, &OTHER_TAG, 0, b"".as_ptr()), S_OK);
@@ -458,10 +458,10 @@ mod tests {
         const RELEASES: usize = 50_000;
         for count in [128, 512, 1024] {
             let live: Vec<_> = (0..count).map(|_| new_test_object()).collect();
-            let set = slot::<extern "system" fn(This, *const Iid, u32, *const u8) -> HRESULT>(
+            let set = slot::<extern "win64" fn(This, *const Iid, u32, *const u8) -> HRESULT>(
                 live[0], 0x20,
             );
-            let release = slot::<extern "system" fn(This) -> u32>(live[0], 0x10);
+            let release = slot::<extern "win64" fn(This) -> u32>(live[0], 0x10);
             for &object in &live {
                 assert_eq!(set(object, &TAG, 1, b"a".as_ptr()), S_OK);
             }
@@ -534,7 +534,7 @@ mod tests {
     /// whichever of its interfaces is asked: the object's identity.
     #[test]
     fn every_object_answers_for_iunknown() {
-        type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        type Query = extern "win64" fn(This, *const Iid, *mut This) -> HRESULT;
         let unknown = |object: This| {
             let mut found = std::ptr::null();
             let hr = slot::<Query>(object, 0)(object, &IUNKNOWN, &mut found);
@@ -559,6 +559,6 @@ mod tests {
             E_NOINTERFACE
         );
         assert!(found.is_null());
-        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+        slot::<extern "win64" fn(This) -> u32>(fence, 0x10)(fence);
     }
 }

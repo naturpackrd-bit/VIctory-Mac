@@ -32,7 +32,7 @@ struct Heap {
 }
 
 /// Device method.
-pub(crate) extern "system" fn create(
+pub(crate) extern "win64" fn create(
     _: This,
     desc: *const Desc,
     iid: *const Iid,
@@ -50,7 +50,7 @@ pub(crate) extern "system" fn create(
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         QUERY_HEAP,
         iid,
@@ -58,7 +58,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
         out,
     )
 }
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
 
@@ -130,7 +130,7 @@ mod tests {
         let mut heap = null;
         assert_eq!(create(null, &desc, &HEAP_IIDS[0], &mut heap), S_OK);
         assert!(!heap.is_null());
-        let query = slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(heap, 0x0);
+        let query = slot::<extern "win64" fn(This, *const Iid, *mut This) -> HRESULT>(heap, 0x0);
         // Every interface the heap answers to hands out the same object.
         for iid in &HEAP_IIDS {
             let mut out = null;
@@ -150,8 +150,8 @@ mod tests {
         assert_eq!(query(heap, &unknown, std::ptr::null_mut()), E_POINTER);
         // References: one from creation, four from the queries, one added;
         // each release hands back what is left, the last frees the heap.
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(heap, 0x8)(heap), 6);
-        let release = slot::<extern "system" fn(This) -> u32>(heap, 0x10);
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(heap, 0x8)(heap), 6);
+        let release = slot::<extern "win64" fn(This) -> u32>(heap, 0x10);
         for left in [5, 4, 3, 2, 1, 0] {
             assert_eq!(release(heap), left);
         }

@@ -8,34 +8,46 @@
 //! `file` (package paths), `thread` (TLS callbacks for title threads),
 //! `xaudio2`, `xstore` stubs.
 
-#[cfg(windows)]
 pub mod apu;
 pub mod audio;
+#[cfg(not(windows))]
+pub mod bcrypt;
+#[cfg(not(windows))]
+pub mod com;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
-#[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
-#[cfg(windows)]
 pub mod lifecycle;
-#[cfg(windows)]
 pub mod media;
-#[cfg(windows)]
+#[cfg(not(windows))]
+pub mod msvcp;
 pub mod net;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
+#[cfg(not(windows))]
+pub mod wer;
+#[cfg(not(windows))]
+pub mod window;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
 pub mod xgameruntime;
 pub mod xgamesave;
 pub mod xgameui;
+#[cfg(not(windows))]
+pub mod ucrt;
+#[cfg(not(windows))]
+pub mod win32;
 #[cfg(windows)]
+pub mod xmem;
+#[cfg(not(windows))]
+#[path = "xmem_sections.rs"]
 pub mod xmem;
 pub mod xnetworking;
 pub mod xpackage;
@@ -55,22 +67,29 @@ pub(crate) fn all() -> Vec<HleModule> {
         dsp::module(),
         xg::module(),
     ];
-    #[cfg(windows)]
     all.push(apu::module());
-    #[cfg(windows)]
     all.push(media::module());
-    #[cfg(windows)]
     all.push(dstorage::module());
     #[cfg(windows)]
     all.push(files::module());
-    #[cfg(windows)]
     all.push(lifecycle::module());
-    #[cfg(windows)]
     all.push(net::module());
     all.push(rpcrt4::module());
-    #[cfg(windows)]
     all.push(xmem::module());
-    #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(not(windows))]
+    all.push(msvcp::module());
+    #[cfg(not(windows))]
+    all.push(ucrt::module());
+    #[cfg(not(windows))]
+    all.push(bcrypt::module());
+    #[cfg(not(windows))]
+    all.push(com::module());
+    #[cfg(not(windows))]
+    all.push(wer::module());
+    #[cfg(not(windows))]
+    all.push(window::module());
+    #[cfg(not(windows))]
+    all.push(win32::module());
     all
 }

@@ -1,5 +1,7 @@
 [toolchain]
 channel = "1.98.1"
-targets = ["x86_64-pc-windows-msvc"]
+# Windows; on macOS the runtime runs as x86-64 under Rosetta 2 and the
+# tools natively on Apple silicon (docs/macos.md).
+targets = ["x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"]
 components = ["rustfmt", "clippy"]
 profile = "minimal"

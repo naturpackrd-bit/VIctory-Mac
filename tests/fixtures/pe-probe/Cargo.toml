@@ -1,0 +1,22 @@
+# A tiny stand-in for an Xbox title that any host can build: no standard
+# library, every import raw-dylib, linked by the rust-lld that comes with
+# Rust (no Windows SDK). victory-loader's tests build it on demand into
+# their own target directory and map it themselves (docs/macos.md, M2a).
+# It is NOT a workspace member.
+[package]
+name = "pe-probe"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]

@@ -24,7 +24,11 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
+#[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
@@ -51,9 +55,41 @@ const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
 
 type Out = *mut *mut c_void;
 
+/// What DirectStorage tells the GPU side about the title memory it writes:
+/// on Windows `victory_gpu`'s watch; off Windows there is no GPU side yet,
+/// so nothing (`victory_gpu::timeline::span` exists on every host).
+mod gpu {
+    #[cfg(windows)]
+    pub(super) use victory_gpu::{kernel_will_write, kernel_writing, title_memory_written};
+
+    /// Held while the kernel writes title memory ([`kernel_writing`]).
+    #[cfg(not(windows))]
+    pub(super) struct KernelWrite;
+
+    #[cfg(not(windows))]
+    impl Drop for KernelWrite {
+        // Nothing to let go of: dropped where the Windows guard is.
+        fn drop(&mut self) {}
+    }
+
+    /// Nothing is guarded off Windows.
+    #[cfg(not(windows))]
+    pub(super) fn kernel_writing(_at: usize, _len: usize) -> KernelWrite {
+        KernelWrite
+    }
+
+    /// Nothing is guarded off Windows.
+    #[cfg(not(windows))]
+    pub(super) fn kernel_will_write(_at: usize, _len: usize) {}
+
+    /// Nothing copied title memory off Windows.
+    #[cfg(not(windows))]
+    pub(super) fn title_memory_written(_at: usize, _len: usize, _pages: bool) {}
+}
+
 static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
 
-pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
+pub extern "win64" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
     // SAFETY: the title passes a GUID (null tolerated).
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
@@ -86,12 +122,12 @@ impl<T> Instance<T> {
     }
 }
 
-extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
+extern "win64" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
     // SAFETY: an instance we created and the title still holds.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+extern "win64" fn release<T>(this: *mut Instance<T>) -> u32 {
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
@@ -107,10 +143,33 @@ fn iid_text(iid: *const Guid) -> String {
 }
 
 /// `HRESULT_FROM_WIN32` of a host error.
+#[cfg(windows)]
 fn from_win32(error: &std::io::Error) -> HRESULT {
     error
         .raw_os_error()
-        .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
+        .map_or(E_INVALIDARG, |e| from_win32_code(e as u32))
+}
+
+/// `HRESULT_FROM_WIN32` of a host error. Off Windows `raw_os_error` is an
+/// errno, not a Win32 code, so the error's kind is mapped instead.
+#[cfg(not(windows))]
+fn from_win32(error: &std::io::Error) -> HRESULT {
+    use super::win32::files::{
+        ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+    };
+    const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
+    match error.kind() {
+        std::io::ErrorKind::NotFound => from_win32_code(ERROR_FILE_NOT_FOUND),
+        std::io::ErrorKind::PermissionDenied => from_win32_code(ERROR_ACCESS_DENIED),
+        std::io::ErrorKind::AlreadyExists => from_win32_code(ERROR_ALREADY_EXISTS),
+        std::io::ErrorKind::InvalidInput => from_win32_code(ERROR_INVALID_PARAMETER),
+        _ => E_FAIL,
+    }
+}
+
+/// `HRESULT_FROM_WIN32` of a Win32 error code.
+fn from_win32_code(code: u32) -> HRESULT {
+    (0x8007_0000 | (code & 0xffff)) as i32
 }
 
 // The factory.
@@ -118,38 +177,53 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
 type Factory = *const Object;
 
 /// Opens `path` for reading; the file object owns the handle.
-extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
-    const GENERIC_READ: u32 = 0x8000_0000;
-    const FILE_SHARE_READ: u32 = 1;
-    const OPEN_EXISTING: u32 = 3;
+extern "win64" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     if path.is_null() {
         return E_INVALIDARG;
     }
-    // Goes through `files`, so paths on our virtual drives work too.
-    let handle = super::files::CreateFileW(
-        path,
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        std::ptr::null(),
-        OPEN_EXISTING,
-        0,
-        std::ptr::null_mut(),
-    );
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
-        return from_win32(&error);
-    }
+    #[cfg(windows)]
+    let file = {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        const OPEN_EXISTING: u32 = 3;
+        // Goes through `files`, so paths on our virtual drives work too.
+        let handle = super::files::CreateFileW(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if handle as isize == -1 {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(path = name, %error, "dstorage: opening a file failed");
+            return from_win32(&error);
+        }
+        // SAFETY: a handle we just opened and nobody else owns.
+        unsafe { std::fs::File::from_raw_handle(handle) }
+    };
+    // A path on our drives, read by the host's own means.
+    #[cfg(not(windows))]
+    let (file, host) = match super::win32::files::open_for_reading(&name) {
+        Ok(opened) => opened,
+        Err(code) => {
+            tracing::warn!(path = name, error = code, "dstorage: opening a file failed");
+            return from_win32_code(code);
+        }
+    };
     let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
-    // SAFETY: a handle we just opened and nobody else owns.
-    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    #[cfg(windows)]
     let files = Files::new(file, Io::chosen());
+    #[cfg(not(windows))]
+    let files = Files::new(file, Io::chosen(), host);
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
@@ -159,7 +233,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
 }
 
 /// `(capacity, name, iid, out)`.
-extern "system" fn create_status_array(
+extern "win64" fn create_status_array(
     _: Factory,
     capacity: u32,
     name: *const c_char,
@@ -192,7 +266,7 @@ struct QueueDesc {
     unknown: u64,
 }
 
-extern "system" fn create_queue(
+extern "win64" fn create_queue(
     _: Factory,
     desc: *const QueueDesc,
     iid: *const Guid,
@@ -232,7 +306,7 @@ extern "system" fn create_queue(
 /// `VICTORY_DSTORAGE_STAGING_MB=<n>`: at least that much (codec-d/cool_fox
 /// 641835a4, which makes it 256 MiB by default, so multi-MB RPF chunks do
 /// not starve the other cores); unset: what the title asks for.
-extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
+extern "win64" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let floor = *FLOOR_MB.get_or_init(|| {
         std::env::var("VICTORY_DSTORAGE_STAGING_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
@@ -288,8 +362,12 @@ enum Io {
     /// `handles`: a handle for each worker.
     Handles,
     /// `overlapped`: one handle, whose reads the host does side by side.
+    /// Windows only (off Windows, only tests make it).
+    #[cfg_attr(not(windows), allow(dead_code))]
     Overlapped,
     /// `direct`: a handle for each worker, past the host's file cache.
+    /// Windows only (off Windows, only tests make it).
+    #[cfg_attr(not(windows), allow(dead_code))]
     Direct,
 }
 
@@ -300,8 +378,16 @@ impl Io {
             let io = match std::env::var("VICTORY_DSTORAGE_IO").as_deref().map(str::trim) {
                 Ok("one") => Io::One,
                 Ok("handles") => Io::Handles,
+                #[cfg(windows)]
                 Ok("overlapped") => Io::Overlapped,
+                #[cfg(windows)]
                 Ok("direct") => Io::Direct,
+                // The host has no overlapped or unbuffered reads here.
+                #[cfg(not(windows))]
+                Ok(way @ ("overlapped" | "direct")) => {
+                    tracing::info!(way, "dstorage: reads through handles (no other way here)");
+                    Io::Handles
+                }
                 _ => Io::DEFAULT,
             };
             tracing::info!(?io, "dstorage: how files are read (VICTORY_DSTORAGE_IO)");
@@ -318,27 +404,43 @@ struct Files {
     first: std::fs::File,
     others: Box<[OnceLock<Option<std::fs::File>>]>,
     io: Io,
+    /// The host path, for opening it again.
+    #[cfg(not(windows))]
+    path: std::path::PathBuf,
 }
 
 impl Files {
-    fn new(first: std::fs::File, io: Io) -> Files {
+    fn new(first: std::fs::File, io: Io, #[cfg(not(windows))] path: std::path::PathBuf) -> Files {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
             Io::Handles | Io::Direct => workers,
         };
+        #[cfg(not(windows))]
+        return Files {
+            first,
+            others: (0..others).map(|_| OnceLock::new()).collect(),
+            io,
+            path,
+        };
+        #[cfg(windows)]
         Files { first, others: (0..others).map(|_| OnceLock::new()).collect(), io }
     }
 
     #[cfg(test)]
     fn open_for_test(path: &str, io: Io) -> Files {
-        Files::new(std::fs::File::open(path).unwrap(), io)
+        #[cfg(windows)]
+        return Files::new(std::fs::File::open(path).unwrap(), io);
+        #[cfg(not(windows))]
+        Files::new(std::fs::File::open(path).unwrap(), io, path.into())
     }
 
-    /// Reads at `offset`; as [`FileExt::seek_read`].
+    /// Reads at `offset`; as [`FileExt::seek_read`] (`read_at` off Windows).
     fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        #[cfg(windows)]
         use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED};
+        #[cfg(windows)]
         let flags = match self.io {
             Io::One | Io::Handles => 0,
             Io::Overlapped => FILE_FLAG_OVERLAPPED,
@@ -346,12 +448,22 @@ impl Files {
         };
         let other = match self.others.len() {
             0 => None,
+            #[cfg(windows)]
             n => self.others[this_thread() % n].get_or_init(|| reopen(&self.first, flags)).as_ref(),
+            #[cfg(not(windows))]
+            n => self.others[this_thread() % n]
+                .get_or_init(|| reopen(&self.path))
+                .as_ref(),
         };
         match (other, self.io) {
+            #[cfg(windows)]
             (Some(file), Io::Overlapped) => read_overlapped(file, out, offset),
+            #[cfg(windows)]
             (Some(file), Io::Direct) => read_direct(file, out, offset),
+            #[cfg(windows)]
             (file, _) => file.unwrap_or(&self.first).seek_read(out, offset),
+            #[cfg(not(windows))]
+            (file, _) => FileExt::read_at(file.unwrap_or(&self.first), out, offset),
         }
     }
 }
@@ -367,6 +479,7 @@ fn this_thread() -> usize {
 
 /// Another handle to `file`, for reading; `None` if the host gives none
 /// (then the first one is used).
+#[cfg(windows)]
 fn reopen(file: &std::fs::File, flags: u32) -> Option<std::fs::File> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
@@ -381,7 +494,19 @@ fn reopen(file: &std::fs::File, flags: u32) -> Option<std::fs::File> {
     Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
+/// Another handle to the file at `path`, for reading; `None` if the host
+/// gives none (then the first one is used).
+#[cfg(not(windows))]
+fn reopen(path: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::File::open(path)
+        .inspect_err(|error| {
+            tracing::warn!(%error, path = %path.display(), "dstorage: a file could not be opened again");
+        })
+        .ok()
+}
+
 /// A read through a handle opened for overlapped reads, waited for.
+#[cfg(windows)]
 fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE};
@@ -431,6 +556,7 @@ fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io
 
 /// A read past the file cache: of the whole sectors around the bytes, into
 /// a buffer of this thread's, unless `out` takes them as they are.
+#[cfg(windows)]
 fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
     /// Every disk's sectors are at most this; offsets, sizes and addresses
     /// are multiples of it.
@@ -480,7 +606,7 @@ type Array = *mut Instance<StatusArray>;
 
 /// The result of the requests before entry `index`: pending, the first
 /// failure, or success.
-extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+extern "win64" fn status_result(this: Array, index: u32) -> HRESULT {
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
     entries
@@ -490,7 +616,7 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
-extern "system" fn is_complete(this: Array, index: u32) -> bool {
+extern "win64" fn is_complete(this: Array, index: u32) -> bool {
     let done = status_result(this, index) != E_PENDING;
     if done && stream_log::on() {
         // SAFETY: as above.
@@ -1264,7 +1390,7 @@ impl Status {
     }
 }
 
-extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
+extern "win64" fn enqueue_request(this: QueueRef, request: *const Request) {
     // SAFETY: the title passes its request (null tolerated).
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
@@ -1273,7 +1399,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     queue(this, Command::Read(Read { request, note }));
 }
 
-extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
+extern "win64" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     // SAFETY: the title passes an array we created (null tolerated).
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
@@ -1350,7 +1476,7 @@ fn queue(this: QueueRef, command: Command) {
 /// The title's submit, where its page lists become valid ([`half_submits`]):
 /// the pages are mapped just before, also those under addresses without a
 /// list (memory only the CPU sees).
-extern "system" fn submit(this: QueueRef) {
+extern "win64" fn submit(this: QueueRef) {
     let _called = victory_gpu::timeline::span("the title's DirectStorage Submit");
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
@@ -1367,7 +1493,7 @@ extern "system" fn submit(this: QueueRef) {
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
 /// finished. The title calls this, not `Release`.
-extern "system" fn close(this: QueueRef) {
+extern "win64" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }
@@ -1580,7 +1706,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
         std::thread::sleep(std::time::Duration::from_millis(1 << tries));
         tries += 1;
-        victory_gpu::kernel_will_write(out.as_ptr() as usize + done, out.len() - done);
+        gpu::kernel_will_write(out.as_ptr() as usize + done, out.len() - done);
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
@@ -1600,7 +1726,7 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first, and until the
         // bytes are there.
-        let writing = victory_gpu::kernel_writing(request.destination as usize, len);
+        let writing = gpu::kernel_writing(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1609,9 +1735,9 @@ fn into_destination(
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
         if super::xmem::stream_notice() {
-            victory_gpu::kernel_will_write(request.destination as usize, len);
+            gpu::kernel_will_write(request.destination as usize, len);
         } else {
-            victory_gpu::title_memory_written(request.destination as usize, len, false);
+            gpu::title_memory_written(request.destination as usize, len, false);
         }
         return filled;
     }
@@ -1763,6 +1889,7 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
@@ -1780,9 +1907,43 @@ mod tests {
         factory
     }
 
+    /// Off Windows: a folder of the test process on one of our drives,
+    /// which the tests' files go under (a drive each would use up the
+    /// letters).
+    #[cfg(not(windows))]
+    fn drive() -> &'static (std::path::PathBuf, char) {
+        static DRIVE: OnceLock<(std::path::PathBuf, char)> = OnceLock::new();
+        DRIVE.get_or_init(|| {
+            let root = tempfile::tempdir().unwrap().keep();
+            let letter = super::super::win32::files::mount(&root).expect("a free drive letter");
+            (root, letter)
+        })
+    }
+
+    /// A folder for a test's files, which [`open`] can open.
+    fn temp_dir() -> tempfile::TempDir {
+        #[cfg(windows)]
+        return tempfile::tempdir().unwrap();
+        #[cfg(not(windows))]
+        tempfile::tempdir_in(&drive().0).unwrap()
+    }
+
+    /// The title's path of a file in a [`temp_dir`], NUL-terminated.
+    fn title_path(path: &std::path::Path) -> Vec<u16> {
+        #[cfg(windows)]
+        return path.as_os_str().encode_wide().chain([0]).collect();
+        #[cfg(not(windows))]
+        {
+            let (root, letter) = drive();
+            let tail = path.strip_prefix(root).unwrap().to_str().unwrap();
+            let path = format!("{letter}:\\{}", tail.replace('/', "\\"));
+            path.encode_utf16().chain([0]).collect()
+        }
+    }
+
     fn open(path: &std::path::Path) -> *mut c_void {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+        let wide = title_path(path);
+        let open: extern "win64" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
             call(factory(), 0x20);
         let mut file = std::ptr::null_mut();
         assert_eq!(
@@ -1793,7 +1954,7 @@ mod tests {
     }
 
     fn status_array(capacity: u32) -> *mut c_void {
-        let create: extern "system" fn(
+        let create: extern "win64" fn(
             *mut c_void,
             u32,
             *const c_char,
@@ -1810,7 +1971,7 @@ mod tests {
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+        let create: extern "win64" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type,
@@ -1847,28 +2008,28 @@ mod tests {
     }
 
     fn enqueue(queue: *mut c_void, request: &Request) {
-        let f: extern "system" fn(*mut c_void, *const Request) = call(queue, 0x18);
+        let f: extern "win64" fn(*mut c_void, *const Request) = call(queue, 0x18);
         f(queue, request);
     }
 
     fn enqueue_status(queue: *mut c_void, array: *mut c_void, index: u32) {
-        let f: extern "system" fn(*mut c_void, *mut c_void, u32) = call(queue, 0x20);
+        let f: extern "win64" fn(*mut c_void, *mut c_void, u32) = call(queue, 0x20);
         f(queue, array, index);
     }
 
     fn void(object: *mut c_void, slot: usize) {
-        let f: extern "system" fn(*mut c_void) = call(object, slot);
+        let f: extern "win64" fn(*mut c_void) = call(object, slot);
         f(object);
     }
 
     fn result(array: *mut c_void, index: u32) -> HRESULT {
-        let f: extern "system" fn(*mut c_void, u32) -> HRESULT = call(array, 0x20);
+        let f: extern "win64" fn(*mut c_void, u32) -> HRESULT = call(array, 0x20);
         f(array, index)
     }
 
     /// Polls as the title does, then returns the entry's result.
     fn wait(array: *mut c_void, index: u32) -> HRESULT {
-        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
+        let done: extern "win64" fn(*mut c_void, u32) -> bool = call(array, 0x18);
         let start = Instant::now();
         while !done(array, index) {
             assert!(start.elapsed() < Duration::from_secs(10), "never completed");
@@ -1878,7 +2039,7 @@ mod tests {
     }
 
     fn file_with(bytes: &[u8]) -> (tempfile::TempDir, *mut c_void) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir();
         let path = dir.path().join("data.bin");
         std::fs::write(&path, bytes).unwrap();
         let file = open(&path);
@@ -2034,7 +2195,7 @@ mod tests {
     #[test]
     fn a_full_queue_submits_itself() {
         let (_dir, file) = file_with(&pattern(64));
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+        let create: extern "win64" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type: 0,
@@ -2093,7 +2254,14 @@ mod tests {
     }
 
     #[test]
+    // Off Windows our own functions, which are safe to call.
+    #[cfg_attr(not(windows), allow(unused_unsafe))]
     fn a_read_into_memory_guarded_for_a_moment_is_tried_again() {
+        #[cfg(not(windows))]
+        use super::super::win32::memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+        };
+        #[cfg(windows)]
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_READONLY, VirtualAlloc, VirtualProtect,
         };
@@ -2102,13 +2270,13 @@ mod tests {
         // SAFETY: a fresh allocation; its middle page is read-only until the
         // thread opens it, as a guard of the GPU side's would be.
         let at = unsafe {
-            VirtualAlloc(std::ptr::null(), plain.len(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+            VirtualAlloc(std::ptr::null_mut(), plain.len(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
         } as usize;
         assert_ne!(at, 0);
         let protect = move |to| {
             let mut old = 0;
             // SAFETY: as above.
-            unsafe { VirtualProtect((at + 4096) as *const _, 4096, to, &mut old) }
+            unsafe { VirtualProtect((at + 4096) as *mut _, 4096, to, &mut old) }
         };
         assert_ne!(protect(PAGE_READONLY), 0);
         let opener = std::thread::spawn(move || {
@@ -2183,7 +2351,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
         std::fs::write(&path, &plain).unwrap();
-        for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
+        #[cfg(windows)]
+        let modes = [Io::One, Io::Handles, Io::Overlapped, Io::Direct];
+        // Off Windows the others are read as `Handles` (`Io::chosen`).
+        #[cfg(not(windows))]
+        let modes = [Io::One, Io::Handles];
+        for mode in modes {
             let file = Files::open_for_test(path.to_str().unwrap(), mode);
             for (at, len) in [(0, 4096), (1, 100), (4095, 2), (8192, 200_000), (12_345, 250_000), (299_990, 11), (300_000, 1)] {
                 let mut out = vec![0u8; len];

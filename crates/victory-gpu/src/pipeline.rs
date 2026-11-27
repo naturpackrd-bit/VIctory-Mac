@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -603,7 +605,7 @@ fn hand_out(
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_graphics(
+pub(crate) extern "win64" fn create_graphics(
     _: This,
     desc: *const GraphicsHead,
     iid: *const Iid,
@@ -625,7 +627,7 @@ pub(crate) extern "system" fn create_graphics(
 }
 
 /// Device method.
-pub(crate) extern "system" fn create_compute(
+pub(crate) extern "win64" fn create_compute(
     _: This,
     desc: *const ComputeHead,
     iid: *const Iid,
@@ -648,7 +650,7 @@ pub(crate) extern "system" fn create_compute(
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
 /// the rest of the description.
-pub(crate) extern "system" fn create_compute_x(
+pub(crate) extern "win64" fn create_compute_x(
     this: This,
     desc: *const ComputeHead,
     _extensions: u32,
@@ -697,7 +699,7 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
 
 /// Device method: a pipeline from a stream; the shaders are kept, and the
 /// graphics state for the host pipeline.
-pub(crate) extern "system" fn create_stream(
+pub(crate) extern "win64" fn create_stream(
     _: This,
     desc: *const StreamDesc,
     iid: *const Iid,
@@ -746,11 +748,11 @@ pub(crate) extern "system" fn create_stream(
     )
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     object::release_boxed::<Pipeline>(this)
 }
 
@@ -862,7 +864,7 @@ mod tests {
             &pipeline(p).shaders[1],
             &pipeline(q).shaders[1]
         ));
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        assert_eq!(slot::<extern "win64" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
     /// The stream layout the title builds (title+0x86f090): root

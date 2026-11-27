@@ -10,6 +10,11 @@
 //!
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
+//!
+//! The runtime runs the title's x86-64 code in our process, so it is built
+//! for x86-64 only: on Apple silicon under Rosetta 2, with the tools built
+//! natively beside it (docs/macos.md). Elsewhere this crate is empty.
+#![cfg(target_arch = "x86_64")]
 
 mod host;
 mod image_watch;
@@ -97,11 +102,13 @@ mod tests {
         );
     }
 
+    /// A function nobody serves (not even Windows: the name is made up, so
+    /// that no later module of ours takes it) is reported missing.
     #[test]
     fn strict_policy_reports_missing() {
         let r = HleResolver::new(HostPolicy::none());
         assert_eq!(
-            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("Sleep")),
+            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("NoSuchFunction")),
             None
         );
     }

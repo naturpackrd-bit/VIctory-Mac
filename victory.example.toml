@@ -7,11 +7,13 @@
 # Your own dump of the title.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
-# Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
+# Derived data. Default: %LOCALAPPDATA%\victory\cache
+# (macOS: ~/Library/Caches/victory).   env: VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
 
 # What titles save (persistent local storage), kept apart from the cache.
-# Default: %LOCALAPPDATA%\victory\data.   env: VICTORY_DATA_DIR
+# Default: %LOCALAPPDATA%\victory\data
+# (macOS: ~/Library/Application Support/victory).   env: VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'
 
 # Other Xbox Series titles used to test platform-level code.

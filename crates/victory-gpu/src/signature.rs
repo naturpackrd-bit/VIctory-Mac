@@ -36,7 +36,7 @@ struct Signature {
 }
 
 /// Device method.
-pub(crate) extern "system" fn create(
+pub(crate) extern "win64" fn create(
     _: This,
     desc: *const Desc,
     _root: This,
@@ -76,11 +76,11 @@ pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
     Some((s.stride, &s.arguments))
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
     object::answer(COMMAND_SIGNATURE, iid, found, out)
 }
-extern "system" fn release(this: This) -> u32 {
+extern "win64" fn release(this: This) -> u32 {
     object::release_boxed::<Signature>(this)
 }
 
@@ -153,7 +153,7 @@ mod tests {
         assert_eq!(stride, 16);
         assert!(arguments.is_empty());
         assert_eq!(
-            slot::<extern "system" fn(This) -> u32>(signature, 0x10)(signature),
+            slot::<extern "win64" fn(This) -> u32>(signature, 0x10)(signature),
             0
         );
         // The argument pointer is not read when the count is zero.
@@ -172,7 +172,7 @@ mod tests {
         let (_, arguments) = layout(signature).expect("one of our signatures");
         assert!(arguments.is_empty());
         assert_eq!(
-            slot::<extern "system" fn(This) -> u32>(signature, 0x10)(signature),
+            slot::<extern "win64" fn(This) -> u32>(signature, 0x10)(signature),
             0
         );
     }
@@ -206,7 +206,7 @@ mod tests {
         assert_eq!(stride, 20);
         assert_eq!(arguments, &expected[..]);
         assert_eq!(
-            slot::<extern "system" fn(This) -> u32>(signature, 0x10)(signature),
+            slot::<extern "win64" fn(This) -> u32>(signature, 0x10)(signature),
             0
         );
     }
@@ -228,7 +228,7 @@ mod tests {
         );
         assert!(!signature.is_null());
         let query =
-            slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(signature, 0x0);
+            slot::<extern "win64" fn(This, *const Iid, *mut This) -> HRESULT>(signature, 0x0);
         // Every interface the signature answers to hands out the same object.
         for iid in &SIGNATURE_IIDS {
             let mut out = null;
@@ -249,10 +249,10 @@ mod tests {
         // References: one from creation, four from the queries, one added;
         // each release hands back what is left, the last frees the signature.
         assert_eq!(
-            slot::<extern "system" fn(This) -> u32>(signature, 0x8)(signature),
+            slot::<extern "win64" fn(This) -> u32>(signature, 0x8)(signature),
             6
         );
-        let release = slot::<extern "system" fn(This) -> u32>(signature, 0x10);
+        let release = slot::<extern "win64" fn(This) -> u32>(signature, 0x10);
         for left in [5, 4, 3, 2, 1, 0] {
             assert_eq!(release(signature), left);
         }

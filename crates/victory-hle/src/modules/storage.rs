@@ -56,10 +56,10 @@ fn folder() -> Option<String> {
     #[cfg(windows)]
     return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
     #[cfg(not(windows))]
-    None
+    super::win32::files::mount(&storage).map(|letter| format!("{letter}:\\"))
 }
 
-extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
+extern "win64" fn path_size(_: This, out: *mut usize) -> HRESULT {
     match folder() {
         Some(path) => put(out, path.len() + 1),
         None => NOT_SUPPORTED,
@@ -68,7 +68,7 @@ extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
 
 /// A buffer too small for the path fails with `E_FAIL`, the documented
 /// Xbox result (a PC gets `ERROR_INSUFFICIENT_BUFFER`).
-extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+extern "win64" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     match folder() {
         Some(path) if size <= path.len() => E_FAIL,
         Some(path) => put_string(&path, size, buffer, used),
@@ -124,6 +124,21 @@ pub(crate) fn disk_free(dir: &Path) -> u64 {
             return free;
         }
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+            // SAFETY: plain data; zero is a valid value.
+            let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a valid output.
+            if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } == 0 {
+                // The fields' types differ by host (32-bit counts on macOS).
+                #[allow(clippy::unnecessary_cast)]
+                let free = stats.f_bavail as u64 * stats.f_frsize as u64;
+                return free;
+            }
+        }
+    }
     let _ = dir;
     u64::MAX
 }
@@ -144,7 +159,7 @@ fn space() -> Result<SpaceInfo, HRESULT> {
     })
 }
 
-extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
+extern "win64" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
     if out.is_null() {
         return xasync::E_INVALIDARG;
     }
@@ -158,7 +173,7 @@ extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
 static PROMPT: u8 = 0;
 
 /// There is nobody to ask: granted when the quota has room, else declined.
-extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
     let hr = match space() {
         Ok(info) if bytes <= info.total_free => S_OK,
         Ok(_) => E_ABORT,
@@ -167,7 +182,7 @@ extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock)
     xasync::finished(block, (&raw const PROMPT).cast(), hr)
 }
 
-extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast())
 }
@@ -186,7 +201,33 @@ static VTABLE: Methods<8> = Methods([
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use crate::modules::xgameruntime::method;
+
+    /// Tests that set the title, one at a time.
+    static TITLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn storage_is_a_drive_with_the_titles_quota() {
+        let _alone = TITLE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
+        let previous_title = runtime::title();
+        runtime::set_title(runtime::Title {
+            id: 1,
+            storage: dir.path().to_owned(),
+            storage_bytes: 1000,
+            ..Default::default()
+        });
+        let drive = folder().expect("a drive");
+        let letter = drive.chars().next().unwrap();
+        assert!(letter.is_ascii_uppercase(), "{drive}");
+        assert_eq!(drive, format!("{letter}:\\"));
+        let info = space().unwrap();
+        assert_eq!((info.used, info.total_free, info.total), (100, 900, 1000));
+        assert!(info.available_free <= 900);
+        runtime::set_title(previous_title);
+    }
 
     #[test]
     fn empty_storage_uses_zero_bytes() {
@@ -234,13 +275,16 @@ mod tests {
         assert_eq!(path, nested);
     }
 
+    // Virtual drives (`files`) are Windows-only so far (docs/macos.md).
+    #[cfg(windows)]
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
-        type Size = extern "system" fn(This, *mut usize) -> HRESULT;
-        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
-        type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
-        type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
-        type Result = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type Size = extern "win64" fn(This, *mut usize) -> HRESULT;
+        type Get = extern "win64" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        type Space = extern "win64" fn(This, *mut SpaceInfo) -> HRESULT;
+        type Prompt = extern "win64" fn(This, u64, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "win64" fn(This, *mut AsyncBlock) -> HRESULT;
+        let _alone = TITLE.lock().unwrap_or_else(|e| e.into_inner());
         let this: This = &OBJECT;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();

@@ -491,7 +491,7 @@ mod tests {
                 let mine = [Site { window: 0x1100, ..*site }];
                 assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
                 assert_eq!(*((place + 0x1100 + site.store) as *const u8), 0xe9);
-                let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+                let (plain, hooked): (F, F) = (std::mem::transmute::<usize, F>(plain), std::mem::transmute::<usize, F>(hooked));
                 let record: [u8; 32] = std::array::from_fn(|k| k as u8 ^ 0x5a);
                 // In the heap: slot 0x40 + 3 of its start.
                 let table = heap.add(0x2000 + 0x40 * 32);
@@ -556,7 +556,7 @@ mod tests {
             let after = COPY_128.store + COPY_128.len;
             assert_eq!(&COPY_128.bytes[after..after + 3], &[0x4c, 0x89, 0xf9]);
             assert_eq!(std::slice::from_raw_parts((place + 0x1100 + after) as *const u8, COPY_128.bytes.len() - after), &COPY_128.bytes[after..]);
-            let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+            let (plain, hooked) = (std::mem::transmute::<usize, F>(plain), std::mem::transmute::<usize, F>(hooked));
             let records: [u8; 128] = std::array::from_fn(|k| (k as u8).wrapping_mul(7) ^ 0x3c);
             // Slots 126..130 of the heap: over the end of chunk 0.
             let table = heap.add(0x2000 + 126 * 32);

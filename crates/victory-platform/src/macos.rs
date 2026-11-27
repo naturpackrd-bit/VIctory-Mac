@@ -1,0 +1,243 @@
+//! macOS.
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use crate::{Dirs, Host, Memory, Protection, Thread};
+
+/// `<mach/vm_statistics.h>` (libc's copies are deprecated).
+const VM_FLAGS_FIXED: libc::c_int = 0;
+const VM_FLAGS_ANYWHERE: libc::c_int = 1;
+
+unsafe extern "C" {
+    /// `<mach/mach_init.h>`: this task's port, which libSystem sets before
+    /// `main` and never changes (C's `mach_task_self()` reads it; libc's
+    /// wrapper of it is deprecated).
+    static mach_task_self_: libc::mach_port_t;
+
+    /// `<mach/mach_vm.h>`: the kernel copies `size` bytes at `address` of
+    /// `target_task` to `data` in ours. Fails (`KERN_INVALID_ADDRESS`,
+    /// `KERN_PROTECTION_FAILURE`) when a page of the source is not there or
+    /// not readable, instead of faulting.
+    fn mach_vm_read_overwrite(
+        target_task: libc::vm_map_t,
+        address: libc::mach_vm_address_t,
+        size: libc::mach_vm_size_t,
+        data: libc::mach_vm_address_t,
+        outsize: *mut libc::mach_vm_size_t,
+    ) -> libc::kern_return_t;
+
+    /// `<mach/mach_vm.h>`: zeroed read-write memory; with `VM_FLAGS_FIXED`
+    /// at `*address` or not at all (`KERN_NO_SPACE` where something is
+    /// mapped), never replacing a mapping.
+    fn mach_vm_allocate(
+        target: libc::vm_map_t,
+        address: *mut libc::mach_vm_address_t,
+        size: libc::mach_vm_size_t,
+        flags: libc::c_int,
+    ) -> libc::kern_return_t;
+
+    /// `<mach/mach_vm.h>`.
+    fn mach_vm_deallocate(
+        target: libc::vm_map_t,
+        address: libc::mach_vm_address_t,
+        size: libc::mach_vm_size_t,
+    ) -> libc::kern_return_t;
+}
+
+fn host_protection(protection: Protection) -> libc::c_int {
+    match protection {
+        Protection::NoAccess => libc::PROT_NONE,
+        Protection::Read => libc::PROT_READ,
+        Protection::ReadWrite => libc::PROT_READ | libc::PROT_WRITE,
+        Protection::ReadExecute => libc::PROT_READ | libc::PROT_EXEC,
+        Protection::ReadWriteExecute => libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+    }
+}
+
+impl Memory for Host {
+    fn page_size() -> usize {
+        // SAFETY: a plain query.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
+    fn allocate(len: usize, at: Option<usize>) -> Option<usize> {
+        let mut address = at.unwrap_or(0) as libc::mach_vm_address_t;
+        let flags = if at.is_some() {
+            VM_FLAGS_FIXED
+        } else {
+            VM_FLAGS_ANYWHERE
+        };
+        // SAFETY: a fresh allocation in our own task; a fixed one fails
+        // rather than replace what is there. The task port is set before
+        // `main`.
+        let result = unsafe {
+            mach_vm_allocate(
+                mach_task_self_,
+                &mut address,
+                len as libc::mach_vm_size_t,
+                flags,
+            )
+        };
+        (result == libc::KERN_SUCCESS).then_some(address as usize)
+    }
+
+    unsafe fn protect(at: usize, len: usize, protection: Protection) -> bool {
+        // SAFETY: the caller's range of our memory.
+        unsafe { libc::mprotect(at as *mut libc::c_void, len, host_protection(protection)) == 0 }
+    }
+
+    unsafe fn free(at: usize, len: usize) -> bool {
+        // SAFETY: the caller's whole allocation, in our own task.
+        unsafe {
+            mach_vm_deallocate(
+                mach_task_self_,
+                at as libc::mach_vm_address_t,
+                len as libc::mach_vm_size_t,
+            ) == libc::KERN_SUCCESS
+        }
+    }
+
+    unsafe fn read(src: usize, dst: *mut u8, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let mut copied: libc::mach_vm_size_t = 0;
+        // SAFETY: the caller's destination of `len` bytes; the kernel checks
+        // the source. The task port is set before `main`.
+        let result = unsafe {
+            mach_vm_read_overwrite(
+                mach_task_self_,
+                src as libc::mach_vm_address_t,
+                len as libc::mach_vm_size_t,
+                dst as libc::mach_vm_address_t,
+                &mut copied,
+            )
+        };
+        result == libc::KERN_SUCCESS && copied == len as libc::mach_vm_size_t
+    }
+}
+
+impl Thread for Host {
+    fn stack_bounds() -> (usize, usize) {
+        // SAFETY: plain queries about this thread.
+        unsafe {
+            let thread = libc::pthread_self();
+            let top = libc::pthread_get_stackaddr_np(thread) as usize;
+            let size = libc::pthread_get_stacksize_np(thread);
+            (top - size, top)
+        }
+    }
+
+    fn thread_id() -> u32 {
+        let mut id = 0u64;
+        // SAFETY: a plain query about this thread, into our own variable.
+        unsafe { libc::pthread_threadid_np(libc::pthread_self(), &mut id) };
+        id as u32
+    }
+
+    fn process_id() -> u32 {
+        // SAFETY: a plain query.
+        unsafe { libc::getpid() as u32 }
+    }
+
+    /// A thread-specific key of our own. libpthread keeps a thread's
+    /// specific values in an array at `gs:0`, eight bytes each
+    /// (`pthread_getspecific` is `mov rax, gs:[rdi*8]`), so the key's value
+    /// is at `gs:[key * 8]`. The test `the_teb_pointer_is_read_through_gs`
+    /// holds the layout to that.
+    fn teb_pointer_disp() -> u32 {
+        static KEY: OnceLock<u32> = OnceLock::new();
+        *KEY.get_or_init(|| {
+            let mut key: libc::pthread_key_t = 0;
+            // SAFETY: a fresh key with no destructor, kept for the process's
+            // life.
+            let made = unsafe { libc::pthread_key_create(&mut key, None) };
+            assert_eq!(made, 0, "pthread_key_create failed");
+            key as u32 * 8
+        })
+    }
+
+    unsafe fn set_teb_pointer(teb: usize) -> bool {
+        let key = Self::teb_pointer_disp() / 8;
+        // SAFETY: our key; the value is the caller's pointer, stored as is.
+        unsafe {
+            libc::pthread_setspecific(key as libc::pthread_key_t, teb as *const libc::c_void) == 0
+        }
+    }
+
+    // `arg` is not read here, only handed to `start` on the new thread.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn spawn_thread(
+        stack: usize,
+        start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
+        arg: *mut libc::c_void,
+    ) -> bool {
+        let Some(stack) = stack
+            .max(libc::PTHREAD_STACK_MIN)
+            .checked_next_multiple_of(Host::page_size())
+        else {
+            return false;
+        };
+        // SAFETY: an attribute object of our own, initialized before use and
+        // destroyed after; the new thread gets `start` and `arg` as the
+        // caller gave them, and is detached, so nothing joins it.
+        unsafe {
+            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+            if libc::pthread_attr_init(&mut attr) != 0 {
+                return false;
+            }
+            let mut thread: libc::pthread_t = std::mem::zeroed();
+            let made = libc::pthread_attr_setstacksize(&mut attr, stack) == 0
+                && libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED) == 0
+                && libc::pthread_create(&mut thread, &attr, start, arg) == 0;
+            libc::pthread_attr_destroy(&mut attr);
+            made
+        }
+    }
+
+    fn exit_thread() -> ! {
+        // SAFETY: ends this thread; its thread-local destructors run.
+        unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+    }
+
+    fn name_current_thread(name: &str) {
+        // The name stops at a NUL, and is cut at a character within
+        // libpthread's 64 bytes (63 and the NUL).
+        let name = name.split('\0').next().unwrap_or_default();
+        let mut end = name.len().min(63);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = name.as_bytes()[..end].to_vec();
+        bytes.push(0);
+        // SAFETY: names the calling thread, from a NUL-terminated name we
+        // hold.
+        unsafe { libc::pthread_setname_np(bytes.as_ptr().cast()) };
+    }
+}
+
+/// The user's home folder, if `HOME` names one.
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+impl Dirs for Host {
+    /// `~/Library/Caches/victory`: where macOS expects what can be made
+    /// again.
+    fn default_cache_dir() -> Option<PathBuf> {
+        Some(home()?.join("Library").join("Caches").join("victory"))
+    }
+
+    /// `~/Library/Application Support/victory`: kept, and backed up.
+    fn default_data_dir() -> Option<PathBuf> {
+        Some(
+            home()?
+                .join("Library")
+                .join("Application Support")
+                .join("victory"),
+        )
+    }
+}

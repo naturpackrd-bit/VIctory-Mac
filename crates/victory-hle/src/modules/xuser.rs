@@ -89,17 +89,17 @@ pub const INTERFACES: &[Interface] = &[
 ];
 
 type This = *const Object;
-extern "system" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
+extern "win64" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
     put(out, user())
 }
-extern "system" fn close(_: This, _: Handle) {}
-extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
+extern "win64" fn close(_: This, _: Handle) {}
+extern "win64" fn compare(_: This, a: Handle, b: Handle) -> i32 {
     i32::from(a != b)
 }
 
 /// The async provider for adding a user: done at once, the result is a
 /// handle.
-extern "system" fn add_provider(op: u32, data: *const ProviderData) -> HRESULT {
+extern "win64" fn add_provider(op: u32, data: *const ProviderData) -> HRESULT {
     const BEGIN: u32 = 0;
     const GET_RESULT: u32 = 2;
     // SAFETY: the async runtime passes valid provider data.
@@ -116,7 +116,7 @@ extern "system" fn add_provider(op: u32, data: *const ProviderData) -> HRESULT {
 static ADD: u8 = 0;
 
 /// Any options add the one user, silently.
-extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> HRESULT {
     tracing::info!(options, "XUserAddAsync: the offline local user");
     xasync::XAsyncBegin(
         block,
@@ -126,7 +126,7 @@ extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> H
         Some(add_provider),
     )
 }
-extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+extern "win64" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
     xasync::XAsyncGetResult(
         block,
         (&raw const ADD).cast(),
@@ -135,29 +135,29 @@ extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle)
         std::ptr::null_mut(),
     )
 }
-extern "system" fn get_local_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
+extern "win64" fn get_local_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
     put(out, LOCAL_ID)
 }
-extern "system" fn find_by_local_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
+extern "win64" fn find_by_local_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
     found(id == LOCAL_ID, out)
 }
-extern "system" fn get_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
+extern "win64" fn get_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
     put(out, XUID)
 }
-extern "system" fn find_by_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
+extern "win64" fn find_by_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
     found(id == XUID, out)
 }
-extern "system" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HRESULT {
+extern "win64" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HRESULT {
     put(out, false)
 }
 /// 0: signed in.
-extern "system" fn get_state(_: This, _: Handle, out: *mut u32) -> HRESULT {
+extern "win64" fn get_state(_: This, _: Handle, out: *mut u32) -> HRESULT {
     put(out, 0)
 }
 /// The user's gamertag as the component asked for (`XUserGamertagComponent`):
 /// it has no suffix, so the modern suffix is empty and every other component
 /// (classic, modern, unique modern) is the name itself.
-extern "system" fn get_gamertag(
+extern "win64" fn get_gamertag(
     _: This,
     _: Handle,
     component: u32,
@@ -173,7 +173,7 @@ extern "system" fn get_gamertag(
     put_string(text, size, buffer, used)
 }
 /// Granted; deny reason 0 (none).
-extern "system" fn check_privilege(
+extern "win64" fn check_privilege(
     _: This,
     _: Handle,
     _options: u32,
@@ -189,7 +189,7 @@ extern "system" fn check_privilege(
 }
 
 /// 3: adult.
-extern "system" fn get_age_group(_: This, _: Handle, out: *mut u32) -> HRESULT {
+extern "win64" fn get_age_group(_: This, _: Handle, out: *mut u32) -> HRESULT {
     put(out, 3)
 }
 
@@ -197,7 +197,7 @@ static RESOLVE: u8 = 0;
 static TOKEN: u8 = 0;
 
 /// Every privilege is granted, so there is nothing to resolve.
-extern "system" fn resolve_privilege_async(
+extern "win64" fn resolve_privilege_async(
     _: This,
     _: Handle,
     _options: u32,
@@ -206,7 +206,7 @@ extern "system" fn resolve_privilege_async(
 ) -> HRESULT {
     xasync::finished(block, (&raw const RESOLVE).cast(), S_OK)
 }
-extern "system" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const RESOLVE).cast(), 0, none, none.cast())
 }
@@ -215,7 +215,7 @@ extern "system" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> 
 pub const FAILED_TO_GET_TOKEN: HRESULT = 0x8924_5111_u32 as i32;
 
 #[allow(clippy::too_many_arguments)]
-extern "system" fn token_async(
+extern "win64" fn token_async(
     _: This,
     _: Handle,
     _options: u32,
@@ -233,10 +233,10 @@ extern "system" fn token_async(
     );
     xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN)
 }
-extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
+extern "win64" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     xasync::XAsyncGetResultSize(block, out)
 }
-extern "system" fn token_result(
+extern "win64" fn token_result(
     _: This,
     block: *mut AsyncBlock,
     size: usize,
@@ -249,7 +249,7 @@ extern "system" fn token_result(
 
 /// The user never changes and no device is ever associated, so these
 /// callbacks are never called.
-extern "system" fn register(
+extern "win64" fn register(
     _: This,
     _queue: *const c_void,
     _context: *mut c_void,
@@ -258,12 +258,12 @@ extern "system" fn register(
 ) -> HRESULT {
     put(out, token())
 }
-extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
+extern "win64" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true
 }
 
 /// No input device belongs to a user.
-extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Handle) -> HRESULT {
+extern "win64" fn find_for_device(_: This, _device: *const c_void, _: *mut Handle) -> HRESULT {
     USER_NOT_FOUND
 }
 
@@ -331,8 +331,7 @@ mod tests {
 
     #[test]
     fn a_gamertag_without_a_suffix_has_an_empty_modern_suffix() {
-        type Gamertag =
-            extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
+        type Gamertag = extern "win64" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
         let this: This = &OBJECT;
         let user = std::ptr::null();
         // Classic, modern, modern suffix, unique modern; through both slots.
@@ -350,11 +349,10 @@ mod tests {
 
     #[test]
     fn startup_adds_the_user_and_reads_its_id() {
-        type Add = extern "system" fn(This, u32, *mut AsyncBlock) -> HRESULT;
-        type AddResult = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
-        type GetId = extern "system" fn(This, Handle, *mut u64) -> HRESULT;
-        type Gamertag =
-            extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
+        type Add = extern "win64" fn(This, u32, *mut AsyncBlock) -> HRESULT;
+        type AddResult = extern "win64" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type GetId = extern "win64" fn(This, Handle, *mut u64) -> HRESULT;
+        type Gamertag = extern "win64" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
         let this: This = &OBJECT;
         let mut block = AsyncBlock {
             queue: std::ptr::null(),
@@ -384,11 +382,11 @@ mod tests {
             E_NOT_SUFFICIENT_BUFFER
         );
 
-        type Age = extern "system" fn(This, Handle, *mut u32) -> HRESULT;
+        type Age = extern "win64" fn(This, Handle, *mut u32) -> HRESULT;
         let mut age = 0;
         assert_eq!(slot::<Age>(&OBJECT, 0x98)(this, handle, &mut age), S_OK);
         assert_eq!(age, 3, "adult");
-        type Token = extern "system" fn(
+        type Token = extern "win64" fn(
             This,
             Handle,
             u32,

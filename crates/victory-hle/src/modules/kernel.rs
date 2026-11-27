@@ -13,7 +13,7 @@ use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
 /// title images and our console modules are found by name.
-pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
+pub extern "win64" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
@@ -21,11 +21,75 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
 }
 
 /// See [`GetModuleHandleW`].
-pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
+pub extern "win64" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
     find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+}
+
+/// Off Windows, where the host has none: the module `name` names (as
+/// [`GetModuleHandleW`]), or with `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`
+/// the image holding the address `name` is. Reference counts are not kept:
+/// title images stay loaded.
+#[cfg(not(windows))]
+pub extern "win64" fn GetModuleHandleExW(
+    flags: u32,
+    name: *const u16,
+    out: *mut *mut c_void,
+) -> i32 {
+    module_handle_ex(flags, name.cast(), out, || GetModuleHandleW(name))
+}
+
+/// See [`GetModuleHandleExW`].
+#[cfg(not(windows))]
+pub extern "win64" fn GetModuleHandleExA(
+    flags: u32,
+    name: *const u8,
+    out: *mut *mut c_void,
+) -> i32 {
+    module_handle_ex(flags, name.cast(), out, || GetModuleHandleA(name))
+}
+
+/// `GetModuleHandleEx`'s body; `by_name` looks the name up.
+#[cfg(not(windows))]
+fn module_handle_ex(
+    flags: u32,
+    name: *const c_void,
+    out: *mut *mut c_void,
+    by_name: impl FnOnce() -> *mut c_void,
+) -> i32 {
+    use crate::modules::win32::handles::{ERROR_INVALID_PARAMETER, set_last_error};
+    const PIN: u32 = 1;
+    const UNCHANGED_REFCOUNT: u32 = 2;
+    const FROM_ADDRESS: u32 = 4;
+    if out.is_null() || flags & (PIN | UNCHANGED_REFCOUNT) == PIN | UNCHANGED_REFCOUNT {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let module = if flags & FROM_ADDRESS != 0 {
+        // A title image holding the address, else the pseudo module of one
+        // of our exports (a title passing `&GetProcAddress` to find
+        // kernel32).
+        victory_loader::images::find(name as usize)
+            .map(|image| image.base as *mut c_void)
+            .or_else(|| {
+                registry()
+                    .iter()
+                    .find(|m| m.exports.iter().any(|e| e.address == name as usize))
+                    .map(handle)
+            })
+            .unwrap_or(std::ptr::null_mut())
+    } else {
+        by_name()
+    };
+    // SAFETY: checked non-null; the title's output.
+    unsafe { out.write(module) };
+    if module.is_null() {
+        set_last_error(ERROR_MOD_NOT_FOUND);
+        return 0;
+    }
+    1
 }
 
 /// A NUL-terminated string from the title.
@@ -47,7 +111,7 @@ fn wide(text: *const u16) -> String {
 
 /// A title image's path is its original file, not our cache copy;
 /// `NULL` means the title's exe.
-pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
+pub extern "win64" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_w(module, out, size);
     };
@@ -56,7 +120,7 @@ pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, si
 }
 
 /// See [`GetModuleFileNameW`].
-pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
+pub extern "win64" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
@@ -106,7 +170,7 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 /// Console-only DLLs we implement load as a pseudo handle (titles load
 /// `xgameruntime.dll` this way), the title's DLLs as the images we map
 /// (on first use if nothing imports them); anything else loads on the host.
-pub extern "system" fn LoadLibraryExA(
+pub extern "win64" fn LoadLibraryExA(
     name: *const u8,
     file: *mut c_void,
     flags: u32,
@@ -120,7 +184,7 @@ pub extern "system" fn LoadLibraryExA(
 }
 
 /// See [`LoadLibraryExA`].
-pub extern "system" fn LoadLibraryExW(
+pub extern "win64" fn LoadLibraryExW(
     name: *const u16,
     file: *mut c_void,
     flags: u32,
@@ -140,17 +204,17 @@ fn runs_code(flags: u32) -> bool {
     flags & (0x1 | 0x2 | 0x20 | 0x40) == 0
 }
 
-pub extern "system" fn LoadLibraryA(name: *const u8) -> *mut c_void {
+pub extern "win64" fn LoadLibraryA(name: *const u8) -> *mut c_void {
     LoadLibraryExA(name, std::ptr::null_mut(), 0)
 }
 
-pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
+pub extern "win64" fn LoadLibraryW(name: *const u16) -> *mut c_void {
     LoadLibraryExW(name, std::ptr::null_mut(), 0)
 }
 
 /// Looks up our implementations behind a pseudo handle; real modules go to
 /// the host.
-pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
+pub extern "win64" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
     // `NULL` is the process's exe, which for the title is its own image.
     let module = if module.is_null() {
         runtime::main_image().unwrap_or(0) as *mut c_void
@@ -158,6 +222,11 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+        // A title image we mapped: no host loader knows its exports.
+        #[cfg(not(windows))]
+        if runtime::image_path(module as usize).is_some() {
+            return title_export(module, name);
+        }
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
@@ -171,10 +240,40 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
     let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-    match m.exports.iter().find(|e| e.name == name) {
+    // A DLL may be served by several modules (kernel32 by this one and by
+    // `win32`): the handle is the first's, the export may be any's.
+    let shared = |other: &&HleModule| other.dlls.iter().any(|d| m.dlls.contains(d));
+    let export = registry()
+        .iter()
+        .filter(shared)
+        .flat_map(|other| other.exports.iter())
+        .find(|e| e.name == name);
+    match export {
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The export `name` of the title image `module` (`runtime::export_of`);
+/// null for one it lacks and for an ordinal (we look exports up by name).
+#[cfg(not(windows))]
+fn title_export(module: *mut c_void, name: *const u8) -> *mut c_void {
+    if (name as usize) < 0x1_0000 {
+        tracing::warn!(
+            module = module as usize,
+            ordinal = name as usize,
+            "GetProcAddress by ordinal"
+        );
+        return std::ptr::null_mut();
+    }
+    let name = narrow(name);
+    match runtime::export_of(module as usize, &name) {
+        Some(address) => address as *mut c_void,
+        None => {
+            tracing::warn!(module = module as usize, %name, "GetProcAddress: no such export");
             std::ptr::null_mut()
         }
     }
@@ -201,7 +300,7 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
 
 /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`
 /// took no reference on them, so the host's count must not drop.
-pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
+pub extern "win64" fn FreeLibrary(module: *mut c_void) -> i32 {
     if registry().iter().any(|m| handle(m) == module)
         || runtime::image_path(module as usize).is_some()
     {
@@ -212,12 +311,12 @@ pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
 
 /// Title images hear of thread starts and ends from us, not from the
 /// Windows loader (`victory_loader::disable_thread_calls`).
-pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
+pub extern "win64" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
     host::disable_thread_library_calls(module)
 }
 
 /// Title debug output goes to our log (no debugger needs to be attached).
-pub extern "system" fn OutputDebugStringA(text: *const u8) {
+pub extern "win64" fn OutputDebugStringA(text: *const u8) {
     if !text.is_null() {
         let text = narrow(text);
         host::note_title_output(text.trim());
@@ -226,7 +325,7 @@ pub extern "system" fn OutputDebugStringA(text: *const u8) {
 }
 
 /// See [`OutputDebugStringA`].
-pub extern "system" fn OutputDebugStringW(text: *const u16) {
+pub extern "win64" fn OutputDebugStringW(text: *const u16) {
     if !text.is_null() {
         let text = wide(text);
         host::note_title_output(text.trim());
@@ -236,26 +335,26 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 
 /// The CRT's `exit`, through which the title's entry point returns: logs
 /// the code and the caller, then exits on the host.
-pub extern "C" fn exit(code: i32) -> ! {
+pub extern "win64" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
     host::exit(code)
 }
 
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
-pub extern "C" fn abort() -> ! {
+pub extern "win64" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
     host::abort()
 }
 
 /// The CRT's `terminate` and the STL's invalid-argument exit: logged, then
 /// the host's `abort`.
-pub extern "C" fn terminate() -> ! {
+pub extern "win64" fn terminate() -> ! {
     tracing::error!(from = %host::callers(), "title calls terminate");
     host::abort()
 }
 
 /// See [`terminate`].
-pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
+pub extern "win64" fn _invalid_parameter_noinfo_noreturn() -> ! {
     tracing::error!(from = %host::callers(), "title passed an invalid parameter");
     host::abort()
 }
@@ -264,17 +363,18 @@ pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
 /// reports the crash first; the title still gets its own back.
 static TITLE_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
+pub extern "win64" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
     host::set_unhandled_exception_filter(report_unhandled);
     TITLE_FILTER.swap(filter, std::sync::atomic::Ordering::AcqRel)
 }
 
+/// The host calls it (Windows' unhandled-exception filter): its convention.
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     host::report_unhandled(info);
     match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         filter => {
-            type Filter = extern "system" fn(*const c_void) -> i32;
+            type Filter = extern "win64" fn(*const c_void) -> i32;
             // SAFETY: the title registered this filter.
             let filter: Filter = unsafe { std::mem::transmute(filter) };
             filter(info)
@@ -282,8 +382,19 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     }
 }
 
+/// Off Windows, where the host has none: logged like [`exit`], then the
+/// process ends with `code`. As on Windows, no `atexit` function runs
+/// (titles call this to skip their static destructors; `exit` runs them);
+/// the C streams are flushed, as the C runtime's detach does.
+#[cfg(not(windows))]
+pub extern "win64" fn ExitProcess(code: u32) -> ! {
+    tracing::warn!(code, from = %host::callers(), "title exits the process");
+    crate::modules::ucrt::stdio::_flushall();
+    std::process::exit(code as i32)
+}
+
 /// See [`exit`]; only the current process is logged.
-pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
+pub extern "win64" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
     }
@@ -325,7 +436,8 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
         return Some(base as *mut c_void);
     }
     // DLLs the host has too are real host modules, whatever `--strict` says.
-    let host_dll = HostPolicy::default().allows(&file);
+    // Off Windows there are no host modules: ours stand in for them.
+    let host_dll = cfg!(windows) && HostPolicy::default().allows(&file);
     if !host_dll && let Some(m) = registry().iter().find(|m| m.serves(&file)) {
         if load {
             tracing::info!(dll = file, "loaded as a pseudo module");
@@ -388,21 +500,36 @@ fn title_argv(program: &str, args: &[String]) -> TitleArgv {
 fn argv() -> &'static TitleArgv {
     static ARGV: std::sync::OnceLock<TitleArgv> = std::sync::OnceLock::new();
     ARGV.get_or_init(|| {
-        // The program's name stays what the host says (as it was before).
-        let program = std::env::args_os().next().unwrap_or_default();
+        let host = || {
+            std::env::args_os()
+                .next()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        // On Windows the program's name is the host's, as before; off it the
+        // title's own path (`G:\game.exe`, as `__wargv[0]` and `_pgmptr`
+        // give it), so that a title finding its folder from `argv[0]` finds
+        // a drive we mount.
+        #[cfg(windows)]
+        let program = host();
+        #[cfg(not(windows))]
+        let program = runtime::main_image()
+            .and_then(runtime::image_path)
+            .map_or_else(host, |p| p.to_string_lossy().into_owned());
         let args = runtime::title_args();
         tracing::info!(?args, "the title's arguments");
-        title_argv(&program.to_string_lossy(), args)
+        title_argv(&program, args)
     })
 }
 
 /// See [`TitleArgv`].
-pub extern "C" fn __p___argc() -> *mut i32 {
+pub extern "win64" fn __p___argc() -> *mut i32 {
     argv().count.get()
 }
 
 /// See [`TitleArgv`].
-pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
+pub extern "win64" fn __p___argv() -> *mut *mut *mut c_char {
     argv().list.get()
 }
 
@@ -426,12 +553,11 @@ fn title_priority(asked: i32) -> i32 {
 }
 
 /// [`title_priority`].
-pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+pub extern "win64" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
     let priority = if as_set { priority } else { title_priority(priority) };
-    // SAFETY: the title passes a thread handle.
-    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    host::set_thread_priority(thread, priority)
 }
 
 pub(crate) fn module() -> HleModule {
@@ -469,6 +595,12 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            #[cfg(not(windows))]
+            hle_export!(ExitProcess),
+            #[cfg(not(windows))]
+            hle_export!(GetModuleHandleExW),
+            #[cfg(not(windows))]
+            hle_export!(GetModuleHandleExA),
         ],
     }
 }
@@ -573,6 +705,11 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: the title passes a thread handle.
+        unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    }
+
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
         // SAFETY: our filter takes the exception pointers as an opaque pointer.
         unsafe {
@@ -657,6 +794,7 @@ mod host {
     }
 
     pub(super) fn exit(code: i32) -> ! {
+        crate::modules::ucrt::runtime::run_exit_hooks();
         std::process::exit(code)
     }
 
@@ -668,7 +806,13 @@ mod host {
         std::process::exit(code as i32)
     }
 
-    pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
+    pub(super) fn set_thread_priority(_: *mut c_void, _: i32) -> i32 {
+        0
+    }
+
+    pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
+        victory_loader::seh::set_unhandled_filter(Some(filter));
+    }
 
     pub(super) fn report_unhandled(_: *const c_void) {}
 
@@ -689,16 +833,19 @@ mod tests {
     fn no_title_thread_waits_for_idle_processors() {
         let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
         assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
-        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
-        std::thread::spawn(|| {
-            // SAFETY: plain calls on this thread.
-            let thread = unsafe { GetCurrentThread() };
-            assert_eq!(SetThreadPriority(thread, -15), 1);
-            // SAFETY: as above.
-            assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
-        })
-        .join()
-        .unwrap();
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+            std::thread::spawn(|| {
+                // SAFETY: plain calls on this thread.
+                let thread = unsafe { GetCurrentThread() };
+                assert_eq!(SetThreadPriority(thread, -15), 1);
+                // SAFETY: as above.
+                assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     #[test]
@@ -811,6 +958,36 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    /// By name, as `GetModuleHandleW`; the address form needs a mapped
+    /// image, which only the loader registers.
+    #[cfg(not(windows))]
+    #[test]
+    fn module_handles_by_name_off_windows() {
+        use crate::modules::win32::handles::last_error;
+        victory_loader::teb::attach_current_thread();
+        let base = 0x7400_0000_0000usize;
+        runtime::set_image_path(base, std::path::Path::new(r"C:\title\Extra.dll"));
+        let mut out = std::ptr::null_mut();
+        assert_eq!(GetModuleHandleExW(0, w("extra.dll").as_ptr(), &mut out), 1);
+        assert_eq!(out as usize, base);
+        assert_eq!(GetModuleHandleExA(2, c"EXTRA".as_ptr().cast(), &mut out), 1);
+        assert_eq!(out as usize, base);
+        assert_eq!(GetModuleHandleExW(4, 0x10 as *const u16, &mut out), 0);
+        assert_eq!(
+            (out, last_error()),
+            (std::ptr::null_mut(), ERROR_MOD_NOT_FOUND)
+        );
+        // One of our exports' addresses names its pseudo module.
+        let ours = GetProcAddress as *const () as *const u16;
+        assert_eq!(GetModuleHandleExW(4, ours, &mut out), 1);
+        assert_eq!(out, GetModuleHandleW(w("kernel32.dll").as_ptr()));
+        assert_eq!(
+            GetModuleHandleExW(0, w("extra.dll").as_ptr(), std::ptr::null_mut()),
+            0
+        );
+        assert_eq!(last_error(), 87);
     }
 
     /// No buffer: nothing written, the error says it was too small.

@@ -27,7 +27,14 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
-    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    // A path in the title's own form (`G:\game.exe`, which the runner records
+    // off Windows, where no host path would mean anything to a title) is
+    // kept as given: `absolute` would put the current directory in front.
+    let path = if is_windows_form(path) {
+        path.to_owned()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+    };
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
     paths.push((base, path));
@@ -52,8 +59,22 @@ pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths
         .iter()
-        .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
+        .find(|(_, p)| file_part(p).eq_ignore_ascii_case(file))
         .map(|(b, _)| *b)
+}
+
+/// Whether `path` is a Windows path with a drive (`X:...`).
+fn is_windows_form(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// The last component of a path, whichever separator it uses (a Windows
+/// path recorded on a Unix host is one component to `Path`).
+fn file_part(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.rsplit(['\\', '/']).next().unwrap_or(&text).to_owned()
 }
 
 static TITLE_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -82,6 +103,23 @@ pub fn set_title_dll_loader(loader: TitleDllLoader) {
 
 pub fn load_title_dll(file: &str) -> Result<Option<usize>, String> {
     TITLE_DLL_LOADER.get().map_or(Ok(None), |load| load(file))
+}
+
+/// Where the export `name` of the title image at `base` is, if it has one:
+/// `GetProcAddress` of a title image where no host loader mapped it.
+pub type ExportLookup = fn(usize, &str) -> Option<usize>;
+
+static EXPORT_LOOKUP: std::sync::OnceLock<ExportLookup> = std::sync::OnceLock::new();
+
+/// Set once by whoever mapped the title: an export of the image at `base` by name.
+pub fn set_export_lookup(lookup: ExportLookup) {
+    let _ = EXPORT_LOOKUP.set(lookup);
+}
+
+/// The export `name` of the title image at `base`; `None` without one, or
+/// before [`set_export_lookup`].
+pub fn export_of(base: usize, name: &str) -> Option<usize> {
+    EXPORT_LOOKUP.get().and_then(|f| f(base, name))
 }
 
 /// What the title's manifest (`MicrosoftGame.config` beside its executable)
@@ -292,6 +330,23 @@ fn ahead_of_other_programs() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title-form path is recorded as given and found by its file name,
+    /// whatever the host's separator.
+    #[test]
+    fn title_form_paths_are_kept_and_found_by_name() {
+        // (A name of its own: other tests record images too.)
+        let base = 0x7_1234_0000;
+        set_image_path(base, Path::new(r"G:\Sub\Title-Form.EXE"));
+        assert_eq!(
+            image_path(base),
+            Some(PathBuf::from(r"G:\Sub\Title-Form.EXE"))
+        );
+        assert_eq!(image_named("title-form.exe"), Some(base));
+        assert_eq!(image_named("sub"), None);
+        forget_image(base);
+        assert_eq!(image_named("title-form.exe"), None);
+    }
 
     #[test]
     fn a_quoted_angle_bracket_does_not_end_its_tag() {

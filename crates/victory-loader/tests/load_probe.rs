@@ -37,16 +37,16 @@ fn build_probe() -> PathBuf {
     target.join("debug").join("hle_probe.dll")
 }
 
-extern "system" fn fake_xgameruntime_initialize() -> i32 {
+extern "win64" fn fake_xgameruntime_initialize() -> i32 {
     0x1234
 }
 /// Asks for the current thread, as our logging does: on a thread std is
 /// still starting, that must not abort the process.
-extern "system" fn fake_get_tick_count() -> u32 {
+extern "win64" fn fake_get_tick_count() -> u32 {
     let _ = std::thread::current().id();
     777
 }
-extern "system" fn fake_delayed() -> u32 {
+extern "win64" fn fake_delayed() -> u32 {
     4242
 }
 
@@ -164,23 +164,23 @@ fn loads_binds_and_calls_probe() {
     // SAFETY: the exports have the signatures declared in the fixture and
     // every import they use has been bound.
     unsafe {
-        let f: extern "system" fn() -> i32 = std::mem::transmute(call("probe_xgameruntime_init"));
+        let f: extern "win64" fn() -> i32 = std::mem::transmute(call("probe_xgameruntime_init"));
         assert_eq!(f(), 0x1234, "console API must reach our implementation");
 
-        let f: extern "system" fn() -> u32 = std::mem::transmute(call("probe_tick"));
+        let f: extern "win64" fn() -> u32 = std::mem::transmute(call("probe_tick"));
         assert_eq!(f(), 777, "host API must be overridable");
 
-        let f: extern "system" fn() -> u32 = std::mem::transmute(call("probe_pid"));
+        let f: extern "win64" fn() -> u32 = std::mem::transmute(call("probe_pid"));
         assert_eq!(f(), std::process::id(), "host API must pass through");
 
-        let f: extern "system" fn() -> u32 = std::mem::transmute(call("probe_title"));
+        let f: extern "win64" fn() -> u32 = std::mem::transmute(call("probe_title"));
         assert_ne!(f(), 0, "title DLL export must be bound");
 
-        let f: extern "system" fn() -> u32 = std::mem::transmute(call("probe_delayed"));
+        let f: extern "win64" fn() -> u32 = std::mem::transmute(call("probe_delayed"));
         assert_eq!(f(), 4242, "delay-loaded API must be bound");
 
         let before = unimplemented_call_count();
-        let f: extern "system" fn() -> u64 = std::mem::transmute(call("probe_missing"));
+        let f: extern "win64" fn() -> u64 = std::mem::transmute(call("probe_missing"));
         assert_eq!(f(), 0);
         assert_eq!(unimplemented_call_count(), before + 1);
 
@@ -194,7 +194,7 @@ fn loads_binds_and_calls_probe() {
                 .is_some_and(|t| !t.callback_rvas.is_empty())
         );
         image.attach().unwrap();
-        let f: extern "system" fn() -> u64 = std::mem::transmute(call("probe_thread_starts"));
+        let f: extern "win64" fn() -> u64 = std::mem::transmute(call("probe_thread_starts"));
         let before = f();
         // A thread std starts, as our runtime's workers are: notified
         // before std sets it up, which must still find its state pristine.
@@ -208,6 +208,8 @@ fn loads_binds_and_calls_probe() {
         let before = mid;
         // Starting in title code, as a title's threads do; the extra
         // argument is ignored.
+        // Windows starts it (`CreateThread`): the host's convention, which
+        // on x64 Windows is the title's.
         let start: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
             std::mem::transmute(call("probe_pid"));
         let thread = CreateThread(
@@ -238,7 +240,7 @@ fn loads_binds_and_calls_probe() {
         assert_eq!(victory_loader::disable_thread_calls(1), None);
 
         // `FreeLibrary`'s notice, as a failed late load sends it.
-        let f: extern "system" fn() -> u32 = std::mem::transmute(call("probe_detaches"));
+        let f: extern "win64" fn() -> u32 = std::mem::transmute(call("probe_detaches"));
         assert_eq!(f(), 0);
         image.detach();
         assert_eq!(f(), 1);

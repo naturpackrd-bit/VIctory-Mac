@@ -106,6 +106,9 @@ You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
+A port to macOS on Apple silicon is under way and does not run the title yet:
+[docs/macos.md](docs/macos.md).
+
 ```powershell
 git clone https://github.com/avatarmanz/VIctory-7900XTX
 cd VIctory-7900XTX

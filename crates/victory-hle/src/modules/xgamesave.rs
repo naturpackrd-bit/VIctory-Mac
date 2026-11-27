@@ -186,9 +186,11 @@ fn version_number(file: &str) -> Option<u64> {
     (n > 0 && format!("v{n}") == file).then_some(n)
 }
 
-/// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
-fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
+/// The names in version folder `dir`: container, display, blobs, and
+/// whether every blob it lists is there; `None` if its manifest is missing
+/// or does not parse. Any other error is the disk's (a file held by another
+/// process, say), not the save's, and is returned.
+fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>, bool)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -199,13 +201,25 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     };
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
-    Ok(Some((name, display, blobs)))
+    // A missing blob is damage too: taking this version would remove the
+    // older intact ones, and the blob would read as empty ([`current`]).
+    let mut intact = true;
+    for i in 0..blobs.len() {
+        match std::fs::metadata(dir.join(i.to_string())) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => intact = false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => intact = false,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some((name, display, blobs, intact)))
 }
 
 /// The container's newest readable committed version, if any. Removes what
 /// a crash left: unfinished versions, and versions older than that one.
-/// An unreadable newer folder (a stray, or a broken manifest) is neither
-/// taken nor removed, and never costs the version below it.
+/// An unreadable newer folder (a stray, a broken manifest, or a blob gone
+/// missing) is neither taken nor removed, and never costs the version below
+/// it.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     let mut highest = 0;
@@ -225,11 +239,25 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     if committed.is_empty() {
         return Ok(None);
     }
+    // The newest version with a blob gone: the save only if no older one is
+    // intact (that blob then reads as missing; refusing the version would
+    // lose every other blob). Never removed for that.
+    let mut damaged = None;
     for (at, &number) in committed.iter().enumerate() {
         let version = dir.join(format!("v{number}"));
-        let Some((name, display, blobs)) = load(&version)? else {
+        let Some((name, display, blobs, intact)) = load(&version)? else {
             continue;
         };
+        if !intact {
+            damaged.get_or_insert(Version {
+                dir: version,
+                highest,
+                name,
+                display,
+                blobs,
+            });
+            continue;
+        }
         for old in &committed[at + 1..] {
             std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
         }
@@ -240,6 +268,9 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             display,
             blobs,
         }));
+    }
+    if damaged.is_some() {
+        return Ok(damaged);
     }
     // Versions exist but none reads: keep them all, and refuse.
     Err(std::io::Error::new(
@@ -547,15 +578,28 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
     let version = current_named(&c.dir, &c.name)
         .map_err(|e| io_error(&c.dir, &e))?
         .ok_or(BLOB_NOT_FOUND)?;
+    let all = names.is_none();
     let names = names.unwrap_or_else(|| version.blobs.clone());
-    names
+    // A blob whose file is gone (a version taken with it missing,
+    // [`current`]) is not there: left out of a read of all blobs, not found
+    // when asked for by name.
+    let read: Result<Vec<_>, HRESULT> = names
         .into_iter()
         .map(|name| {
-            let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
-            let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
-            Ok((name, data))
+            let i = version
+                .blobs
+                .iter()
+                .position(|b| *b == name)
+                .ok_or(BLOB_NOT_FOUND)?;
+            match std::fs::read(version.blob(i)) {
+                Ok(data) => Ok(Some((name, data))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && all => Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BLOB_NOT_FOUND),
+                Err(e) => Err(io_error(&c.dir, &e)),
+            }
         })
-        .collect()
+        .collect();
+    Ok(read?.into_iter().flatten().collect())
 }
 
 /// One blob as the public API lays it out: name, size, data.
@@ -590,8 +634,8 @@ fn names(names: *const *const c_char, count: u32) -> Option<Vec<String>> {
 }
 
 type This = *const Object;
-type ContainerCallback = extern "system" fn(*const ContainerInfo, *mut c_void) -> bool;
-type BlobCallback = extern "system" fn(*const BlobInfo, *mut c_void) -> bool;
+type ContainerCallback = extern "win64" fn(*const ContainerInfo, *mut c_void) -> bool;
+type BlobCallback = extern "win64" fn(*const BlobInfo, *mut c_void) -> bool;
 
 #[repr(C)]
 pub struct ContainerInfo {
@@ -655,7 +699,7 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
-extern "system" fn initialize_async(
+extern "win64" fn initialize_async(
     _: This,
     _user: *const c_void,
     config: *const c_char,
@@ -670,18 +714,18 @@ extern "system" fn initialize_async(
     };
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
-extern "system" fn initialize_result(
+extern "win64" fn initialize_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
     xasync::result(block, (&raw const INIT).cast(), out)
 }
-extern "system" fn close_provider(_: This, provider: *mut Provider) {
+extern "win64" fn close_provider(_: This, provider: *mut Provider) {
     take(provider);
 }
 
-extern "system" fn quota_async(
+extern "win64" fn quota_async(
     _: This,
     provider: *const Provider,
     block: *mut AsyncBlock,
@@ -691,11 +735,11 @@ extern "system" fn quota_async(
         .map(|p| xasync::bytes(p.remaining() as i64));
     xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
 }
-extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
+extern "win64" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
-extern "system" fn delete_async(
+extern "win64" fn delete_async(
     _: This,
     provider: *const Provider,
     name: *const c_char,
@@ -708,14 +752,14 @@ extern "system" fn delete_async(
     };
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
-extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast())
 }
 
 /// Reports the container if it exists; a missing one is no error, the
 /// callback just does not run.
-extern "system" fn container_info(
+extern "win64" fn container_info(
     _: This,
     provider: *const Provider,
     name: *const c_char,
@@ -732,7 +776,7 @@ extern "system" fn container_info(
     S_OK
 }
 
-extern "system" fn enumerate_containers(
+extern "win64" fn enumerate_containers(
     _: This,
     provider: *const Provider,
     context: *mut c_void,
@@ -746,7 +790,7 @@ extern "system" fn enumerate_containers(
 }
 
 /// The container exists once an update to it is submitted.
-extern "system" fn create_container(
+extern "win64" fn create_container(
     _: This,
     provider: *const Provider,
     name: *const c_char,
@@ -760,11 +804,11 @@ extern "system" fn create_container(
     }
     put(out, give(p.container(&name)))
 }
-extern "system" fn close_container(_: This, container: *mut Container) {
+extern "win64" fn close_container(_: This, container: *mut Container) {
     take(container);
 }
 
-extern "system" fn enumerate_blobs(
+extern "win64" fn enumerate_blobs(
     _: This,
     container: *const Container,
     prefix: *const c_char,
@@ -793,7 +837,7 @@ extern "system" fn enumerate_blobs(
     S_OK
 }
 
-extern "system" fn read_blobs(
+extern "win64" fn read_blobs(
     _: This,
     container: *const Container,
     blob_names: *const *const c_char,
@@ -821,7 +865,7 @@ extern "system" fn read_blobs(
 
 /// Read at once; the result holds the layout with pointers relative to the
 /// title's buffer, fixed up when the title takes it.
-extern "system" fn read_async(
+extern "win64" fn read_async(
     _: This,
     container: *const Container,
     blob_names: *const *const c_char,
@@ -834,7 +878,7 @@ extern "system" fn read_async(
     };
     xasync::finished_with(block, (&raw const READ).cast(), result)
 }
-extern "system" fn read_result(
+extern "win64" fn read_result(
     _: This,
     block: *mut AsyncBlock,
     size: usize,
@@ -870,7 +914,7 @@ extern "system" fn read_result(
     put(count, blobs as u32)
 }
 
-extern "system" fn create_update(
+extern "win64" fn create_update(
     _: This,
     container: *const Container,
     display: *const c_char,
@@ -889,11 +933,11 @@ extern "system" fn create_update(
         }),
     )
 }
-extern "system" fn close_update(_: This, update: *mut Update) {
+extern "win64" fn close_update(_: This, update: *mut Update) {
     take(update);
 }
 
-extern "system" fn write_blob(
+extern "win64" fn write_blob(
     _: This,
     update: *mut Update,
     name: *const c_char,
@@ -920,7 +964,7 @@ extern "system" fn write_blob(
     S_OK
 }
 
-extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
+extern "win64" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
         (Some(update), Some(name)) if !name.is_empty() => {
@@ -931,11 +975,11 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
-extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
-extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const SUBMIT).cast(), 0, none, none.cast())
 }
@@ -1245,12 +1289,8 @@ mod tests {
 
         // Write two blobs through an update.
         let mut container = std::ptr::null_mut();
-        type Create = extern "system" fn(
-            This,
-            *const Provider,
-            *const c_char,
-            *mut *mut Container,
-        ) -> HRESULT;
+        type Create =
+            extern "win64" fn(This, *const Provider, *const c_char, *mut *mut Container) -> HRESULT;
         let create = method::<Create>(&OBJECT, 0x80);
         assert_eq!(
             create(this, provider, c"bad name".as_ptr(), &mut container),
@@ -1262,13 +1302,13 @@ mod tests {
         );
         let mut update = std::ptr::null_mut();
         type Update_ =
-            extern "system" fn(This, *const Container, *const c_char, *mut *mut Update) -> HRESULT;
+            extern "win64" fn(This, *const Container, *const c_char, *mut *mut Update) -> HRESULT;
         assert_eq!(
             method::<Update_>(&OBJECT, 0xb8)(this, container, c"Chapter 1".as_ptr(), &mut update),
             S_OK
         );
         type Write =
-            extern "system" fn(This, *mut Update, *const c_char, *const u8, usize) -> HRESULT;
+            extern "win64" fn(This, *mut Update, *const c_char, *const u8, usize) -> HRESULT;
         let write = method::<Write>(&OBJECT, 0xc8);
         assert_eq!(
             write(this, update, c"world".as_ptr(), b"hello".as_ptr(), 5),
@@ -1282,9 +1322,9 @@ mod tests {
             write(this, update, c"gone".as_ptr(), b"z".as_ptr(), 1),
             S_OK
         );
-        type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
+        type Delete = extern "win64" fn(This, *mut Update, *const c_char) -> HRESULT;
         assert_eq!(method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()), S_OK);
-        type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
+        type Submit = extern "win64" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
         assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
@@ -1294,7 +1334,7 @@ mod tests {
 
         // A new provider sees the container and reads both blobs back.
         let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
-        extern "system" fn seen(info: *const ContainerInfo, context: *mut c_void) -> bool {
+        extern "win64" fn seen(info: *const ContainerInfo, context: *mut c_void) -> bool {
             // SAFETY: valid during the callback; the context is the test's vector.
             let (info, out) = unsafe {
                 (
@@ -1367,7 +1407,7 @@ mod tests {
         let mut one = 1;
         let mut small = [0u8; 8];
         let read_now = method::<
-            extern "system" fn(
+            extern "win64" fn(
                 This,
                 *const Container,
                 *const *const c_char,
@@ -1488,5 +1528,61 @@ mod tests {
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
         assert!(!slot.join("v2").exists());
+    }
+
+    /// A newer version whose manifest reads but lists a blob that is gone
+    /// is damaged: the older intact version is the save and is kept, and
+    /// the damaged one is not removed.
+    #[test]
+    fn only_damaged_versions_are_refused_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let slot = container_dir(root, "Slot");
+        // v2 as a crash could leave it: a newer blob a, and blob b deleted.
+        let (v1, v2) = (slot.join("v1"), slot.join("v2"));
+        std::fs::create_dir(&v2).unwrap();
+        for entry in std::fs::read_dir(&v1).unwrap().flatten() {
+            std::fs::copy(entry.path(), v2.join(entry.file_name())).unwrap();
+        }
+        std::fs::write(v2.join("0"), b"new a").unwrap();
+        std::fs::remove_file(v2.join("1")).unwrap();
+
+        let c = Provider { root: root.into() }.container("Slot");
+        let chosen = current_named(&c.dir, "Slot")
+            .unwrap()
+            .expect("the older version");
+        assert_eq!(chosen.dir, v1);
+        assert_eq!(state(root), old_state());
+        assert!(v1.is_dir() && v2.is_dir());
+    }
+
+    /// The only version, its manifest readable but a blob gone (an antivirus
+    /// or a sync client took the file): with no older intact version to go
+    /// back to, it is still the save. Refusing it would lose every blob for
+    /// the one that is gone.
+    #[test]
+    fn a_lone_version_with_a_blob_gone_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        let slot = container_dir(root, "Slot");
+        std::fs::remove_file(slot.join("v1").join("1")).unwrap();
+
+        let c = Provider { root: root.into() }.container("Slot");
+        assert!(read(&c, None).is_ok(), "the save reads");
+        assert_eq!(
+            update(root, "two", &[("b", Some("new b"))]),
+            S_OK,
+            "the save updates"
+        );
+        let blobs = vec![("a".into(), "old a".into()), ("b".into(), "new b".into())];
+        assert_eq!(state(root), Some(("two".into(), blobs)));
     }
 }

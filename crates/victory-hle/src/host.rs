@@ -14,6 +14,17 @@ pub struct HostPolicy {
     pub allow: Vec<String>,
 }
 
+/// Off Windows no host DLL serves anything, so none is allowed: a DLL the
+/// host would serve on Windows is looked for in the title's folder, and
+/// named missing when it is not there.
+#[cfg(not(windows))]
+impl Default for HostPolicy {
+    fn default() -> Self {
+        HostPolicy::none()
+    }
+}
+
+#[cfg(windows)]
 impl Default for HostPolicy {
     fn default() -> Self {
         let allow = [
@@ -100,12 +111,20 @@ impl HostPolicy {
 
 /// The host's own `name` from the System32 DLL `dll`: what a title import
 /// of it is bound to when we do not override it.
+#[cfg(windows)]
 pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
     let name = ImportSymbol::Name {
         hint: 0,
         name: name.into(),
     };
     imp::resolve(dll, &name)
+}
+
+/// Off Windows no host DLL serves anything, so a host function is never
+/// there.
+#[cfg(not(windows))]
+pub(crate) fn function(_dll: &str, _name: &str) -> Option<usize> {
+    None
 }
 
 #[cfg(windows)]
@@ -177,7 +196,7 @@ mod imp {
         static STARTED: AtomicBool = AtomicBool::new(false);
 
         /// Runs as title TLS callbacks do: under the loader lock, as a new
-        /// thread starts.
+        /// thread starts. The host's loader calls it: its convention.
         #[used]
         #[unsafe(link_section = ".CRT$XLY")]
         static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = attach;
@@ -193,6 +212,7 @@ mod imp {
             }
         }
 
+        // Started by the host (`CreateThread`): its convention.
         unsafe extern "system" fn idle(_: *mut c_void) -> u32 {
             0
         }

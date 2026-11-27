@@ -39,7 +39,8 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # Includes xtask's repository_passes_policy, the asset-policy check.
-      - run: cargo test --workspace --locked
+      # --no-fail-fast: every crate's tests run and report, past a failure.
+      - run: cargo test --workspace --locked --no-fail-fast
 
   test-diagnostics:
     name: Diagnostics tests
@@ -49,18 +50,89 @@ jobs:
       - uses: actions/checkout@v5
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features --locked -- --test-threads=1
+      - run: cargo test --workspace --all-features --locked --no-fail-fast -- --test-threads=1
+
+  # macOS (docs/macos.md): the runtime is built for x86-64 and runs under
+  # Rosetta 2, the tools natively for Apple silicon; both are checked, tested
+  # and run here. `macos-latest` is an Apple silicon runner.
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # The version, components and targets pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # The x86-64 tests and binary run under Rosetta 2.
+      - name: Rosetta 2
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Clippy, Apple silicon
+        run: |
+          cargo clippy --workspace --all-targets --locked --target aarch64-apple-darwin -- -D warnings
+          cargo clippy --workspace --all-targets --all-features --locked --target aarch64-apple-darwin -- -D warnings
+      - name: Clippy, x86-64
+        run: |
+          cargo clippy --workspace --all-targets --locked --target x86_64-apple-darwin -- -D warnings
+          cargo clippy --workspace --all-targets --all-features --locked --target x86_64-apple-darwin -- -D warnings
+      - name: Tests, Apple silicon
+        run: cargo test --workspace --locked --no-fail-fast --target aarch64-apple-darwin
+      - name: Tests, x86-64 under Rosetta 2
+        run: cargo test --workspace --locked --no-fail-fast --target x86_64-apple-darwin
+      # The binaries start, find the macOS default folders, and refuse to
+      # run a title with the message that says why: the tools build (Apple
+      # silicon) points to the runtime build, which is not ported yet.
+      - name: Run victory, both
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            bin=target/$target/debug/victory
+            cargo build --locked -p victory --target $target
+            file $bin
+            $bin --version
+            $bin config | tee config.txt
+            grep -F "$HOME/Library/Caches/victory" config.txt
+            grep -F "$HOME/Library/Application Support/victory" config.txt
+            grep -E '^memory +: [0-9.]+ GiB, [0-9.]+ GiB available, [0-9]+ processors' config.txt \
+              | tee memory-$target.txt
+            if $bin run nothing.exe 2> run.txt; then exit 1; fi
+            cat run.txt
+            case $target in
+              aarch64-*) grep -F "built for x86-64" run.txt ;;
+              *) grep -F "nothing.exe" run.txt ;;
+            esac
+          done
+          # Both builds see the same machine: the available memory they
+          # report agrees within 2x (the kernel's page size, not Rosetta 2's
+          # 4 KiB, is the unit the kernel counts pages in), and is not tiny.
+          native=$(awk '{ print $5 }' memory-aarch64-apple-darwin.txt)
+          rosetta=$(awk '{ print $5 }' memory-x86_64-apple-darwin.txt)
+          awk -v a="$native" -v b="$rosetta" 'BEGIN {
+            if (a > 2 * b || b > 2 * a || b < 0.5) {
+              print "available memory disagrees: native " a " GiB, Rosetta " b " GiB"; exit 1
+            }
+          }'
+      # The x86-64 runtime keeps the low 4 GiB for titles: a one-page
+      # __PAGEZERO, AVX2 seen through Rosetta 2's variable, low memory free.
+      - name: Low memory and AVX2 in the x86-64 build
+        run: |
+          bin=target/x86_64-apple-darwin/debug/victory
+          otool -l $bin | grep -A 3 __PAGEZERO | tee pagezero.txt
+          grep -E 'vmsize 0x0*1000$' pagezero.txt
+          $bin config | tee config2.txt
+          grep -E '^cpu +: avx2 yes' config2.txt
+          grep -E '^low memory +: [3-4]\.[0-9]+ GiB free below 4 GiB' config2.txt
 
   check:
-    needs: [clippy, test-default, test-diagnostics]
+    needs: [clippy, test-default, test-diagnostics, macos]
     if: always()
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - name: Require all three jobs to pass
+      - name: Require all four jobs to pass
         run: |
           if ('${{ needs.clippy.result }}' -ne 'success' -or
               '${{ needs.test-default.result }}' -ne 'success' -or
-              '${{ needs.test-diagnostics.result }}' -ne 'success') {
+              '${{ needs.test-diagnostics.result }}' -ne 'success' -or
+              '${{ needs.macos.result }}' -ne 'success') {
             exit 1
           }

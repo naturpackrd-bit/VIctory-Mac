@@ -58,7 +58,7 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
+extern "win64" fn title_id(_: This, out: *mut u32) -> HRESULT {
     put(out, runtime::title().id)
 }
 
@@ -68,7 +68,7 @@ extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
 /// arguments from its configuration. The new `victory run` gets the same
 /// options, the new executable, and the title's arguments after `--`
 /// (the title reads the whole command line).
-extern "system" fn launch_new_game(
+extern "win64" fn launch_new_game(
     _: This,
     exe: *const c_char,
     args: *const c_char,
@@ -165,12 +165,12 @@ const AVAILABLE: [u32; 20] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20,
 ];
 
-extern "system" fn is_feature_available(_: This, feature: u32) -> bool {
+extern "win64" fn is_feature_available(_: This, feature: u32) -> bool {
     AVAILABLE.contains(&feature)
 }
 
 /// Nothing raises these events offline, so the callback never runs.
-extern "system" fn register(
+extern "win64" fn register(
     _: This,
     _queue: *const c_void,
     _context: *mut c_void,
@@ -179,12 +179,12 @@ extern "system" fn register(
 ) -> HRESULT {
     put(out, token())
 }
-extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
+extern "win64" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true
 }
 
 /// Accepted and dropped; the name goes to the debug log.
-extern "system" fn write_event(
+extern "win64" fn write_event(
     _: This,
     _user: *const c_void,
     _service_config: *const c_char,
@@ -285,19 +285,14 @@ mod tests {
 
     #[test]
     fn served_areas_are_available_others_not() {
-        type Check = extern "system" fn(This, u32) -> bool;
+        type Check = extern "win64" fn(This, u32) -> bool;
         let check = method::<Check>(&FEATURES_OBJECT, 0x18);
         assert!(check(&FEATURES_OBJECT, 18), "users");
         assert!(!check(&FEATURES_OBJECT, 21), "game streaming");
 
-        type Register = extern "system" fn(
-            This,
-            *const c_void,
-            *mut c_void,
-            *const c_void,
-            *mut u64,
-        ) -> HRESULT;
-        type Unregister = extern "system" fn(This, u64, bool) -> bool;
+        type Register =
+            extern "win64" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+        type Unregister = extern "win64" fn(This, u64, bool) -> bool;
         let null = std::ptr::null();
         let mut token = 0;
         let register = method::<Register>(&INVITES_OBJECT, 0x18);

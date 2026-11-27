@@ -643,6 +643,7 @@ dependencies = [
  "victory-hle",
  "victory-loader",
  "victory-pe",
+ "victory-platform",
  "victory-shader",
  "walkdir",
 ]
@@ -657,6 +658,7 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing-subscriber",
+ "victory-platform",
 ]
 
 [[package]]
@@ -682,6 +684,7 @@ dependencies = [
  "victory-core",
  "victory-formats",
  "victory-pipeline",
+ "victory-platform",
  "victory-shader",
  "windows",
  "windows-sys",
@@ -692,6 +695,7 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "opus-pure",
  "tempfile",
  "tracing",
@@ -699,6 +703,7 @@ dependencies = [
  "victory-gpu",
  "victory-loader",
  "victory-pe",
+ "victory-platform",
  "windows",
  "windows-core",
  "windows-sys",
@@ -716,6 +721,7 @@ dependencies = [
  "tracing",
  "victory-core",
  "victory-pe",
+ "victory-platform",
  "windows-sys",
 ]
 
@@ -736,6 +742,14 @@ dependencies = [
  "tempfile",
  "tracing",
  "victory-core",
+]
+
+[[package]]
+name = "victory-platform"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys",
 ]
 
 [[package]]

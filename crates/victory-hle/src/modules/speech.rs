@@ -45,26 +45,26 @@ static STREAM: u8 = 0;
 type This = *const Object;
 
 /// No voice is installed, so the callback never runs.
-extern "system" fn enumerate_voices(
+extern "win64" fn enumerate_voices(
     _: This,
     _context: *mut c_void,
     _callback: *const c_void,
 ) -> HRESULT {
     S_OK
 }
-extern "system" fn create(_: This, out: *mut *const u8) -> HRESULT {
+extern "win64" fn create(_: This, out: *mut *const u8) -> HRESULT {
     put(out, &raw const SYNTHESIZER)
 }
-extern "system" fn close(_: This, _: *const u8) -> HRESULT {
+extern "win64" fn close(_: This, _: *const u8) -> HRESULT {
     S_OK
 }
-extern "system" fn set_default_voice(_: This, _: *const u8) -> HRESULT {
+extern "win64" fn set_default_voice(_: This, _: *const u8) -> HRESULT {
     S_OK
 }
-extern "system" fn set_custom_voice(_: This, _: *const u8, _voice: *const c_char) -> HRESULT {
+extern "win64" fn set_custom_voice(_: This, _: *const u8, _voice: *const c_char) -> HRESULT {
     S_OK
 }
-extern "system" fn create_stream(
+extern "win64" fn create_stream(
     _: This,
     _: *const u8,
     words: *const c_char,
@@ -73,10 +73,10 @@ extern "system" fn create_stream(
     tracing::debug!(text = text(words).unwrap_or_default(), "speech (silent)");
     put(out, &raw const STREAM)
 }
-extern "system" fn stream_size(_: This, _: *const u8, out: *mut usize) -> HRESULT {
+extern "win64" fn stream_size(_: This, _: *const u8, out: *mut usize) -> HRESULT {
     put(out, SILENCE.len())
 }
-extern "system" fn stream_data(
+extern "win64" fn stream_data(
     _: This,
     _: *const u8,
     size: usize,
@@ -128,10 +128,10 @@ mod tests {
     #[test]
     fn streams_are_empty_wave_files() {
         let this: This = &OBJECT;
-        type Create = extern "system" fn(This, *mut *const u8) -> HRESULT;
-        type Stream = extern "system" fn(This, *const u8, *const c_char, *mut *const u8) -> HRESULT;
-        type Size = extern "system" fn(This, *const u8, *mut usize) -> HRESULT;
-        type Data = extern "system" fn(This, *const u8, usize, *mut u8, *mut usize) -> HRESULT;
+        type Create = extern "win64" fn(This, *mut *const u8) -> HRESULT;
+        type Stream = extern "win64" fn(This, *const u8, *const c_char, *mut *const u8) -> HRESULT;
+        type Size = extern "win64" fn(This, *const u8, *mut usize) -> HRESULT;
+        type Data = extern "win64" fn(This, *const u8, usize, *mut u8, *mut usize) -> HRESULT;
         let (mut synth, mut stream, mut size) = (std::ptr::null(), std::ptr::null(), 0);
         assert_eq!(method::<Create>(&OBJECT, 0x48)(this, &mut synth), S_OK);
         let say = method::<Stream>(&OBJECT, 0x68);

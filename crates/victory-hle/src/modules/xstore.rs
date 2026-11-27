@@ -70,16 +70,16 @@ fn offline(block: *mut AsyncBlock, what: &str) -> HRESULT {
     xasync::finished(block, (&raw const FAILED).cast(), NETWORK_ERROR)
 }
 /// The result functions of calls that failed: their status.
-extern "system" fn status(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn status(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
 
-extern "system" fn create_context(_: This, _user: *const c_void, out: *mut Handle) -> HRESULT {
+extern "win64" fn create_context(_: This, _user: *const c_void, out: *mut Handle) -> HRESULT {
     put(out, handle(&CONTEXT))
 }
-extern "system" fn close(_: This, _: Handle) {}
+extern "win64" fn close(_: This, _: Handle) {}
 
-extern "system" fn associated_products_async(
+extern "win64" fn associated_products_async(
     _: This,
     _: Handle,
     _kinds: u32,
@@ -90,7 +90,7 @@ extern "system" fn associated_products_async(
 }
 
 /// The user owns no add-ons: an empty query.
-extern "system" fn entitled_products_async(
+extern "win64" fn entitled_products_async(
     _: This,
     _: Handle,
     _kinds: u32,
@@ -103,11 +103,11 @@ extern "system" fn entitled_products_async(
         Ok(xasync::bytes(handle(&QUERY))),
     )
 }
-extern "system" fn query_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+extern "win64" fn query_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
     xasync::result(block, (&raw const QUERY_CALL).cast(), out)
 }
 /// Empty, so the callback never runs.
-extern "system" fn enumerate_products(
+extern "win64" fn enumerate_products(
     _: This,
     _: Handle,
     _: *mut c_void,
@@ -115,11 +115,11 @@ extern "system" fn enumerate_products(
 ) -> HRESULT {
     S_OK
 }
-extern "system" fn has_more_pages(_: This, _: Handle) -> bool {
+extern "win64" fn has_more_pages(_: This, _: Handle) -> bool {
     false
 }
 /// There is no next page to ask for.
-extern "system" fn next_page_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn next_page_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
     xasync::finished(block, (&raw const QUERY_CALL).cast(), E_ILLEGAL_METHOD_CALL)
 }
 
@@ -132,7 +132,7 @@ fn license_for(owned: bool, block: *mut AsyncBlock) -> HRESULT {
     )
 }
 /// Only the game's own package is installed, so only its licence is valid.
-extern "system" fn license_for_package_async(
+extern "win64" fn license_for_package_async(
     _: This,
     _: Handle,
     package: *const c_char,
@@ -142,7 +142,7 @@ extern "system" fn license_for_package_async(
     license_for(ours, block)
 }
 /// The user owns no durables: their licences are not valid.
-extern "system" fn license_for_durables_async(
+extern "win64" fn license_for_durables_async(
     _: This,
     _: Handle,
     store_id: *const c_char,
@@ -154,10 +154,10 @@ extern "system" fn license_for_durables_async(
     );
     license_for(false, block)
 }
-extern "system" fn license_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+extern "win64" fn license_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
     xasync::result(block, (&raw const LICENSE_CALL).cast(), out)
 }
-extern "system" fn is_license_valid(_: This, license: Handle) -> bool {
+extern "win64" fn is_license_valid(_: This, license: Handle) -> bool {
     license == handle(&VALID)
 }
 
@@ -194,11 +194,11 @@ fn game_license() -> GameLicense {
     }
 }
 
-extern "system" fn game_license_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn game_license_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
     let license = xasync::bytes(game_license());
     xasync::finished_with(block, (&raw const GAME_LICENSE).cast(), Ok(license))
 }
-extern "system" fn game_license_result(
+extern "win64" fn game_license_result(
     _: This,
     block: *mut AsyncBlock,
     out: *mut GameLicense,
@@ -206,7 +206,7 @@ extern "system" fn game_license_result(
     xasync::result(block, (&raw const GAME_LICENSE).cast(), out)
 }
 
-extern "system" fn consumable_balance_async(
+extern "win64" fn consumable_balance_async(
     _: This,
     _: Handle,
     _store_id: *const c_char,
@@ -214,7 +214,7 @@ extern "system" fn consumable_balance_async(
 ) -> HRESULT {
     offline(block, "consumable balance")
 }
-extern "system" fn report_fulfillment_async(
+extern "win64" fn report_fulfillment_async(
     _: This,
     _: Handle,
     _store_id: *const c_char,
@@ -225,7 +225,7 @@ extern "system" fn report_fulfillment_async(
     offline(block, "consumable fulfillment")
 }
 /// Collections and purchase ids alike.
-extern "system" fn user_id_async(
+extern "win64" fn user_id_async(
     _: This,
     _: Handle,
     _ticket: *const c_char,
@@ -234,10 +234,10 @@ extern "system" fn user_id_async(
 ) -> HRESULT {
     offline(block, "user store id")
 }
-extern "system" fn size_status(_: This, block: *mut AsyncBlock, _out: *mut usize) -> HRESULT {
+extern "win64" fn size_status(_: This, block: *mut AsyncBlock, _out: *mut usize) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
-extern "system" fn string_status(
+extern "win64" fn string_status(
     _: This,
     block: *mut AsyncBlock,
     _: usize,
@@ -245,19 +245,14 @@ extern "system" fn string_status(
 ) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
-extern "system" fn count_status(_: This, block: *mut AsyncBlock, _out: *mut u32) -> HRESULT {
+extern "win64" fn count_status(_: This, block: *mut AsyncBlock, _out: *mut u32) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
-extern "system" fn array_status(
-    _: This,
-    block: *mut AsyncBlock,
-    _: u32,
-    _: *mut c_void,
-) -> HRESULT {
+extern "win64" fn array_status(_: This, block: *mut AsyncBlock, _: u32, _: *mut c_void) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
 
-extern "system" fn purchase_ui_async(
+extern "win64" fn purchase_ui_async(
     _: This,
     _: Handle,
     _store_id: *const c_char,
@@ -267,7 +262,7 @@ extern "system" fn purchase_ui_async(
 ) -> HRESULT {
     offline(block, "purchase page")
 }
-extern "system" fn product_page_ui_async(
+extern "win64" fn product_page_ui_async(
     _: This,
     _: Handle,
     _store_id: *const c_char,
@@ -275,7 +270,7 @@ extern "system" fn product_page_ui_async(
 ) -> HRESULT {
     offline(block, "product page")
 }
-extern "system" fn redeem_ui_async(
+extern "win64" fn redeem_ui_async(
     _: This,
     _: Handle,
     _token: *const c_char,
@@ -286,11 +281,11 @@ extern "system" fn redeem_ui_async(
 ) -> HRESULT {
     offline(block, "redeem page")
 }
-extern "system" fn updates_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn updates_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
     offline(block, "update check")
 }
 /// Installing updates or packages by id alike.
-extern "system" fn install_async(
+extern "win64" fn install_async(
     _: This,
     _: Handle,
     _ids: *const *const c_char,
@@ -303,7 +298,7 @@ extern "system" fn install_async(
 /// The game's own store id maps to its installation; nothing else is
 /// installed, and any other id gets the documented E_INVALIDARG (not
 /// XPackage's "could not resolve" error).
-extern "system" fn package_identifier(
+extern "win64" fn package_identifier(
     _: This,
     store_id: *const c_char,
     size: usize,
@@ -319,7 +314,7 @@ extern "system" fn package_identifier(
 }
 
 /// Licences never change offline, so these callbacks never run.
-extern "system" fn register(
+extern "win64" fn register(
     _: This,
     _: Handle,
     _queue: *const c_void,
@@ -329,7 +324,7 @@ extern "system" fn register(
 ) -> HRESULT {
     put(out, token())
 }
-extern "system" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> bool {
+extern "win64" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> bool {
     true
 }
 
@@ -433,8 +428,8 @@ mod tests {
 
         let this: This = &OBJECT;
         type StoreIdAsync =
-            extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
-        type ReportFulfillmentAsync = extern "system" fn(
+            extern "win64" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type ReportFulfillmentAsync = extern "win64" fn(
             This,
             Handle,
             *const c_char,
@@ -442,7 +437,7 @@ mod tests {
             *const c_void,
             *mut AsyncBlock,
         ) -> HRESULT;
-        type PurchaseUiAsync = extern "system" fn(
+        type PurchaseUiAsync = extern "win64" fn(
             This,
             Handle,
             *const c_char,
@@ -450,7 +445,7 @@ mod tests {
             *const c_char,
             *mut AsyncBlock,
         ) -> HRESULT;
-        type RedeemUiAsync = extern "system" fn(
+        type RedeemUiAsync = extern "win64" fn(
             This,
             Handle,
             *const c_char,
@@ -459,8 +454,8 @@ mod tests {
             bool,
             *mut AsyncBlock,
         ) -> HRESULT;
-        type StatusResult = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
-        type CountResult = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type StatusResult = extern "win64" fn(This, *mut AsyncBlock) -> HRESULT;
+        type CountResult = extern "win64" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
 
         let mut b = block();
         assert_eq!(
@@ -558,8 +553,8 @@ mod tests {
     fn the_game_is_licensed_and_the_store_is_offline() {
         let this: This = &OBJECT;
         assert_eq!(size_of::<GameLicense>(), 104);
-        type Begin = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
-        type Result = extern "system" fn(This, *mut AsyncBlock, *mut GameLicense) -> HRESULT;
+        type Begin = extern "win64" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "win64" fn(This, *mut AsyncBlock, *mut GameLicense) -> HRESULT;
         let mut b = block();
         assert_eq!(
             method::<Begin>(&OBJECT, 0xe0)(this, handle(&CONTEXT), &mut b),
@@ -581,14 +576,14 @@ mod tests {
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
-        type Count = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type Count = extern "win64" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
         assert_eq!(
             method::<Count>(&OBJECT, 0x1c0)(this, &mut b, &mut 0),
             NETWORK_ERROR
         );
 
-        type Durable = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
-        type License = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type Durable = extern "win64" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type License = extern "win64" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
         let mut b = block();
         let durable = method::<Durable>(&OBJECT, 0x238);
         assert_eq!(
@@ -601,14 +596,14 @@ mod tests {
             method::<License>(&OBJECT, 0x240)(this, &mut b, &mut l),
             S_OK
         );
-        assert!(!method::<extern "system" fn(This, Handle) -> bool>(
+        assert!(!method::<extern "win64" fn(This, Handle) -> bool>(
             &OBJECT, 0xb0
         )(this, l));
     }
 
     #[test]
     fn a_store_id_without_a_package_is_an_invalid_argument() {
-        type Query = extern "system" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
+        type Query = extern "win64" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
         let query = method::<Query>(&OBJECT, 0x208);
         let mut id = [0u8; 33];
         assert_eq!(

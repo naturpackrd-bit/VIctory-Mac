@@ -20,17 +20,38 @@
 //! 5. initialise the title's DLLs, then run TLS callbacks and the entry
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
+//!
+//! Steps 2 to 5 are Windows-only so far (macOS: docs/macos.md). Elsewhere
+//! the portable helpers only they call are unused, and are let be; the
+//! Windows build is the whole one, and still finds code that is dead.
+#![cfg_attr(not(windows), allow(dead_code))]
+//!
+//! The runtime runs the title's x86-64 code in our process, so it is built
+//! for x86-64 only: on Apple silicon under Rosetta 2, with the tools built
+//! natively beside it (docs/macos.md). Elsewhere this crate is empty.
+#![cfg(target_arch = "x86_64")]
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
 mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
+#[cfg(not(windows))]
+pub mod faults;
 pub mod frame_rate;
+pub mod images;
+pub mod map;
 pub mod prepare;
+pub mod stubs;
+#[cfg(not(windows))]
+pub mod teb;
+pub mod unwind;
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;
+#[cfg(not(windows))]
+pub mod seh;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -52,6 +73,7 @@ pub use crash::{
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
+pub use map::{Export, MapError, MappedImage};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -71,3 +93,7 @@ pub use windows::{
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 /// `DLL_PROCESS_DETACH`.
 pub const DLL_PROCESS_DETACH: u32 = 0;
+/// `DLL_THREAD_ATTACH`: a thread starts.
+pub const DLL_THREAD_ATTACH: u32 = 2;
+/// `DLL_THREAD_DETACH`: a thread ends.
+pub const DLL_THREAD_DETACH: u32 = 3;

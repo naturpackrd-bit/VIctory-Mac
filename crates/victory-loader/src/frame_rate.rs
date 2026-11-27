@@ -328,7 +328,7 @@ mod tests {
             assert_eq!(after[..6], replacement(Kind::Load, 60)[..]);
             assert_eq!(after[6..], bytes[6..]);
             assert_eq!(std::slice::from_raw_parts(place.add(0x200), other.len()), &other[..]);
-            let rate: extern "system" fn() -> f32 = std::mem::transmute(place.add(0x300));
+            let rate: extern "win64" fn() -> f32 = std::mem::transmute(place.add(0x300));
             assert_eq!(rate(), 60.0);
             VirtualFree(place.cast(), 0, MEM_RELEASE);
         }

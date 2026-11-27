@@ -22,6 +22,7 @@ victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
+victory-platform = { path = "crates/victory-platform" }
 
 # External crates
 anyhow = "1.0.104"
@@ -43,6 +44,9 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# The host's C interfaces on macOS (and Linux, for tests); already in
+# Cargo.lock through rustix and getrandom.
+libc = "0.2.191"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

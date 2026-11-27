@@ -38,7 +38,7 @@ accepted.
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
 user's dump), `test_titles`, and `cache_dir` for everything derived
-(default `%LOCALAPPDATA%\victory\cache`).
+(default `%LOCALAPPDATA%\victory\cache`; on macOS `~/Library/Caches/victory`).
 
 ## Enforcement
 
