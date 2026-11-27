@@ -543,7 +543,12 @@ mod tests {
         assert_ne!(a, b);
         unregister_tls(a);
         let c = register_tls(&[9], 0).unwrap();
-        assert_eq!(c, a, "a freed index is used again");
+        // A freed index is used again: by this registration, or by another
+        // test's that ran between the two calls (the registry is shared).
+        let a_taken = lock(&TLS_REGISTRY)
+            .get(a as usize)
+            .is_some_and(Option::is_some);
+        assert!(c == a || a_taken, "a freed index is used again");
         unregister_tls(b);
         unregister_tls(c);
     }

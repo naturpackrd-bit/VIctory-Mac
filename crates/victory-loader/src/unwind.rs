@@ -461,7 +461,18 @@ pub fn virtual_unwind(
         pop_return(ctx)?;
         return Ok(None);
     };
-    let primary = Info::read(base + u64::from(function.unwind_info))?;
+    // An indirect entry (bit 0 set) names another `RUNTIME_FUNCTION`, whose
+    // unwind info is the function's.
+    let unwind_info = if function.unwind_info & 1 != 0 {
+        let mut target = [0; 12];
+        read_bytes(base + u64::from(function.unwind_info & !1), &mut target)?;
+        RuntimeFunction::parse(&target)
+            .ok_or(UnwindError::Malformed("indirect entry"))?
+            .unwind_info
+    } else {
+        function.unwind_info
+    };
+    let primary = Info::read(base + u64::from(unwind_info))?;
     let offset_in_function = (ctx.rip - base) as u32 - function.begin;
     let establisher_frame = if primary.frame_register != 0 {
         primary.frame_base(ctx)
@@ -768,6 +779,44 @@ mod tests {
         assert_eq!(ctx.rsp, start + 0x40 + 24);
         assert_eq!(ctx.rip, 0x4000_1234);
         assert_eq!(unwound.handler, None, "no handler in an epilogue");
+    }
+
+    /// An indirect entry (bit 0 of its unwind-info RVA set) names another
+    /// `RUNTIME_FUNCTION`, whose unwind info is used.
+    #[test]
+    fn indirect_entries_name_another_functions_info() {
+        let image = FakeImage::new();
+        // sub rsp, 0x20, with a handler.
+        let info = unwind_info(
+            1,
+            FLAG_EHANDLER,
+            4,
+            0,
+            0,
+            &[code(4, 2, 3)],
+            &[0, 0x30, 0, 0],
+        );
+        image.put(0x300, &info);
+        // The entry the indirect one names.
+        image.put(0x400, &entry(0x1000, 0x1100, 0x300));
+        let pdata = entry(0x1000, 0x1100, 0x401);
+        let stack = [0u64, 0, 0, 0, 0x4000_4321];
+        let start = address(&stack, 0);
+        let mut ctx = Context {
+            rip: image.base() + 0x1000 + 5,
+            rsp: start,
+            ..Default::default()
+        };
+        let unwound = virtual_unwind(image.base(), &pdata, &mut ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unwound.function.begin, 0x1000);
+        assert_eq!(ctx.rsp, start + 0x20 + 8);
+        assert_eq!(ctx.rip, 0x4000_4321);
+        assert_eq!(
+            unwound.handler.map(|h| (h.flags, h.address)),
+            Some((FLAG_EHANDLER, image.base() + 0x3000))
+        );
     }
 
     #[test]
