@@ -27,7 +27,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, Once, OnceLock, PoisonError};
 
-use victory_loader::seh::__C_specific_handler;
+use victory_loader::seh::{__C_specific_handler, RtlUnwind};
 use victory_platform::system::System;
 use victory_platform::{Host, Thread};
 
@@ -38,10 +38,14 @@ use crate::{HleExport, hle_export};
 pub(crate) const EPERM: i32 = 1;
 /// `errno`: no such file or directory.
 pub(crate) const ENOENT: i32 = 2;
+/// `errno`: an argument list (or environment) too long.
+pub(crate) const E2BIG: i32 = 7;
 /// `errno`: an executable's format is wrong.
 pub(crate) const ENOEXEC: i32 = 8;
 /// `errno`: bad file descriptor.
 pub(crate) const EBADF: i32 = 9;
+/// `errno`: no child processes.
+pub(crate) const ECHILD: i32 = 10;
 /// `errno`: resource temporarily unavailable.
 pub(crate) const EAGAIN: i32 = 11;
 /// `errno`: not enough memory.
@@ -268,8 +272,8 @@ pub extern "win64" fn _crt_at_quick_exit(function: ExitFunction) -> i32 {
     }
 }
 
-/// Runs the `atexit` functions in reverse order, once: an `exit` from inside
-/// one of them does not run them again.
+/// Runs the `atexit` functions in reverse order, once (an `exit` from inside
+/// one of them does not run them again), then flushes the streams.
 pub(crate) fn run_exit_hooks() {
     if EXIT_HOOKS_RAN.swap(true, Ordering::AcqRel) {
         return;
@@ -285,6 +289,9 @@ pub(crate) fn run_exit_hooks() {
         callback(std::ptr::null_mut(), 0, std::ptr::null_mut());
     }
     run_reversed(&ATEXIT);
+    // The streams last, as the UCRT flushes them after the `atexit`
+    // functions (the static destructors among them) have written.
+    super::stdio::flush_all();
 }
 
 static THREAD_LOCAL_EXIT_CALLBACK: AtomicUsize = AtomicUsize::new(0);
@@ -343,8 +350,18 @@ pub extern "win64" fn __p__commode() -> *mut i32 {
     COMMODE.as_ptr()
 }
 
-/// Sets the default translation mode of files (kept for the stdio slice).
+/// Sets the default translation mode of files (kept for the stdio slice):
+/// `_O_TEXT`, `_O_BINARY` or `_O_WTEXT`; anything else is `EINVAL`, an
+/// invalid parameter.
 pub extern "win64" fn _set_fmode(mode: i32) -> i32 {
+    const O_TEXT: i32 = 0x4000;
+    const O_BINARY: i32 = 0x8000;
+    const O_WTEXT: i32 = 0x1_0000;
+    if !matches!(mode, O_TEXT | O_BINARY | O_WTEXT) {
+        set_errno(EINVAL);
+        _invalid_parameter_noinfo();
+        return EINVAL;
+    }
     FMODE.store(mode, Ordering::Relaxed);
     0
 }
@@ -1539,8 +1556,51 @@ unsafe fn decorated(data: *const TypeInfo) -> *const c_char {
 /// Frees the cached undecorated names: we cache none.
 pub extern "win64" fn __std_type_info_destroy_list(_root: *mut c_void) {}
 
-/// The name of a type: the decorated name without its leading `.`, a stand
-/// in for the undecorated one (no undecorator here).
+/// The kinds of names [`undecorated_name`] knows: the decorated prefix and
+/// the keyword MSVC gives.
+const NAME_KINDS: [(&[u8], &[u8]); 3] = [
+    (b"?AV", b"class "),
+    (b"?AU", b"struct "),
+    (b"?AW4", b"enum "),
+];
+
+/// The name MSVC's `type_info::name` gives a decorated name (its `.`
+/// first): `class Foo` for `.?AVFoo@@`, `struct` for `?AU`, `enum` for
+/// `?AW4`, nested names as `Outer::Inner` (`.?AVInner@Outer@@`); anything
+/// else (templates, pointers, back references) the decorated name without
+/// its `.`.
+fn undecorated_name(decorated: &[u8]) -> Vec<u8> {
+    let name = decorated.strip_prefix(b".").unwrap_or(decorated);
+    let simple = |part: &&[u8]| {
+        part.first().is_some_and(|b| !b.is_ascii_digit())
+            && part.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    NAME_KINDS
+        .iter()
+        .find_map(|&(prefix, keyword)| {
+            let parts: Vec<&[u8]> = name
+                .strip_prefix(prefix)?
+                .strip_suffix(b"@@")?
+                .split(|&b| b == b'@')
+                .collect();
+            if !parts.iter().all(simple) {
+                return None;
+            }
+            let mut out = keyword.to_vec();
+            for (i, part) in parts.iter().rev().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b"::");
+                }
+                out.extend_from_slice(part);
+            }
+            Some(out)
+        })
+        .unwrap_or_else(|| name.to_vec())
+}
+
+/// The undecorated name of a type ([`undecorated_name`]), cached in the
+/// `type_info`'s own field as vcruntime caches it (made once, kept for the
+/// process's life; the root list is not used).
 pub extern "win64" fn __std_type_info_name(
     data: *const TypeInfo,
     _root: *mut c_void,
@@ -1548,8 +1608,28 @@ pub extern "win64" fn __std_type_info_name(
     if data.is_null() {
         return std::ptr::null();
     }
-    // SAFETY: the title's `type_info`, whose name starts with a `.`.
-    unsafe { decorated(data).add(1) }
+    // SAFETY: the title's `type_info`, whose cached name is a pointer-sized
+    // field written only this way (vcruntime writes it so too).
+    let cached = unsafe { AtomicPtr::from_ptr((&raw const (*data).undecorated).cast_mut()) };
+    let known = cached.load(Ordering::Acquire);
+    if !known.is_null() {
+        return known;
+    }
+    // SAFETY: the title's `type_info`, whose name is NUL-terminated.
+    let mut name = undecorated_name(unsafe { CStr::from_ptr(decorated(data)) }.to_bytes());
+    name.push(0);
+    let made = Box::leak(name.into_boxed_slice())
+        .as_mut_ptr()
+        .cast::<c_char>();
+    match cached.compare_exchange(
+        std::ptr::null_mut(),
+        made,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => made,
+        Err(other) => other,
+    }
 }
 
 /// Compares two types by their decorated names (as `strcmp`).
@@ -1564,18 +1644,23 @@ pub extern "win64" fn __std_type_info_compare(a: *const TypeInfo, b: *const Type
     unsafe { CStr::from_ptr(decorated(a)).cmp(CStr::from_ptr(decorated(b))) as i32 }
 }
 
-/// A hash of a type's decorated name (FNV-1a).
+/// A hash of a type's decorated name as vcruntime's on x64: FNV-1a from
+/// the name's second character (its `.` skipped), then the high half
+/// folded into the low.
 pub extern "win64" fn __std_type_info_hash(data: *const TypeInfo) -> usize {
     if data.is_null() {
         return 0;
     }
     // SAFETY: the title's `type_info`, whose name is NUL-terminated.
-    let name = unsafe { CStr::from_ptr(decorated(data)) };
-    name.to_bytes()
+    let name = unsafe { CStr::from_ptr(decorated(data)) }.to_bytes();
+    let value = name
+        .get(1..)
+        .unwrap_or_default()
         .iter()
         .fold(0xCBF2_9CE4_8422_2325u64, |hash, &b| {
             (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
-        }) as usize
+        });
+    (value ^ (value >> 32)) as usize
 }
 
 /// `std::exception`'s data: its message, and whether the exception owns it.
@@ -1834,6 +1919,74 @@ pub extern "win64" fn __telemetry_main_invoke_trigger(_module: *const c_void) {}
 /// Telemetry at `main`'s end: nothing.
 pub extern "win64" fn __telemetry_main_return_trigger(_module: *const c_void) {}
 
+/// `__unDName`'s allocator and its release.
+pub type UndnameAlloc = Option<extern "win64" fn(usize) -> *mut c_void>;
+pub type UndnameFree = Option<extern "win64" fn(*mut c_void)>;
+
+/// The undecorator: a copy of `mangled` without its leading `?` (no
+/// demangling here; a warning once), into `buffer` (at most `len - 1`
+/// characters and a NUL) or, for a null buffer, into a block from `alloc`
+/// of the size the copy needs; null for a null name, no room or no memory.
+pub extern "win64" fn __unDName(
+    buffer: *mut c_char,
+    mangled: *const c_char,
+    len: i32,
+    alloc: UndnameAlloc,
+    _free: UndnameFree,
+    _flags: u16,
+) -> *mut c_char {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("__unDName gives decorated names as they are (no demangling)");
+    }
+    if mangled.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the title's NUL-terminated name.
+    let name = unsafe { CStr::from_ptr(mangled) }.to_bytes();
+    let name = name.strip_prefix(b"?").unwrap_or(name);
+    let (out, n) = if buffer.is_null() {
+        match alloc.map(|alloc| alloc(name.len() + 1).cast::<c_char>()) {
+            Some(block) if !block.is_null() => (block, name.len()),
+            _ => return std::ptr::null_mut(),
+        }
+    } else {
+        match usize::try_from(len) {
+            Ok(room) if room > 0 => (buffer, name.len().min(room - 1)),
+            _ => return std::ptr::null_mut(),
+        }
+    };
+    // SAFETY: `out` has room for `n` bytes and the NUL.
+    unsafe {
+        std::ptr::copy_nonoverlapping(name.as_ptr(), out.cast::<u8>(), n);
+        out.add(n).write(0);
+    }
+    out
+}
+
+/// vcruntime's hook for a debugger at a non-local goto: nothing.
+pub extern "win64" fn __NLG_Dispatch2() {}
+
+/// vcruntime's hook for a debugger at a non-local goto's return: nothing.
+pub extern "win64" fn __NLG_Return2() {}
+
+/// `_local_unwind`: unwinds to `frame`, running the `__finally` blocks on
+/// the way, and resumes it at `target`: `RtlUnwind(frame, target, null,
+/// 0)`, reached by a jump so that the walk starts at the title's frame
+/// (ours has no unwind data the walk could read).
+///
+/// # Safety
+/// Called from title code, with a frame on this thread's stack.
+#[unsafe(naked)]
+pub unsafe extern "win64" fn _local_unwind(frame: u64, target: u64) {
+    core::arch::naked_asm!(
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "jmp {unwind}",
+        unwind = sym RtlUnwind,
+    )
+}
+
 /// Saves the callee-saved registers, the stack pointer, the return address
 /// and the floating-point control in the 256-byte `_JUMP_BUFFER` at `rcx`
 /// (`rdx`, the frame, is stored); returns 0, and again with
@@ -2035,6 +2188,15 @@ pub(crate) fn exports() -> Vec<HleExport> {
         // MSVC's `__try` handler, imported from vcruntime140.dll (ntdll's
         // copy is `win32::exceptions`'s).
         hle_export!(__C_specific_handler),
+        // The handler of `__try` in a `noexcept` function: the same.
+        HleExport {
+            name: "__C_specific_handler_noexcept",
+            address: __C_specific_handler as *const () as usize,
+        },
+        hle_export!(_local_unwind),
+        hle_export!(__unDName),
+        hle_export!(__NLG_Dispatch2),
+        hle_export!(__NLG_Return2),
         hle_export!(longjmp),
     ]
 }
@@ -2224,24 +2386,130 @@ mod tests {
             undecorated: usize,
             name: [u8; 16],
         }
-        let a = Named {
+        let mut a = Named {
             vtable: 0,
             undecorated: 0,
             name: *b".?AVWidget@@\0\0\0\0",
         };
-        let b = Named {
+        let mut b = Named {
             vtable: 0,
             undecorated: 0,
             name: *b".?AVGadget@@\0\0\0\0",
         };
-        let pa = (&raw const a).cast::<TypeInfo>();
-        let pb = (&raw const b).cast::<TypeInfo>();
-        // SAFETY: NUL-terminated within `a`.
-        let name = unsafe { CStr::from_ptr(__std_type_info_name(pa, std::ptr::null_mut())) };
-        assert_eq!(name.to_str(), Ok("?AVWidget@@"));
+        let pa = (&raw mut a).cast::<TypeInfo>().cast_const();
+        let pb = (&raw mut b).cast::<TypeInfo>().cast_const();
+        let first = __std_type_info_name(pa, std::ptr::null_mut());
+        // SAFETY: a NUL-terminated name kept for the process's life.
+        assert_eq!(
+            unsafe { CStr::from_ptr(first) }.to_str(),
+            Ok("class Widget")
+        );
+        assert_eq!(
+            __std_type_info_name(pa, std::ptr::null_mut()),
+            first,
+            "cached"
+        );
+        // The name wrote its cache into `a`.
+        assert_eq!(a.undecorated, first as usize);
         assert!(__std_type_info_compare(pa, pb) > 0);
         assert_eq!(__std_type_info_compare(pa, pa), 0);
         assert_ne!(__std_type_info_hash(pa), __std_type_info_hash(pb));
+        // vcruntime's hash: FNV-1a of "?AVWidget@@", the high half folded.
+        let fnv = b"?AVWidget@@"
+            .iter()
+            .fold(0xCBF2_9CE4_8422_2325u64, |h, &c| {
+                (h ^ u64::from(c)).wrapping_mul(0x100_0000_01B3)
+            });
+        assert_eq!(__std_type_info_hash(pa), (fnv ^ (fnv >> 32)) as usize);
+    }
+
+    #[test]
+    fn undecorated_names_are_msvc_s() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b".?AVFoo@@", b"class Foo"),
+            (b".?AUFoo@@", b"struct Foo"),
+            (b".?AW4Foo@@", b"enum Foo"),
+            (b".?AVInner@Outer@@", b"class Outer::Inner"),
+            (b".?AUC@B@A@@", b"struct A::B::C"),
+            (b".?AV?$vector@H@std@@", b"?AV?$vector@H@std@@"),
+            (b".PEAH", b"PEAH"),
+            (b".H", b"H"),
+            (b".?AVFoo@", b"?AVFoo@"),
+        ];
+        for &(decorated, name) in cases {
+            assert_eq!(
+                undecorated_name(decorated),
+                name,
+                "{}",
+                String::from_utf8_lossy(decorated)
+            );
+        }
+    }
+
+    extern "win64" fn take(n: usize) -> *mut c_void {
+        heap::malloc(n)
+    }
+
+    #[test]
+    fn undname_copies_without_the_question_mark() {
+        let mut buffer = [0x55 as c_char; 8];
+        let out = __unDName(buffer.as_mut_ptr(), c"?AVFoo@@".as_ptr(), 8, None, None, 0);
+        assert_eq!(out, buffer.as_mut_ptr());
+        // SAFETY: NUL-terminated by `__unDName`.
+        assert_eq!(unsafe { CStr::from_ptr(out) }.to_bytes(), b"AVFoo@@");
+        let out = __unDName(
+            buffer.as_mut_ptr(),
+            c"?AVLonger@@".as_ptr(),
+            4,
+            None,
+            None,
+            0,
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { CStr::from_ptr(out) }.to_bytes(), b"AVL");
+        let out = __unDName(
+            std::ptr::null_mut(),
+            c"?f@@YAXXZ".as_ptr(),
+            0,
+            Some(take),
+            None,
+            0,
+        );
+        assert!(!out.is_null());
+        // SAFETY: as above.
+        assert_eq!(unsafe { CStr::from_ptr(out) }.to_bytes(), b"f@@YAXXZ");
+        heap::free(out.cast());
+        let none = __unDName(std::ptr::null_mut(), c"?x".as_ptr(), 0, None, None, 0);
+        assert!(none.is_null());
+        __NLG_Dispatch2();
+        __NLG_Return2();
+    }
+
+    thread_local! {
+        static INVALID_CALLS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    extern "win64" fn count_invalid(_: *const u16, _: *const u16, _: *const u16, _: u32, _: usize) {
+        INVALID_CALLS.with(|n| n.set(n.get() + 1));
+    }
+
+    #[test]
+    fn set_fmode_takes_the_three_modes() {
+        // Other tests open files meanwhile: only text mode (what 0 means
+        // to them too) is set.
+        let old = _set_thread_local_invalid_parameter_handler(Some(count_invalid));
+        assert_eq!(_set_fmode(0x4000), 0);
+        assert_eq!(INVALID_CALLS.with(Cell::get), 0);
+        for bad in [0, 0x1234, 0x4000 | 0x8000, -1] {
+            set_errno(0);
+            assert_eq!(_set_fmode(bad), EINVAL, "{bad:#x}");
+            assert_eq!(errno(), EINVAL);
+        }
+        assert_eq!(INVALID_CALLS.with(Cell::get), 4);
+        let mut now = 0;
+        assert_eq!(_get_fmode(&mut now), 0);
+        assert_eq!(now, 0x4000);
+        _set_thread_local_invalid_parameter_handler(old);
     }
 
     #[test]
@@ -2442,6 +2710,6 @@ mod tests {
 
     #[test]
     fn every_export_is_listed() {
-        assert_eq!(exports().len(), 106);
+        assert_eq!(exports().len(), 111);
     }
 }

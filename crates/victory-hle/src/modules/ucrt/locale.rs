@@ -14,7 +14,7 @@
 // API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::hash_map::RandomState;
 use std::ffi::{c_char, c_void};
 use std::hash::BuildHasher;
@@ -259,37 +259,56 @@ fn wide_text(s: *const u16) -> Option<String> {
     (!s.is_null()).then(|| String::from_utf16_lossy(unsafe { wide_units(s) }))
 }
 
-thread_local! {
-    static NARROW_VALUE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    static WIDE_VALUE: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
+/// The value of `name` in a `NAME=value` array (`_environ` or
+/// `_wenviron`): the address just after the `=` of the first entry whose
+/// name matches ignoring ASCII case, inside the array's own string; null
+/// when there is none.
+///
+/// # Safety
+/// `array` is a null-terminated array of NUL-terminated entries; `name`
+/// has no NUL.
+unsafe fn value_in<T: Copy + Into<u32>>(array: *mut *mut T, name: &[T]) -> *mut T {
+    let same = |a: T, b: T| {
+        let (a, b): (u32, u32) = (a.into(), b.into());
+        a == b || (a < 128 && b < 128 && (a as u8).eq_ignore_ascii_case(&(b as u8)))
+    };
+    // SAFETY: as the caller says; each entry is read up to its NUL (a
+    // mismatch or the `=` comes first).
+    unsafe {
+        let mut entry = array;
+        while !entry.is_null() && !(*entry).is_null() {
+            let text = *entry;
+            let mut i = 0;
+            while i < name.len() && same(*text.add(i), name[i]) {
+                i += 1;
+            }
+            if i == name.len() && (*text.add(i)).into() == u32::from(b'=') {
+                return text.add(i + 1);
+            }
+            entry = entry.add(1);
+        }
+    }
+    std::ptr::null_mut()
 }
 
-/// A variable's value in a per-thread buffer; null when it is not set.
+/// A variable's value (its name in any ASCII case), inside `_environ`'s
+/// array: valid until the environment next changes (`_putenv` makes a new
+/// array and keeps the old one), as on Windows; null when it is not set.
 pub extern "win64" fn getenv(name: *const c_char) -> *mut c_char {
-    let Some(value) = narrow_text(name).and_then(|n| lookup(&n)) else {
+    if name.is_null() {
         return std::ptr::null_mut();
-    };
-    NARROW_VALUE.with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        buffer.clear();
-        buffer.extend_from_slice(value.as_bytes());
-        buffer.push(0);
-        buffer.as_mut_ptr().cast()
-    })
+    }
+    // SAFETY: the title's string; the array `__p__environ` keeps.
+    unsafe { value_in((*__p__environ()).cast::<*mut u8>(), narrow_bytes(name)).cast() }
 }
 
-/// See [`getenv`].
+/// See [`getenv`]; inside `_wenviron`'s array.
 pub extern "win64" fn _wgetenv(name: *const u16) -> *mut u16 {
-    let Some(value) = wide_text(name).and_then(|n| lookup(&n)) else {
+    if name.is_null() {
         return std::ptr::null_mut();
-    };
-    WIDE_VALUE.with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        buffer.clear();
-        buffer.extend(value.encode_utf16());
-        buffer.push(0);
-        buffer.as_mut_ptr()
-    })
+    }
+    // SAFETY: the title's string; the array `__p__wenviron` keeps.
+    unsafe { value_in(*__p__wenviron(), wide_units(name)) }
 }
 
 /// A value into a buffer of `size` units, its length with the NUL in
@@ -985,6 +1004,26 @@ mod tests {
         assert!(copy.is_null() && len == 0);
         assert_eq!(_putenv(c"no equals".as_ptr()), -1);
         assert!(!getenv(c"NUMBER_OF_PROCESSORS".as_ptr()).is_null());
+    }
+
+    #[test]
+    fn getenv_pointers_stay_valid() {
+        let first = getenv(c"computername".as_ptr());
+        let second = getenv(c"PROCESSOR_ARCHITECTURE".as_ptr());
+        assert!(!first.is_null() && !second.is_null());
+        // SAFETY: values inside the leaked environment arrays.
+        unsafe {
+            assert_eq!(CStr::from_ptr(first).to_bytes(), b"VICTORY");
+            assert_eq!(CStr::from_ptr(second).to_bytes(), b"AMD64");
+        }
+        let wide: Vec<u16> = "ComputerName\0".encode_utf16().collect();
+        let value = _wgetenv(wide.as_ptr());
+        assert!(!value.is_null());
+        // SAFETY: as above, NUL-terminated.
+        let units = unsafe { super::super::string::wide_units(value) };
+        assert_eq!(String::from_utf16_lossy(units), "VICTORY");
+        assert!(getenv(c"COMPUTERNAM".as_ptr()).is_null());
+        assert!(getenv(c"COMPUTERNAME=".as_ptr()).is_null());
     }
 
     #[test]

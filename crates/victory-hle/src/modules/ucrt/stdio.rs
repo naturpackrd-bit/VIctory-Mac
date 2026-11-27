@@ -29,8 +29,8 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, Once, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use super::super::win32::files::{GetFileAttributesW, GetTempFileNameW, GetTempPathW};
 use super::format::{
@@ -43,8 +43,8 @@ use super::lowio::{
     O_TRUNC, O_U8TEXT, O_U16TEXT, O_WRONLY, O_WTEXT, S_IREAD, S_IWRITE, SH_DENYNO, TextMode,
 };
 use super::runtime::{
-    __p__commode, _crt_atexit, _getpid, _invalid_parameter_noinfo, EBADF, EINVAL, ERANGE,
-    environment, errno, lock, set_errno,
+    __p__commode, _getpid, _invalid_parameter_noinfo, EBADF, EINVAL, ERANGE, environment, errno,
+    lock, set_errno,
 };
 use super::scan::{self, Source, UnitSource};
 use super::string::{narrow_bytes, wide_units};
@@ -564,9 +564,18 @@ pub struct Stream {
     _placeholder: *mut c_void,
     lock: FileLock,
     state: Mutex<State>,
+    /// The buffer's start, position and count as the STL's `basic_filebuf`
+    /// sees them (`_get_stream_buffer_pointers`): null, null and 0, so it
+    /// finds an empty buffer and goes through `fgetc` and `fputc`. Ours
+    /// never change them; the title may write through the pointers it was
+    /// given.
+    stl_base: UnsafeCell<*mut c_char>,
+    stl_ptr: UnsafeCell<*mut c_char>,
+    stl_cnt: UnsafeCell<i32>,
 }
 
-// SAFETY: the placeholder is never read; the rest is behind locks.
+// SAFETY: the placeholder is never read; the STL's fields are the title's
+// (never read or written here once made); the rest is behind locks.
 unsafe impl Sync for Stream {}
 // SAFETY: as above.
 unsafe impl Send for Stream {}
@@ -582,6 +591,9 @@ fn new_stream(state: State) -> &'static Stream {
         _placeholder: std::ptr::null_mut(),
         lock: FileLock::new(),
         state: Mutex::new(state),
+        stl_base: UnsafeCell::new(std::ptr::null_mut()),
+        stl_ptr: UnsafeCell::new(std::ptr::null_mut()),
+        stl_cnt: UnsafeCell::new(0),
     }))
 }
 
@@ -623,17 +635,8 @@ fn all_streams() -> Vec<&'static Stream> {
     lock(&STREAMS).clone()
 }
 
-/// Flushes every stream at exit, registered with the first stream opened.
-extern "win64" fn flush_at_exit() {
-    flush_all();
-}
-
 /// A stream for `state`: a closed one used again, or a new one.
 fn take_stream(state: State) -> &'static Stream {
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        _crt_atexit(Some(flush_at_exit));
-    });
     standard();
     let mut streams = lock(&STREAMS);
     for stream in streams.iter().skip(3) {
@@ -1080,8 +1083,10 @@ pub extern "win64" fn _rmtmp() -> i32 {
 }
 
 /// Flushes every open stream; the number open, and whether every flush
-/// worked.
-fn flush_all() -> (i32, bool) {
+/// worked. `exit` calls it after the `atexit` functions
+/// (`runtime::run_exit_hooks`), so what static destructors write reaches
+/// the files.
+pub(crate) fn flush_all() -> (i32, bool) {
     let mut open = 0;
     let mut ok = true;
     for stream in all_streams() {
@@ -1843,19 +1848,35 @@ pub extern "win64" fn __acrt_iob_func(index: u32) -> *mut FILE {
     }
 }
 
-/// No title should look inside a stream: `EINVAL`.
+/// Where a stream's buffer start, position and count are, for the STL's
+/// `basic_filebuf`: the stream's own fields (null, null and 0, which never
+/// change), so the STL sees an empty buffer and calls `fgetc`, `fputc` and
+/// `ungetc`. Each non-null output is written; 0, or `EINVAL` (an invalid
+/// parameter) for a stream that is not ours. The fields live as long as
+/// the stream, a leaked box never moved or freed.
 pub extern "win64" fn _get_stream_buffer_pointers(
-    _stream: *mut FILE,
-    _base: *mut *mut *mut c_char,
-    _pointer: *mut *mut *mut c_char,
-    _count: *mut *mut i32,
+    stream: *mut FILE,
+    base: *mut *mut *mut c_char,
+    pointer: *mut *mut *mut c_char,
+    count: *mut *mut i32,
 ) -> i32 {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!("the title asked for a stream's buffer pointers, which are not given");
+    let Some(s) = find(stream) else {
+        report(Fail::Invalid(EINVAL));
+        return EINVAL;
+    };
+    // SAFETY: the title's places for the pointers, each checked non-null.
+    unsafe {
+        if !base.is_null() {
+            base.write_unaligned(s.stl_base.get());
+        }
+        if !pointer.is_null() {
+            pointer.write_unaligned(s.stl_ptr.get());
+        }
+        if !count.is_null() {
+            count.write_unaligned(s.stl_cnt.get());
+        }
     }
-    set_errno(EINVAL);
-    EINVAL
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -3244,7 +3265,7 @@ mod tests {
         let args = slots(&[Arg::W(&w("ab")[..2]), Arg::I(3)]);
         let stream = open(&narrow, "w");
         let n = __stdio_common_vfwprintf(
-            0,
+            format::LEGACY_WIDE_SPECIFIERS,
             stream,
             wide_format.as_ptr(),
             std::ptr::null_mut(),
@@ -3385,7 +3406,7 @@ mod tests {
 
         // The wide forms.
         let mut wide = [0u16; 8];
-        let wformat = w("%ls%c");
+        let wformat = w("%ls%lc");
         let wargs = slots(&[Arg::W(&w("ab")[..2]), Arg::U(0x3A9)]);
         let n = __stdio_common_vswprintf(
             standard,
@@ -3419,6 +3440,64 @@ mod tests {
         assert!(matches!(_get_printf_count_output(), 0 | 1));
         assert_eq!(_fileno(__acrt_iob_func(0)), 0);
         assert!(__acrt_iob_func(3).is_null());
+    }
+
+    #[test]
+    fn the_stl_sees_an_empty_buffer() {
+        let _shared = shared();
+        let stream = tmpfile();
+        assert!(!stream.is_null());
+        let mut base = std::ptr::null_mut();
+        let mut position = std::ptr::null_mut();
+        let mut count = std::ptr::null_mut();
+        assert_eq!(
+            _get_stream_buffer_pointers(stream, &mut base, &mut position, &mut count),
+            0
+        );
+        assert!(!base.is_null() && !position.is_null() && !count.is_null());
+        // SAFETY: the stream's own fields, live while it is.
+        unsafe {
+            assert!((*base).is_null());
+            assert!((*position).is_null());
+            assert_eq!(*count, 0);
+        }
+        // Null outputs are skipped.
+        assert_eq!(
+            _get_stream_buffer_pointers(
+                stream,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(fclose(stream), 0);
+        let _tolerant = Tolerant::new();
+        let mut other = 0u8;
+        assert_eq!(
+            _get_stream_buffer_pointers(
+                (&raw mut other).cast(),
+                &mut base,
+                &mut position,
+                &mut count
+            ),
+            EINVAL
+        );
+    }
+
+    #[test]
+    fn flush_all_writes_what_streams_hold() {
+        let _shared = shared();
+        let dir = folder("stdio-flush-all");
+        let path = format!(r"{dir}\held.txt");
+        let stream = open(&path, "w");
+        assert_eq!(write_text(stream, "kept"), 4);
+        assert_eq!(bytes_of(&path), b"", "buffered until flushed");
+        // Other tests' streams are flushed too; this one's flush is what
+        // is checked.
+        assert!(flush_all().0 >= 1);
+        assert_eq!(bytes_of(&path), b"kept");
+        assert_eq!(fclose(stream), 0);
     }
 
     #[test]

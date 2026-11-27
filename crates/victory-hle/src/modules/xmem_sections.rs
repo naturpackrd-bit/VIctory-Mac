@@ -576,6 +576,43 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     true
 }
 
+/// Forgets the views within `[base, base + len)`: a reservation the title
+/// released took its mapped physical pages with it on the host, and the
+/// views that showed them must not count in the working set nor be taken
+/// for live views by a later mapping over a new region at the same
+/// address. The parts of a view reaching past the range are kept.
+pub(crate) fn forget_views(base: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    let mut physical = physical();
+    let first = physical
+        .views
+        .range(..=base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base)
+        .map(|(at, _)| *at);
+    let hit: Vec<usize> = first
+        .into_iter()
+        .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
+        .collect();
+    for at in hit {
+        let Some((size, slice)) = physical.views.remove(&at) else {
+            continue;
+        };
+        if at < base {
+            physical.views.insert(at, (base - at, slice.clone()));
+        }
+        if at + size > end {
+            let index = slice.index + (end - at) / PAGE;
+            physical
+                .views
+                .insert(end, (at + size - end, Slice { index, ..slice }));
+        }
+    }
+}
+
 /// Returns `[base, base + len)` to reserved memory; the parts of views
 /// reaching past it are shown again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {

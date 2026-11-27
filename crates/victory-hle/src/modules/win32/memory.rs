@@ -566,10 +566,14 @@ fn virtual_free(address: usize, size: usize, kind: u32) -> Result<(), u32> {
             if size != 0 {
                 return Err(ERROR_INVALID_PARAMETER);
             }
-            if !map.contains_key(&address) {
+            let Some(size) = map.get(&address).map(|r| r.size) else {
                 return Err(ERROR_INVALID_ADDRESS);
-            }
+            };
             release(&mut map, address);
+            // After the regions lock: `xmem` takes its own lock first, then
+            // ours, never the other way round.
+            drop(map);
+            crate::modules::xmem::forget_views(address, size);
             Ok(())
         }
         MEM_DECOMMIT => {

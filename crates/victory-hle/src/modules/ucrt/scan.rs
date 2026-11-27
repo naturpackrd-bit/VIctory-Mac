@@ -449,7 +449,7 @@ fn run(
         if !matches!(conversion, b'c' | b'[' | b'n') {
             input.skip_space();
         }
-        let wide = wide_argument(u16::from(conversion), length, wide_format);
+        let wide = wide_argument(u16::from(conversion), length, wide_format, true);
         match conversion {
             b'%' => match input.get() {
                 Some(x) if is(x, b'%') => {}

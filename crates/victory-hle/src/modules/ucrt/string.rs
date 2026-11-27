@@ -3,8 +3,9 @@
 //!
 //! Narrow strings are bytes. The title's ANSI code page is not known here,
 //! so case and character classes follow ASCII rules for them (bytes from
-//! 0x80 up are of no class and have no case). Wide strings are UTF-16, and
-//! their classes and case come from Unicode (Rust's `char`). The multibyte
+//! 0x80 up are of no class and have no case). Wide strings are UTF-16:
+//! their classes come from Unicode (Rust's `char`), their case is the "C"
+//! locale's, A-Z and a-z only (as the UCRT maps it). The multibyte
 //! conversions (`mbstowcs` and its family) convert UTF-8 to UTF-16 and back,
 //! lossily for the whole-string ones (a bad sequence becomes U+FFFD) and
 //! with `EILSEQ` for the one-character ones.
@@ -70,26 +71,22 @@ impl Unit for u16 {
     }
 }
 
-/// The one UTF-16 unit `c` maps to under `map`, or `c` itself.
-fn wide_case(c: u16, map: impl Fn(char) -> Option<char>) -> u16 {
-    char::from_u32(u32::from(c))
-        .and_then(map)
-        .and_then(|m| u16::try_from(u32::from(m)).ok())
-        .unwrap_or(c)
-}
-
+/// The "C" locale's lower case of a wide unit: A-Z mapped, the rest kept.
 fn wide_lower(c: u16) -> u16 {
-    wide_case(c, |ch| {
-        let mut it = ch.to_lowercase();
-        it.next().filter(|_| it.next().is_none())
-    })
+    if (0x41..=0x5A).contains(&c) {
+        c + 0x20
+    } else {
+        c
+    }
 }
 
+/// The "C" locale's upper case of a wide unit: a-z mapped, the rest kept.
 fn wide_upper(c: u16) -> u16 {
-    wide_case(c, |ch| {
-        let mut it = ch.to_uppercase();
-        it.next().filter(|_| it.next().is_none())
-    })
+    if (0x61..=0x7A).contains(&c) {
+        c - 0x20
+    } else {
+        c
+    }
 }
 
 /// The number of units before the NUL.
@@ -172,6 +169,74 @@ pub extern "win64" fn memmove(dst: *mut c_void, src: *const c_void, n: usize) ->
         unsafe { std::ptr::copy(src.cast::<u8>(), dst.cast::<u8>(), n) };
     }
     dst
+}
+
+/// `memcpy_s`' and `wmemcpy_s`' body over `count` units of `unit` bytes:
+/// `EINVAL` for a null destination (or source) with a count, `ERANGE` when
+/// `count > size`; both after the invalid-parameter handler, the
+/// destination zeroed (`zero`, the `memcpy_s` forms) once it is known.
+fn copy_checked(
+    dst: *mut c_void,
+    size: usize,
+    src: *const c_void,
+    count: usize,
+    unit: usize,
+    zero: bool,
+) -> i32 {
+    if count == 0 {
+        return 0;
+    }
+    let error = if dst.is_null() {
+        EINVAL
+    } else if src.is_null() {
+        if zero {
+            memset(dst, 0, size.saturating_mul(unit));
+        }
+        EINVAL
+    } else if count > size {
+        if zero {
+            memset(dst, 0, size.saturating_mul(unit));
+        }
+        ERANGE
+    } else {
+        memmove(dst, src, count * unit);
+        return 0;
+    };
+    set_errno(error);
+    _invalid_parameter_noinfo();
+    error
+}
+
+/// Copies `count` bytes into a buffer of `size`: 0, `EINVAL` or `ERANGE`
+/// (see [`copy_checked`]; the destination zeroed on failure).
+pub extern "win64" fn memcpy_s(
+    dst: *mut c_void,
+    size: usize,
+    src: *const c_void,
+    count: usize,
+) -> i32 {
+    copy_checked(dst, size, src, count, 1, true)
+}
+
+/// As [`memcpy_s`], the two may overlap and the destination is left as it
+/// was on failure.
+pub extern "win64" fn memmove_s(
+    dst: *mut c_void,
+    size: usize,
+    src: *const c_void,
+    count: usize,
+) -> i32 {
+    copy_checked(dst, size, src, count, 1, false)
+}
+
+/// [`memcpy_s`] in `u16` units.
+pub extern "win64" fn wmemcpy_s(dst: *mut u16, size: usize, src: *const u16, count: usize) -> i32 {
+    copy_checked(dst.cast(), size, src.cast(), count, 2, true)
+}
+
+/// [`memmove_s`] in `u16` units.
+pub extern "win64" fn wmemmove_s(dst: *mut u16, size: usize, src: *const u16, count: usize) -> i32 {
+    copy_checked(dst.cast(), size, src.cast(), count, 2, false)
 }
 
 /// Fills `n` bytes with `c`.
@@ -499,8 +564,10 @@ unsafe fn copy_s<T: Unit>(
         // SAFETY: as the caller says.
         return unsafe { invalid(dst, size) };
     }
+    // Read no further than `size` units, where the UCRT stops (an
+    // unterminated source is not read past it).
     // SAFETY: as the caller says.
-    let n = unsafe { nlen(src, count) };
+    let n = unsafe { nlen(src, count.min(size)) };
     if n < size {
         // SAFETY: `n + 1 <= size` units.
         unsafe {
@@ -517,12 +584,15 @@ unsafe fn copy_s<T: Unit>(
         }
         return STRUNCATE;
     }
+    // Too small: the UCRT's check calls the invalid-parameter handler.
+    _invalid_parameter_noinfo();
     // SAFETY: as the caller says.
     unsafe { fail(dst, size, ERANGE) }
 }
 
 /// `strncat_s` (and `strcat_s`, with `count` `_TRUNCATE` and no truncation
-/// allowed).
+/// allowed). Too small a destination reaches the invalid-parameter handler
+/// once, in [`copy_s`].
 ///
 /// # Safety
 /// `dst` has `size` units; `src` is a string or has `count` units.
@@ -588,19 +658,21 @@ unsafe fn map<T: Unit>(s: *mut T, f: impl Fn(T) -> T) -> *mut T {
     s
 }
 
-/// [`map`] of a string checked to end within `size`; `EINVAL` otherwise.
+/// [`map`] of a string checked to end within `size`; `EINVAL` otherwise,
+/// after the invalid-parameter handler.
 ///
 /// # Safety
 /// `s` is null or has `size` units.
 unsafe fn map_s<T: Unit>(s: *mut T, size: usize, f: impl Fn(T) -> T) -> i32 {
     if s.is_null() || size == 0 {
+        _invalid_parameter_noinfo();
         set_errno(EINVAL);
         return EINVAL;
     }
     // SAFETY: as the caller says.
     unsafe {
         if nlen(s, size) == size {
-            return fail(s, size, EINVAL);
+            return invalid(s, size);
         }
         map(s, f);
     }
@@ -835,12 +907,21 @@ macro_rules! string_functions {
             })
         }
 
-        /// The next token, the position in `*context`.
+        /// The next token, the position in `*context`; null and `EINVAL`
+        /// after the invalid-parameter handler for a null `context` or
+        /// `delim`, or a null `s` with a null `*context`.
         pub extern "win64" fn $tok_s(
             s: *mut $c,
             delim: *const $c,
             context: *mut *mut $c,
         ) -> *mut $c {
+            // SAFETY: the title's place for the position, read when non-null.
+            let none_left = s.is_null() && (context.is_null() || unsafe { *context }.is_null());
+            if context.is_null() || delim.is_null() || none_left {
+                _invalid_parameter_noinfo();
+                set_errno(EINVAL);
+                return std::ptr::null_mut();
+            }
             // SAFETY: the title's strings and place for the position.
             unsafe { token(s.cast::<$t>(), delim.cast::<$t>(), context.cast()).cast() }
         }
@@ -1729,6 +1810,9 @@ unsafe fn write_bounded<T: Unit>(buffer: *mut T, size: usize, text: &[u8], radix
             return fail(buffer, size, EINVAL);
         }
         if text.len() >= size {
+            // Too small: the UCRT's check calls the invalid-parameter
+            // handler.
+            _invalid_parameter_noinfo();
             return fail(buffer, size, ERANGE);
         }
         write_unbounded(buffer, text);
@@ -2039,6 +2123,30 @@ pub extern "win64" fn wcstombs_s(
     unsafe { convert_s(converted, dst, dst_size, &groups, count) }
 }
 
+/// See [`mbstowcs_s`]; the locale is not used.
+pub extern "win64" fn _mbstowcs_s_l(
+    converted: *mut usize,
+    dst: *mut u16,
+    dst_size: usize,
+    src: *const c_char,
+    count: usize,
+    _locale: *mut c_void,
+) -> i32 {
+    mbstowcs_s(converted, dst, dst_size, src, count)
+}
+
+/// See [`wcstombs_s`]; the locale is not used.
+pub extern "win64" fn _wcstombs_s_l(
+    converted: *mut usize,
+    dst: *mut c_char,
+    dst_size: usize,
+    src: *const u16,
+    count: usize,
+    _locale: *mut c_void,
+) -> i32 {
+    wcstombs_s(converted, dst, dst_size, src, count)
+}
+
 /// The bytes at `s`, at most `n` and not past a NUL.
 ///
 /// # Safety
@@ -2294,6 +2402,10 @@ pub(crate) fn exports() -> Vec<HleExport> {
     vec![
         hle_export!(memcpy),
         hle_export!(memmove),
+        hle_export!(memcpy_s),
+        hle_export!(memmove_s),
+        hle_export!(wmemcpy_s),
+        hle_export!(wmemmove_s),
         hle_export!(memset),
         hle_export!(memcmp),
         hle_export!(memchr),
@@ -2469,6 +2581,8 @@ pub(crate) fn exports() -> Vec<HleExport> {
         hle_export!(mbstowcs_s),
         hle_export!(wcstombs),
         hle_export!(wcstombs_s),
+        hle_export!(_mbstowcs_s_l),
+        hle_export!(_wcstombs_s_l),
         hle_export!(mbtowc),
         hle_export!(wctomb),
         hle_export!(wctomb_s),
@@ -2483,11 +2597,44 @@ pub(crate) fn exports() -> Vec<HleExport> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::runtime::{
+        _set_thread_local_invalid_parameter_handler, InvalidParameterHandler,
+    };
     use super::*;
     use std::ffi::CStr;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    thread_local! {
+        static INVALID_CALLS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    extern "win64" fn record(_: *const u16, _: *const u16, _: *const u16, _: u32, _: usize) {
+        INVALID_CALLS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Counts the invalid parameters reported on this thread for a test's
+    /// life (instead of the default handler ending the process).
+    struct Recorder(InvalidParameterHandler);
+
+    impl Recorder {
+        fn new() -> Self {
+            INVALID_CALLS.with(|n| n.set(0));
+            Recorder(_set_thread_local_invalid_parameter_handler(Some(record)))
+        }
+
+        /// The calls since the last look.
+        fn calls(&self) -> u32 {
+            INVALID_CALLS.with(|n| n.replace(0))
+        }
+    }
+
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            _set_thread_local_invalid_parameter_handler(self.0);
+        }
     }
 
     #[test]
@@ -2579,8 +2726,11 @@ mod tests {
         assert_eq!(tolower(i32::from(b'A')), i32::from(b'a'));
         assert_eq!(tolower(i32::from(b'1')), i32::from(b'1'));
         assert_eq!(toupper(i32::from(b'z')), i32::from(b'Z'));
-        assert_eq!(towupper(0xE9), 0xC9);
+        // The "C" locale maps A-Z and a-z only.
+        assert_eq!(towupper(0xE9), 0xE9);
+        assert_eq!(towlower(0xC9), 0xC9);
         assert_eq!(towlower(u16::from(b'Q')), u16::from(b'q'));
+        assert_eq!(towupper(u16::from(b'q')), u16::from(b'Q'));
         assert_ne!(isalpha(i32::from(b'x')), 0);
         assert_eq!(isalpha(0xE9), 0);
         assert_eq!(isdigit(-1), 0);
@@ -2604,7 +2754,13 @@ mod tests {
         assert_eq!(_stricmp(c"Hello".as_ptr(), c"hELLO".as_ptr()), 0);
         assert!(_stricmp(c"a".as_ptr(), c"B".as_ptr()) < 0);
         assert!(strcmp(c"\x80".as_ptr(), c"a".as_ptr()) > 0);
-        assert_eq!(_wcsicmp(wide("ÉTÉ").as_ptr(), wide("été").as_ptr()), 0);
+        assert_ne!(_wcsicmp(wide("ÉTÉ").as_ptr(), wide("été").as_ptr()), 0);
+        assert_eq!(_wcsicmp(wide("ÉTé").as_ptr(), wide("Été").as_ptr()), 0);
+        assert_eq!(_wcsnicmp(wide("ABx").as_ptr(), wide("aby").as_ptr(), 2), 0);
+        let mut upper = wide("aé");
+        _wcsupr(upper.as_mut_ptr());
+        assert_eq!(upper, wide("Aé"));
+        assert_ne!(iswalpha(0xE9), 0, "classes stay Unicode");
     }
 
     #[test]
@@ -2677,8 +2833,11 @@ mod tests {
         assert_eq!(text(&buffer), "z");
         assert_eq!(_itoa_s(5, buffer.as_mut_ptr(), 40, 37), EINVAL);
         assert_eq!(buffer[0], 0);
+        let recorder = Recorder::new();
         assert_eq!(_itoa_s(12345, buffer.as_mut_ptr(), 5, 10), ERANGE);
         assert_eq!(buffer[0], 0);
+        assert_eq!(recorder.calls(), 1, "too small a buffer is reported");
+        drop(recorder);
         let mut wbuffer = [0u16; 8];
         _itow(-42, wbuffer.as_mut_ptr(), 10);
         assert_eq!(&wbuffer[..4], &wide("-42")[..]);
@@ -2686,23 +2845,56 @@ mod tests {
 
     #[test]
     fn secure_copies_fail_by_emptying_the_destination() {
+        let recorder = Recorder::new();
         let mut small = [b'x' as c_char; 4];
         assert_eq!(strcpy_s(small.as_mut_ptr(), 4, c"abc".as_ptr()), 0);
         assert_eq!(strcmp(small.as_ptr(), c"abc".as_ptr()), 0);
+        assert_eq!(recorder.calls(), 0);
         assert_eq!(strcpy_s(small.as_mut_ptr(), 4, c"abcd".as_ptr()), ERANGE);
         assert_eq!(small[0], 0);
+        assert_eq!(recorder.calls(), 1);
         assert_eq!(strcpy_s(small.as_mut_ptr(), 4, c"ab".as_ptr()), 0);
         assert_eq!(strcat_s(small.as_mut_ptr(), 4, c"c".as_ptr()), 0);
+        assert_eq!(recorder.calls(), 0);
         assert_eq!(strcat_s(small.as_mut_ptr(), 4, c"d".as_ptr()), ERANGE);
         assert_eq!(small[0], 0);
+        assert_eq!(recorder.calls(), 1, "once for an append");
         assert_eq!(strncpy_s(small.as_mut_ptr(), 4, c"abcdef".as_ptr(), 2), 0);
         assert_eq!(strcmp(small.as_ptr(), c"ab".as_ptr()), 0);
         // A null source goes to the invalid-parameter handler first.
-        extern "win64" fn ignore(_: *const u16, _: *const u16, _: *const u16, _: u32, _: usize) {}
-        let old = super::super::runtime::_set_thread_local_invalid_parameter_handler(Some(ignore));
         assert_eq!(strcpy_s(small.as_mut_ptr(), 4, std::ptr::null()), EINVAL);
         assert_eq!(small[0], 0);
-        super::super::runtime::_set_thread_local_invalid_parameter_handler(old);
+        assert_eq!(recorder.calls(), 1);
+        // An unterminated source longer than the count and the destination
+        // is read no further than the destination's size.
+        let unterminated = [b'z' as c_char; 4];
+        assert_eq!(
+            strncpy_s(small.as_mut_ptr(), 4, unterminated.as_ptr(), 100),
+            ERANGE
+        );
+        assert_eq!(small[0], 0);
+        assert_eq!(recorder.calls(), 1);
+        assert_eq!(
+            strncpy_s(small.as_mut_ptr(), 4, unterminated.as_ptr(), TRUNCATE),
+            STRUNCATE
+        );
+        assert_eq!(strcmp(small.as_ptr(), c"zzz".as_ptr()), 0);
+        assert_eq!(strcpy_s(small.as_mut_ptr(), 4, c"a".as_ptr()), 0);
+        assert_eq!(
+            strncat_s(small.as_mut_ptr(), 4, unterminated.as_ptr(), 100),
+            ERANGE
+        );
+        assert_eq!(small[0], 0);
+        assert_eq!(recorder.calls(), 1);
+        // The case functions and `strtok_s` report what they are refused.
+        assert_eq!(_strlwr_s(std::ptr::null_mut(), 4), EINVAL);
+        assert_eq!(recorder.calls(), 1);
+        let mut context = std::ptr::null_mut();
+        assert!(strtok_s(std::ptr::null_mut(), c",".as_ptr(), &mut context).is_null());
+        assert_eq!(super::super::runtime::errno(), EINVAL);
+        assert_eq!(recorder.calls(), 1);
+        assert!(strtok_s(small.as_mut_ptr(), c",".as_ptr(), std::ptr::null_mut()).is_null());
+        assert_eq!(recorder.calls(), 1);
 
         let mut wsmall = [1u16; 4];
         let long = wide("truncated");
@@ -2716,6 +2908,57 @@ mod tests {
         );
         assert_eq!(wcsncpy_s(wsmall.as_mut_ptr(), 4, long.as_ptr(), 9), ERANGE);
         assert_eq!(wsmall[0], 0);
+        assert_eq!(recorder.calls(), 1);
+    }
+
+    #[test]
+    fn secure_memory_copies_check_their_sizes() {
+        let recorder = Recorder::new();
+        let mut dst = [7u8; 4];
+        let src = *b"abcdef";
+        let copy = |dst: &mut [u8; 4], size, src: *const u8, count| {
+            memcpy_s(dst.as_mut_ptr().cast(), size, src.cast(), count)
+        };
+        assert_eq!(copy(&mut dst, 4, src.as_ptr(), 3), 0);
+        assert_eq!(&dst, b"abc\x07");
+        assert_eq!(copy(&mut dst, 4, std::ptr::null(), 0), 0);
+        assert_eq!(recorder.calls(), 0);
+        assert_eq!(copy(&mut dst, 4, src.as_ptr(), 5), ERANGE);
+        assert_eq!(dst, [0; 4], "zeroed");
+        assert_eq!(super::super::runtime::errno(), ERANGE);
+        assert_eq!(recorder.calls(), 1);
+        dst = [7; 4];
+        assert_eq!(copy(&mut dst, 4, std::ptr::null(), 2), EINVAL);
+        assert_eq!(dst, [0; 4]);
+        assert_eq!(recorder.calls(), 1);
+        assert_eq!(
+            memcpy_s(std::ptr::null_mut(), 0, src.as_ptr().cast(), 1),
+            EINVAL
+        );
+        assert_eq!(recorder.calls(), 1);
+        dst = [7; 4];
+        let d = dst.as_mut_ptr().cast();
+        assert_eq!(memmove_s(d, 4, src.as_ptr().cast(), 5), ERANGE);
+        assert_eq!(dst, [7; 4], "memmove_s leaves it");
+        assert_eq!(recorder.calls(), 1);
+        // Overlapping.
+        let d = dst.as_mut_ptr();
+        assert_eq!(memmove_s(d.wrapping_add(1).cast(), 3, d.cast(), 3), 0);
+        let mut wide_dst = [9u16; 3];
+        let wide_src = [1u16, 2, 3, 4];
+        assert_eq!(wmemcpy_s(wide_dst.as_mut_ptr(), 3, wide_src.as_ptr(), 3), 0);
+        assert_eq!(wide_dst, [1, 2, 3]);
+        assert_eq!(
+            wmemcpy_s(wide_dst.as_mut_ptr(), 3, wide_src.as_ptr(), 4),
+            ERANGE
+        );
+        assert_eq!(wide_dst, [0; 3], "every unit zeroed");
+        assert_eq!(
+            wmemmove_s(wide_dst.as_mut_ptr(), 3, wide_src.as_ptr(), 2),
+            0
+        );
+        assert_eq!(wide_dst, [1, 2, 0]);
+        assert_eq!(recorder.calls(), 1);
     }
 
     #[test]
@@ -2764,6 +3007,30 @@ mod tests {
             ),
             0
         );
+        assert_eq!(
+            _mbstowcs_s_l(
+                &mut converted,
+                buffer.as_mut_ptr(),
+                8,
+                text.as_ptr(),
+                TRUNCATE,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(converted, 6);
+        assert_eq!(
+            _wcstombs_s_l(
+                &mut converted,
+                back.as_mut_ptr(),
+                8,
+                buffer.as_ptr(),
+                TRUNCATE,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(converted, 7);
         let mut unit = 0;
         assert_eq!(mbtowc(&mut unit, c"é".as_ptr(), 4), 2);
         assert_eq!(unit, 0xE9);
@@ -2780,6 +3047,6 @@ mod tests {
 
     #[test]
     fn every_export_is_listed() {
-        assert_eq!(exports().len(), 186);
+        assert_eq!(exports().len(), 192);
     }
 }

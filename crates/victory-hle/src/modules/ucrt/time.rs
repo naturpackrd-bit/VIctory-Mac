@@ -234,6 +234,22 @@ pub extern "win64" fn _localtime64(time: *const i64) -> *mut Tm {
     _gmtime64(time)
 }
 
+/// See [`_gmtime64`], the 32-bit `*time` widened.
+pub extern "win64" fn _gmtime32(time: *const i32) -> *mut Tm {
+    match read(time) {
+        Some(wide) => _gmtime64(&wide),
+        None => _gmtime64(std::ptr::null()),
+    }
+}
+
+/// See [`_localtime64`], the 32-bit `*time` widened.
+pub extern "win64" fn _localtime32(time: *const i32) -> *mut Tm {
+    match read(time) {
+        Some(wide) => _localtime64(&wide),
+        None => _localtime64(std::ptr::null()),
+    }
+}
+
 /// Normalizes a broken-down UTC time and fills its weekday and day of the
 /// year; its seconds since 1970, -1 (and `EINVAL`) out of `0..=max`.
 fn from_tm(tm: *mut Tm, max: i64) -> i64 {
@@ -625,6 +641,75 @@ pub extern "win64" fn _wctime64_s(buffer: *mut u16, size: usize, time: *const i6
     unsafe { write_asctime(buffer, size, text) }
 }
 
+thread_local! {
+    /// The text `asctime` and `ctime` give, per thread (the UCRT's
+    /// `_asctime_buffer`), and the wide forms'.
+    static ASCTIME: Cell<[u8; ASCBUFSIZE]> = const { Cell::new([0; ASCBUFSIZE]) };
+    static WASCTIME: Cell<[u16; ASCBUFSIZE]> = const { Cell::new([0; ASCBUFSIZE]) };
+}
+
+/// [`asctime_s`] into the thread's buffer: the buffer, or null for a bad
+/// `tm`.
+pub extern "win64" fn asctime(tm: *const Tm) -> *mut c_char {
+    ASCTIME.with(|buffer| {
+        let out = buffer.as_ptr().cast::<c_char>();
+        if asctime_s(out, ASCBUFSIZE, tm) == 0 {
+            out
+        } else {
+            std::ptr::null_mut()
+        }
+    })
+}
+
+/// The wide form of [`asctime`].
+pub extern "win64" fn _wasctime(tm: *const Tm) -> *mut u16 {
+    WASCTIME.with(|buffer| {
+        let out = buffer.as_ptr().cast::<u16>();
+        if _wasctime_s(out, ASCBUFSIZE, tm) == 0 {
+            out
+        } else {
+            std::ptr::null_mut()
+        }
+    })
+}
+
+/// [`asctime`] of the local time (UTC) of `*time`; null for an invalid
+/// time. The thread's `tm` (`_localtime64`'s) is left as it was.
+pub extern "win64" fn _ctime64(time: *const i64) -> *mut c_char {
+    let mut tm = Tm::default();
+    if _localtime64_s(&mut tm, time) != 0 {
+        return std::ptr::null_mut();
+    }
+    asctime(&tm)
+}
+
+/// The wide form of [`_ctime64`].
+pub extern "win64" fn _wctime64(time: *const i64) -> *mut u16 {
+    let mut tm = Tm::default();
+    if _localtime64_s(&mut tm, time) != 0 {
+        return std::ptr::null_mut();
+    }
+    _wasctime(&tm)
+}
+
+/// See [`_ctime64`], for a 32-bit time.
+pub extern "win64" fn _ctime32(time: *const i32) -> *mut c_char {
+    let mut tm = Tm::default();
+    if _localtime32_s(&mut tm, time) != 0 {
+        return std::ptr::null_mut();
+    }
+    asctime(&tm)
+}
+
+/// See [`_wctime64`], for a 32-bit time.
+pub extern "win64" fn _wctime32(time: *const i32) -> *mut u16 {
+    let mut tm = Tm::default();
+    if _localtime32_s(&mut tm, time) != 0 {
+        return std::ptr::null_mut();
+    }
+    _wasctime(&tm)
+}
+
 /// Reads the time zone from the environment: there is none (UTC).
 pub extern "win64" fn _tzset() {}
 
@@ -795,6 +880,14 @@ pub(crate) fn exports() -> Vec<HleExport> {
         hle_export!(_ctime64_s),
         hle_export!(_wasctime_s),
         hle_export!(_wctime64_s),
+        hle_export!(asctime),
+        hle_export!(_wasctime),
+        hle_export!(_ctime64),
+        hle_export!(_wctime64),
+        hle_export!(_ctime32),
+        hle_export!(_wctime32),
+        hle_export!(_localtime32),
+        hle_export!(_gmtime32),
         hle_export!(_tzset),
         hle_export!(_get_timezone),
         hle_export!(_get_daylight),
@@ -944,7 +1037,44 @@ mod tests {
     }
 
     #[test]
+    fn asctime_and_ctime_share_a_thread_buffer() {
+        let text = |p: *mut c_char| {
+            // SAFETY: the thread's NUL-terminated buffer.
+            unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned()
+        };
+        let tm = gm(86_400 * 365);
+        let out = asctime(&tm);
+        assert_eq!(text(out), "Fri Jan 01 00:00:00 1971\n");
+        let time = 0i64;
+        let again = _ctime64(&time);
+        assert_eq!(again, out, "one buffer");
+        assert_eq!(text(again), "Thu Jan 01 00:00:00 1970\n");
+        let time32 = 60i32;
+        assert_eq!(text(_ctime32(&time32)), "Thu Jan 01 00:01:00 1970\n");
+        assert!(_ctime64(&-1).is_null());
+        assert!(_ctime64(std::ptr::null()).is_null());
+        assert!(asctime(std::ptr::null()).is_null());
+        let wide = _wctime64(&time);
+        // SAFETY: the thread's NUL-terminated wide buffer.
+        let units = unsafe { super::super::string::wide_units(wide) };
+        assert_eq!(
+            String::from_utf16_lossy(units),
+            "Thu Jan 01 00:00:00 1970\n"
+        );
+        assert_eq!(_wasctime(&tm), wide);
+        assert!(!_wctime32(&time32).is_null());
+        // SAFETY: the thread's `tm`.
+        let local = unsafe { *_localtime32(&time32) };
+        assert_eq!((local.min, local.year), (1, 70));
+        // SAFETY: as above.
+        let utc = unsafe { *_gmtime32(&0x7FFF_D27F) };
+        assert_eq!((utc.year, utc.mon, utc.mday), (138, 0, 18));
+        assert!(_gmtime32(&-1).is_null());
+        assert!(_localtime32(std::ptr::null()).is_null());
+    }
+
+    #[test]
     fn every_export_is_listed() {
-        assert_eq!(exports().len(), 36);
+        assert_eq!(exports().len(), 44);
     }
 }

@@ -246,8 +246,11 @@ pub extern "win64" fn _aligned_offset_malloc(
     }
 }
 
-/// A block of `size` bytes aligned to `alignment` (a power of two).
+/// A block of `size` bytes aligned to `alignment` (a power of two; 0 is
+/// the default, 16).
 pub extern "win64" fn _aligned_malloc(size: usize, alignment: usize) -> *mut c_void {
+    // An alignment of 0 is the default one.
+    let alignment = if alignment == 0 { ALIGN } else { alignment };
     _aligned_offset_malloc(size, alignment, 0)
 }
 
@@ -474,6 +477,9 @@ mod tests {
             }
         }
         assert!(_aligned_malloc(8, 3).is_null());
+        let default = _aligned_malloc(24, 0);
+        assert!(!default.is_null() && (default as usize).is_multiple_of(16));
+        _aligned_free(default);
         let r = _aligned_recalloc(std::ptr::null_mut(), 4, 8, 64);
         // SAFETY: 32 bytes of ours.
         assert!(

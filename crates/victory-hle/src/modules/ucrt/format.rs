@@ -21,6 +21,10 @@ use super::runtime::{_invalid_parameter_noinfo, EINVAL};
 pub(crate) const LEGACY_VSPRINTF_NULL_TERMINATION: u64 = 1;
 /// `_CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR`.
 pub(crate) const STANDARD_SNPRINTF_BEHAVIOR: u64 = 2;
+/// `_CRT_INTERNAL_PRINTF_LEGACY_WIDE_SPECIFIERS`: in a wide format `%s` and
+/// `%c` take wide arguments and `%S` and `%C` narrow ones (MSVC's meaning,
+/// the headers' default); without it they follow ISO C (`%s` narrow).
+pub(crate) const LEGACY_WIDE_SPECIFIERS: u64 = 4;
 /// `_CRT_INTERNAL_PRINTF_LEGACY_THREE_DIGIT_EXPONENTS`.
 pub(crate) const LEGACY_THREE_DIGIT_EXPONENTS: u64 = 16;
 /// Ours, never passed by a title: positional arguments (`%1$d`) are
@@ -171,15 +175,23 @@ pub(crate) fn parse_length(spec: &Spec, i: &mut usize) -> Length {
     length
 }
 
-/// Whether a character or string conversion takes a wide argument, as MSVC
-/// has it: `h` narrow, `l`/`w` wide, else `c`/`s`/`Z`/`[` the format's
-/// width and `C`/`S` the other.
-pub(crate) fn wide_argument(conversion: u16, length: Length, wide_format: bool) -> bool {
+/// Whether a character or string conversion takes a wide argument, as the
+/// UCRT has it: `h` narrow, `l`/`w` wide; else, with `legacy` (MSVC's wide
+/// specifiers), `c`/`s`/`Z`/`[` the format's width and `C`/`S` the other,
+/// and without it (ISO C) `c`/`s`/`Z`/`[` narrow and `C`/`S` wide in every
+/// format. A narrow format reads the same either way.
+pub(crate) fn wide_argument(
+    conversion: u16,
+    length: Length,
+    wide_format: bool,
+    legacy: bool,
+) -> bool {
+    let other = conversion == u16::from(b'C') || conversion == u16::from(b'S');
     match length {
         Length::H | Length::Hh => false,
         Length::L | Length::W => true,
-        _ if conversion == u16::from(b'C') || conversion == u16::from(b'S') => !wide_format,
-        _ => wide_format,
+        _ if legacy => other != wide_format,
+        _ => other,
     }
 }
 
@@ -483,6 +495,7 @@ pub(crate) fn format(
 
 /// Formats one directive.
 fn directive(options: u64, wide_format: bool, d: &Directive, args: &mut Args, out: &mut Out) {
+    let legacy = options & LEGACY_WIDE_SPECIFIERS != 0;
     let mut flags = d.flags;
     let width = match d.width {
         Count::None => 0,
@@ -509,7 +522,7 @@ fn directive(options: u64, wide_format: bool, d: &Directive, args: &mut Args, ou
         }
         b'c' | b'C' => {
             let raw = args.take(d.position);
-            let unit = if wide_argument(d.conversion, d.length, wide_format) {
+            let unit = if wide_argument(d.conversion, d.length, wide_format, legacy) {
                 raw as u16
             } else {
                 u16::from(raw as u8)
@@ -518,7 +531,7 @@ fn directive(options: u64, wide_format: bool, d: &Directive, args: &mut Args, ou
         }
         b's' | b'S' | b'Z' => {
             let raw = args.take(d.position) as usize;
-            let wide = wide_argument(d.conversion, d.length, wide_format);
+            let wide = wide_argument(d.conversion, d.length, wide_format, legacy);
             let text = if c == b'Z' {
                 counted_string(raw, wide, precision)
             } else {
@@ -1131,8 +1144,37 @@ pub(crate) mod tests {
         let mut list = VaList::new(narrow.as_ptr());
         let mut sink = VecSink::default();
         let format_units = wide("%S %s %C %c");
-        format(0, &Spec::Wide(&format_units), &mut list, &mut sink).unwrap();
+        let legacy = LEGACY_WIDE_SPECIFIERS;
+        format(legacy, &Spec::Wide(&format_units), &mut list, &mut sink).unwrap();
         assert_eq!(String::from_utf16_lossy(&sink.0), "nar wid A Ω");
+    }
+
+    #[test]
+    fn wide_formats_follow_iso_without_the_legacy_bit() {
+        let args = slots(&[
+            Arg::W(&wide("wid")),
+            Arg::S("nar"),
+            Arg::U(0x3A9),
+            Arg::U(0x41),
+            Arg::S("hs"),
+            Arg::W(&wide("ls")),
+        ]);
+        let mut list = VaList::new(args.as_ptr());
+        let mut sink = VecSink::default();
+        let format_units = wide("%S %s %C %c %hs %ls");
+        format(0, &Spec::Wide(&format_units), &mut list, &mut sink).unwrap();
+        assert_eq!(String::from_utf16_lossy(&sink.0), "wid nar Ω A hs ls");
+    }
+
+    #[test]
+    fn narrow_formats_read_the_same_either_way() {
+        for options in [0, LEGACY_WIDE_SPECIFIERS] {
+            let args = slots(&[Arg::S("nar"), Arg::W(&wide("wid")), Arg::U(0x41)]);
+            let mut list = VaList::new(args.as_ptr());
+            let mut sink = VecSink::default();
+            format(options, &Spec::Narrow(b"%s %S %c"), &mut list, &mut sink).unwrap();
+            assert_eq!(String::from_utf16_lossy(&sink.0), "nar wid A");
+        }
     }
 
     /// A sink that takes `room` units, then fails.

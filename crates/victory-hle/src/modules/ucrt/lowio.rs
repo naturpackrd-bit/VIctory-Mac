@@ -45,9 +45,9 @@ use super::super::win32::handles::{CloseHandle, DuplicateHandle, GetCurrentProce
 use super::super::win32::time::FILETIME;
 use super::heap::malloc;
 use super::runtime::{
-    _get_fmode, _getpid, _invalid_parameter_noinfo, _set_doserrno, EACCES, EAGAIN, EBADF, EEXIST,
-    EFBIG, EINVAL, EMFILE, ENOENT, ENOEXEC, ENOMEM, ENOSPC, ENOTEMPTY, EPIPE, ERANGE, EXDEV, lock,
-    set_errno,
+    _get_fmode, _getpid, _invalid_parameter_noinfo, _set_doserrno, E2BIG, EACCES, EAGAIN, EBADF,
+    ECHILD, EEXIST, EFBIG, EINVAL, EMFILE, ENOENT, ENOEXEC, ENOMEM, ENOSPC, ENOTEMPTY, EPIPE,
+    ERANGE, EXDEV, lock, set_errno,
 };
 use super::string::{narrow_bytes, wide_units};
 use crate::{HleExport, hle_export};
@@ -158,7 +158,9 @@ pub(crate) fn dos_map_err(code: u32) -> i32 {
         5 | 16 | 19 | 32 | 33 | 65 | 82 | 83 | 108 | 132 | 158 | 167 => EACCES,
         6 | 114 | 130 => EBADF,
         7 | 8 | 9 | 1816 => ENOMEM,
-        10 | 11 => ENOEXEC,
+        10 => E2BIG,
+        11 => ENOEXEC,
+        128 | 129 => ECHILD,
         12 | 13 | 87 | 131 => EINVAL,
         17 => EXDEV,
         112 => ENOSPC,
@@ -3144,6 +3146,7 @@ pub(crate) mod tests {
             (5, EACCES),
             (6, EBADF),
             (8, ENOMEM),
+            (10, E2BIG),
             (11, ENOEXEC),
             (17, EXDEV),
             (19, EACCES),
@@ -3153,6 +3156,8 @@ pub(crate) mod tests {
             (87, EINVAL),
             (109, EPIPE),
             (112, ENOSPC),
+            (128, ECHILD),
+            (129, ECHILD),
             (145, ENOTEMPTY),
             (164, EAGAIN),
             (183, EEXIST),
